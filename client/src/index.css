@@ -1,0 +1,132 @@
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap');
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  body, button, a, select, input, textarea, label {
+    cursor: none !important;
+  }
+  body {
+    @apply bg-slate-50 text-slate-800 font-sans antialiased;
+  }
+}
+
+/* Custom Cursor styling */
+.custom-cursor-dot {
+  position: fixed;
+  top: 0;
+  left: 0;
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background-color: #6366F1;
+  pointer-events: none;
+  z-index: 9999;
+  opacity: 0;
+  transition: transform 0.12s ease-out, opacity 0.25s ease-in-out;
+  will-change: transform;
+}
+
+.custom-cursor-ring {
+  position: fixed;
+  top: 0;
+  left: 0;
+  width: 30px;
+  height: 30px;
+  border-radius: 50%;
+  border: 2px solid #8B5CF6;
+  background-color: transparent;
+  opacity: 0;
+  pointer-events: none;
+  z-index: 9998;
+  transition: transform 0.18s cubic-bezier(0.25, 1, 0.5, 1), border-color 0.25s ease, opacity 0.25s ease-in-out;
+  will-change: transform;
+}
+
+/* Button ripple styling */
+.btn-ripple-span {
+  position: absolute;
+  border-radius: 50%;
+  background-color: rgba(255, 255, 255, 0.45);
+  transform: scale(0);
+  animation: ripple-effect 0.6s linear;
+  pointer-events: none;
+}
+
+button.bg-white .btn-ripple-span,
+button.border-indigo-600 .btn-ripple-span {
+  background-color: rgba(99, 102, 241, 0.15);
+}
+
+@keyframes ripple-effect {
+  to {
+    transform: scale(4);
+    opacity: 0;
+  }
+}
+
+/* Hover glow card effect */
+.hover-glow-card {
+  transition: box-shadow 300ms ease, transform 300ms ease;
+}
+.hover-glow-card:hover {
+  box-shadow: 0 0 20px rgba(99, 102, 241, 0.08), 0 4px 6px -1px rgb(0 0 0 / 0.02), 0 2px 4px -2px rgb(0 0 0 / 0.02);
+  transform: translateY(-4px);
+}
+
+/* Underline slide in effect */
+.link-underline {
+  position: relative;
+}
+.link-underline::after {
+  content: '';
+  position: absolute;
+  width: 100%;
+  transform: scaleX(0);
+  height: 2px;
+  bottom: -4px;
+  left: 0;
+  background-color: #6366F1;
+  transform-origin: bottom left;
+  transition: transform 0.25s ease-out;
+}
+.link-underline:hover::after,
+.link-underline.active::after {
+  transform: scaleX(1);
+}
+
+/* Custom SVG Chart Path Animation */
+.svg-chart-path {
+  stroke-dasharray: 1200;
+  stroke-dashoffset: 1200;
+  animation: draw-chart 2.2s cubic-bezier(0.25, 1, 0.5, 1) forwards;
+}
+
+@keyframes draw-chart {
+  to {
+    stroke-dashoffset: 0;
+  }
+}
+
+/* Shimmer skeleton loaders */
+.skeleton-shimmer {
+  background: linear-gradient(
+    90deg,
+    #f1f5f9 25%,
+    #e2e8f0 37%,
+    #f1f5f9 63%
+  );
+  background-size: 400% 100%;
+  animation: skeleton-loading 1.4s ease infinite;
+}
+
+@keyframes skeleton-loading {
+  0% {
+    background-position: 100% 50%;
+  }
+  100% {
+    background-position: 0% 50%;
+  }
+}
