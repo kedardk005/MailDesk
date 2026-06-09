@@ -139,26 +139,29 @@ exports.updateTask = async (req, res) => {
         return res.status(400).json({ message: 'Employees are only allowed to mark a task as Completed.' });
       }
 
+      const wasAlreadyCompleted = task.status === 'Completed';
       task.status = 'Completed';
 
-      // Send completion notification & email alert to task creator (Admin/Head)
-      try {
-        const creator = await User.findById(task.createdBy);
-        if (creator) {
-          const io = req.app.get('io');
-          // 1. App Notification
-          await createNotification(
-            task.createdBy,
-            `Task completed: ${task.title} by ${req.user.name}`,
-            io
-          );
-          // 2. Email alert
-          const emailSubject = `Task Completed: ${task.title}`;
-          const emailBody = `Employee ${req.user.name} has marked the task "${task.title}" as completed on ${new Date().toLocaleString()}.`;
-          await sendEmail(creator.email, emailSubject, emailBody);
+      if (!wasAlreadyCompleted) {
+        // Send completion notification & email alert to task creator (Admin/Head)
+        try {
+          const creator = await User.findById(task.createdBy);
+          if (creator) {
+            const io = req.app.get('io');
+            // 1. App Notification
+            await createNotification(
+              task.createdBy,
+              `Task completed: ${task.title} by ${req.user.name}`,
+              io
+            );
+            // 2. Email alert
+            const emailSubject = `Task Completed: ${task.title}`;
+            const emailBody = `Employee ${req.user.name} has marked the task "${task.title}" as completed on ${new Date().toLocaleString()}.`;
+            await sendEmail(creator.email, emailSubject, emailBody);
+          }
+        } catch (err) {
+          console.error('Failed to send task completion alerts:', err);
         }
-      } catch (err) {
-        console.error('Failed to send task completion alerts:', err);
       }
     } else {
       // Admin/Head can update all fields

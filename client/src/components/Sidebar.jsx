@@ -1,17 +1,33 @@
-import React from 'react';
+import React, { useState, useEffect } from 'react';
 import { NavLink, useNavigate } from 'react-router-dom';
 
 const Sidebar = ({ isOpen, onClose }) => {
   const navigate = useNavigate();
-  const userString = localStorage.getItem('user');
-  let user = { name: 'Guest', role: 'Employee' };
-  try {
-    if (userString) {
-      user = JSON.parse(userString);
+  
+  const [currentUser, setCurrentUser] = useState(() => {
+    const userString = localStorage.getItem('user');
+    try {
+      return userString ? JSON.parse(userString) : { name: 'Guest', role: 'Employee' };
+    } catch {
+      return { name: 'Guest', role: 'Employee' };
     }
-  } catch (err) {
-    console.error('Error parsing user details for Sidebar:', err);
-  }
+  });
+
+  useEffect(() => {
+    const handleStorageChange = () => {
+      const userString = localStorage.getItem('user');
+      try {
+        if (userString) {
+          setCurrentUser(JSON.parse(userString));
+        }
+      } catch (err) {
+        console.error('Error syncing user details for Sidebar:', err);
+      }
+    };
+    
+    window.addEventListener('storage', handleStorageChange);
+    return () => window.removeEventListener('storage', handleStorageChange);
+  }, []);
 
   const handleLogout = () => {
     localStorage.removeItem('token');
@@ -70,10 +86,20 @@ const Sidebar = ({ isOpen, onClose }) => {
           <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 002 2h2a2 2 0 002-2z" />
         </svg>
       )
+    },
+    {
+      path: '/profile',
+      label: 'My Profile',
+      roles: ['Admin', 'Head', 'Employee'],
+      icon: (
+        <svg className="h-5 w-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M16 7a4 4 0 11-8 0 4 4 0 018 0zM12 14a7 7 0 00-7 7h14a7 7 0 00-7-7z" />
+        </svg>
+      )
     }
   ];
 
-  const filteredItems = navItems.filter((item) => item.roles.includes(user.role));
+  const filteredItems = navItems.filter((item) => item.roles.includes(currentUser.role));
 
   return (
     <>
@@ -113,12 +139,12 @@ const Sidebar = ({ isOpen, onClose }) => {
           {/* User Profile Block (Gradient Card) */}
           <div className="p-4 mx-4 mt-4 bg-gradient-to-br from-indigo-600 to-purple-600 rounded-2xl text-white shadow-md shadow-indigo-600/10 flex items-center space-x-3">
             <div className="h-9 w-9 rounded-xl bg-white/10 backdrop-blur-md border border-white/25 flex items-center justify-center text-white font-bold text-sm shrink-0">
-              {getInitials(user.name)}
+              {getInitials(currentUser.name)}
             </div>
             <div className="flex flex-col min-w-0">
-              <span className="text-xs font-bold truncate leading-none mb-1">{user.name}</span>
+              <span className="text-xs font-bold truncate leading-none mb-1">{currentUser.name}</span>
               <span className="text-[9px] font-extrabold tracking-wider bg-white/20 text-white px-2 py-0.5 rounded-full w-max uppercase font-mono">
-                {user.role}
+                {currentUser.role}
               </span>
             </div>
           </div>

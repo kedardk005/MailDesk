@@ -64,6 +64,8 @@ exports.registerUser = async (req, res) => {
       name: savedUser.name,
       email: savedUser.email,
       role: savedUser.role,
+      birthdate: savedUser.birthdate,
+      phoneNumber: savedUser.phoneNumber,
       createdAt: savedUser.createdAt
     };
 
@@ -111,6 +113,8 @@ exports.loginUser = async (req, res) => {
       name: user.name,
       email: user.email,
       role: user.role,
+      birthdate: user.birthdate,
+      phoneNumber: user.phoneNumber,
       createdAt: user.createdAt
     };
 

@@ -69,6 +69,38 @@ const startCronJobs = (io) => {
       console.error('[CRON ERROR] Overdue task evaluation failed:', error);
     }
   });
+
+  // Schedule to run every 30 minutes
+  cron.schedule('*/30 * * * *', async () => {
+    try {
+      console.log('[CRON] Starting automatic email synchronization for connected users...');
+      
+      // Find all users who have a connected Gmail account
+      const users = await User.find({
+        gmailAccessToken: { $ne: null, $ne: "" }
+      });
+
+      if (users.length === 0) {
+        console.log('[CRON] No users with connected Gmail accounts found for auto-sync.');
+        return;
+      }
+
+      // Dynamic import to avoid circular dependency/load order issues
+      const { syncUserEmails } = require('../controllers/gmailController');
+
+      for (const user of users) {
+        try {
+          console.log(`[CRON] Auto-syncing emails for user: ${user.email}`);
+          const count = await syncUserEmails(user, false);
+          console.log(`[CRON] Auto-sync complete. ${count} new emails fetched for user ${user.email}.`);
+        } catch (syncError) {
+          console.error(`[CRON ERROR] Failed to auto-sync emails for user ${user.email}:`, syncError);
+        }
+      }
+    } catch (error) {
+      console.error('[CRON ERROR] Automatic email sync cron job failed:', error);
+    }
+  });
 };
 
 module.exports = { startCronJobs };

@@ -328,9 +328,16 @@ const EmailInbox = () => {
                     </div>
 
                     {/* Email Text Body container */}
-                    <div className="bg-white border border-slate-200/85 rounded-xl p-4 text-xs text-slate-700 leading-relaxed whitespace-pre-wrap break-words overflow-hidden max-w-full select-text">
-                      {email.body ? email.body : <span className="italic text-slate-400">This email has no text content.</span>}
-                    </div>
+                    {email.body ? (
+                      <div
+                        className="bg-white border border-slate-200/85 rounded-xl p-4 text-xs text-slate-700 leading-relaxed break-words overflow-hidden max-w-full select-text email-body-rendered"
+                        dangerouslySetInnerHTML={{ __html: email.body }}
+                      />
+                    ) : (
+                      <div className="bg-white border border-slate-200/85 rounded-xl p-4 text-xs text-slate-700 leading-relaxed whitespace-pre-wrap break-words overflow-hidden max-w-full select-text">
+                        <span className="italic text-slate-400">This email has no text content.</span>
+                      </div>
+                    )}
 
                     {/* Action footer */}
                     <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3 pt-2">

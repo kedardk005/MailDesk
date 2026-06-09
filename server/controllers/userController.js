@@ -181,3 +181,60 @@ exports.getActivityLogs = async (req, res) => {
     return res.status(500).json({ message: 'Server error. Failed to retrieve activity logs.' });
   }
 };
+
+// @desc    Update logged-in user profile details (name, email, birthdate, phoneNumber)
+// @route   PUT /api/users/profile
+// @access  Private
+exports.updateUserProfile = async (req, res) => {
+  try {
+    const { name, email, birthdate, phoneNumber } = req.body;
+
+    const user = await User.findById(req.user._id);
+    if (!user) {
+      return res.status(404).json({ message: 'User not found.' });
+    }
+
+    if (name) {
+      user.name = name.trim();
+    }
+
+    if (email) {
+      const emailNormalized = email.toLowerCase().trim();
+      // If email is changing, check if new email is already taken
+      if (emailNormalized !== user.email) {
+        const emailExists = await User.findOne({ email: emailNormalized });
+        if (emailExists) {
+          return res.status(400).json({ message: 'Email address is already in use by another user.' });
+        }
+        user.email = emailNormalized;
+      }
+    }
+
+    // Birthdate and Phone Number are optional/nullable
+    if (birthdate !== undefined) {
+      user.birthdate = birthdate || null;
+    }
+
+    if (phoneNumber !== undefined) {
+      user.phoneNumber = phoneNumber ? phoneNumber.trim() : '';
+    }
+
+    const updatedUser = await user.save();
+
+    // Response user object excluding password
+    const userResponse = {
+      _id: updatedUser._id,
+      name: updatedUser.name,
+      email: updatedUser.email,
+      role: updatedUser.role,
+      birthdate: updatedUser.birthdate,
+      phoneNumber: updatedUser.phoneNumber,
+      createdAt: updatedUser.createdAt
+    };
+
+    return res.status(200).json(userResponse);
+  } catch (error) {
+    console.error('Error in updateUserProfile:', error);
+    return res.status(500).json({ message: 'Server error. Failed to update profile.' });
+  }
+};

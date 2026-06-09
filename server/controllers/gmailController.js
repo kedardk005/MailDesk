@@ -132,6 +132,108 @@ exports.handleOAuthCallback = async (req, res) => {
   }
 };
 
+// Helper to perform Gmail fetching for a specific user document
+const syncUserEmails = async (user, isManual = false) => {
+  if (!user || !user.gmailAccessToken) {
+    throw new Error('Gmail account not connected or user is invalid.');
+  }
+
+  console.log(`[GMAIL SYNC] Syncing emails for ${user.email} (Manual: ${isManual})...`);
+
+  const oauth2Client = getOAuth2Client();
+  oauth2Client.setCredentials({
+    access_token: user.gmailAccessToken,
+    refresh_token: user.gmailRefreshToken
+  });
+
+  // Handle token refresh events automatically
+  oauth2Client.on('tokens', async (tokens) => {
+    console.log('[GMAIL SYNC] Google OAuth2 tokens refreshed.');
+    if (tokens.access_token) {
+      user.gmailAccessToken = tokens.access_token;
+    }
+    if (tokens.refresh_token) {
+      user.gmailRefreshToken = tokens.refresh_token;
+    }
+    await user.save();
+  });
+
+  const gmail = google.gmail({ version: 'v1', auth: oauth2Client });
+
+  // Fetch list of last 50 messages
+  const listRes = await gmail.users.messages.list({
+    userId: 'me',
+    maxResults: 50
+  });
+
+  const messages = listRes.data.messages || [];
+  console.log(`[GMAIL SYNC] Gmail API returned ${messages.length} messages from mailbox.`);
+
+  let newEmailsCount = 0;
+
+  for (const message of messages) {
+    // Check if messageId already exists in DB
+    const exists = await Email.findOne({ messageId: message.id });
+    if (exists) {
+      continue;
+    }
+
+    // Fetch detailed message payload
+    const msgDetails = await gmail.users.messages.get({
+      userId: 'me',
+      id: message.id
+    });
+
+    const payload = msgDetails.data.payload;
+    const headers = payload.headers;
+
+    // Extract subject, from, and date headers
+    const subject = getHeader(headers, 'subject') || '(No Subject)';
+    const from = getHeader(headers, 'from') || 'Unknown Sender';
+    const dateStr = getHeader(headers, 'date');
+    const date = dateStr ? new Date(dateStr) : new Date();
+
+    // Extract and decode text body
+    const rawBody = getBodyText(payload);
+    let decodedBody = '';
+    if (rawBody) {
+      // Base64url decoding
+      const base64Body = rawBody.replace(/-/g, '+').replace(/_/g, '/');
+      decodedBody = Buffer.from(base64Body, 'base64').toString('utf-8');
+    }
+
+    // Save email to DB
+    const emailRecord = new Email({
+      messageId: message.id,
+      subject,
+      from,
+      date,
+      body: decodedBody,
+      status: 'unassigned',
+      assignedTo: null,
+      fetchedBy: user._id
+    });
+
+    await emailRecord.save();
+    console.log(`[GMAIL SYNC] Saved new email: "${subject}" from ${from}`);
+    newEmailsCount++;
+  }
+
+  console.log(`[GMAIL SYNC] Sync complete. Added ${newEmailsCount} new emails.`);
+
+  // Log activity
+  const activityType = isManual ? 'Gmail Fetch' : 'Gmail Fetch Auto';
+  const activityDesc = isManual 
+    ? `Manually fetched Gmail emails (Found ${newEmailsCount} new emails)`
+    : `Automatically fetched Gmail emails (Found ${newEmailsCount} new emails)`;
+  await logActivity(user._id, activityType, activityDesc);
+
+  return newEmailsCount;
+};
+
+// Export syncUserEmails for cron job usage
+exports.syncUserEmails = syncUserEmails;
+
 // @desc    Manually fetch the last 50 emails
 // @route   POST /api/gmail/fetch
 // @access  Private
@@ -144,102 +246,11 @@ exports.fetchEmails = async (req, res) => {
       return res.status(400).json({ message: 'Gmail account not connected. Please authenticate first.' });
     }
 
-    console.log('Fetching emails for user:', user.email);
-
-    const oauth2Client = getOAuth2Client();
-    oauth2Client.setCredentials({
-      access_token: user.gmailAccessToken,
-      refresh_token: user.gmailRefreshToken
-    });
-
-    // Handle token refresh events automatically
-    oauth2Client.on('tokens', async (tokens) => {
-      console.log('Google OAuth2 tokens refreshed.');
-      if (tokens.access_token) {
-        user.gmailAccessToken = tokens.access_token;
-      }
-      if (tokens.refresh_token) {
-        user.gmailRefreshToken = tokens.refresh_token;
-      }
-      await user.save();
-    });
-
-    const gmail = google.gmail({ version: 'v1', auth: oauth2Client });
-
-    // Fetch list of last 50 messages
-    let listRes;
-    try {
-      listRes = await gmail.users.messages.list({
-        userId: 'me',
-        maxResults: 50
-      });
-    } catch (apiError) {
-      console.error('Gmail List API Error:', apiError);
-      return res.status(500).json({ message: 'Failed to access Gmail inbox. Access token might be invalid.' });
-    }
-
-    const messages = listRes.data.messages || [];
-    console.log(`Gmail API returned ${messages.length} messages from mailbox.`);
-
-    let newEmailsCount = 0;
-
-    for (const message of messages) {
-      // Check if messageId already exists in DB
-      const exists = await Email.findOne({ messageId: message.id });
-      if (exists) {
-        console.log(`Skipping duplicate message: ${message.id} (Subject: ${exists.subject})`);
-        continue;
-      }
-
-      // Fetch detailed message payload
-      console.log(`Fetching details for message ID: ${message.id}`);
-      const msgDetails = await gmail.users.messages.get({
-        userId: 'me',
-        id: message.id
-      });
-
-      const payload = msgDetails.data.payload;
-      const headers = payload.headers;
-
-      // Extract subject, from, and date headers
-      const subject = getHeader(headers, 'subject') || '(No Subject)';
-      const from = getHeader(headers, 'from') || 'Unknown Sender';
-      const dateStr = getHeader(headers, 'date');
-      const date = dateStr ? new Date(dateStr) : new Date();
-
-      // Extract and decode text body
-      const rawBody = getBodyText(payload);
-      let decodedBody = '';
-      if (rawBody) {
-        // Base64url decoding
-        const base64Body = rawBody.replace(/-/g, '+').replace(/_/g, '/');
-        decodedBody = Buffer.from(base64Body, 'base64').toString('utf-8');
-      }
-
-      // Save email to DB
-      const emailRecord = new Email({
-        messageId: message.id,
-        subject,
-        from,
-        date,
-        body: decodedBody,
-        status: 'unassigned',
-        assignedTo: null,
-        fetchedBy: req.user._id
-      });
-
-      await emailRecord.save();
-      console.log(`Saved new email: "${subject}" from ${from}`);
-      newEmailsCount++;
-    }
-
-    console.log(`Fetch finished. Added ${newEmailsCount} new emails.`);
-
-    await logActivity(req.user._id, 'Gmail Fetch', `Manually fetched Gmail emails (Found ${newEmailsCount} new emails)`);
+    const count = await syncUserEmails(user, true);
 
     return res.status(200).json({
       message: 'Emails fetched successfully',
-      count: newEmailsCount
+      count
     });
   } catch (error) {
     console.error('Error in fetchEmails:', error);

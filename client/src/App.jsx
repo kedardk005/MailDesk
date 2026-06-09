@@ -8,6 +8,7 @@ import ManageUsers from './pages/admin/ManageUsers';
 import ActivityLog from './pages/admin/ActivityLog';
 import EmailInbox from './pages/EmailInbox';
 import TaskList from './pages/TaskList';
+import Profile from './pages/Profile';
 import ProtectedRoute from './components/ProtectedRoute';
 import AdminRoute from './components/AdminRoute';
 import ProtectedLayout from './components/ProtectedLayout';
@@ -46,6 +47,7 @@ function App() {
           <Route path="/dashboard" element={<Dashboard />} />
           <Route path="/inbox" element={<EmailInbox />} />
           <Route path="/tasks" element={<TaskList />} />
+          <Route path="/profile" element={<Profile />} />
           
           {/* Admin Routes */}
           <Route
