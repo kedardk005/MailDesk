@@ -131,15 +131,15 @@ const NotificationBell = () => {
       {/* Bell Icon Trigger */}
       <button
         onClick={() => setIsOpen(!isOpen)}
-        className={`relative p-2 text-blue-950 border hover:text-blue-700 hover:bg-blue-50 transition-all duration-150 focus:outline-none ${
+        className={`relative p-2 rounded-xl text-blue-600 hover:text-blue-700 bg-blue-50/50 hover:bg-blue-50 border border-blue-100 transition-all duration-150 focus:outline-none ${
           bounce ? 'animate-bounce text-blue-700' : ''
         }`}
       >
-        <svg className="h-5.5 w-5.5" fill="none" stroke="#2563eb" viewBox="0 0 24 24" aria-label="Notifications">
-          <path stroke="#2563eb" strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M15 17h5l-1.405-1.405A2.032 2.032 0 0118 14.158V11a6.002 6.002 0 00-4-5.659V5a2 2 0 10-4 0v.341C7.67 6.165 6 8.388 6 11v3.159c0 .538-.214 1.055-.595 1.436L4 17h5m6 0v1a3 3 0 11-6 0v-1m6 0H9" />
+        <svg className="h-5 w-5 text-blue-600" fill="none" stroke="#2563eb" strokeWidth="2.5" viewBox="0 0 24 24" aria-label="Notifications">
+          <path stroke="#2563eb" strokeLinecap="round" strokeLinejoin="round" d="M15 17h5l-1.405-1.405A2.032 2.032 0 0118 14.158V11a6.002 6.002 0 00-4-5.659V5a2 2 0 10-4 0v.341C7.67 6.165 6 8.388 6 11v3.159c0 .538-.214 1.055-.595 1.436L4 17h5m6 0v1a3 3 0 11-6 0v-1m6 0H9" />
         </svg>
         {unreadCount > 0 && (
-          <span className="absolute top-1.5 right-1.5 h-4 w-4 bg-red-500 rounded-full text-[9px] font-extrabold text-white flex items-center justify-center animate-pulse shadow-md">
+          <span className="absolute top-1 right-1 h-3.5 w-3.5 bg-red-500 rounded-full text-[9px] font-black text-white flex items-center justify-center animate-pulse shadow-md">
             {unreadCount > 9 ? '9+' : unreadCount}
           </span>
         )}
@@ -147,14 +147,14 @@ const NotificationBell = () => {
 
       {/* Dropdown Container */}
       {isOpen && (
-        <div className="absolute right-0 mt-3 w-80 bg-white border border-slate-200/80 rounded-2xl shadow-xl overflow-hidden z-50 animate-fade-in origin-top-right transition-all">
+        <div className="absolute right-0 mt-3 w-80 bg-white/95 backdrop-blur-xl border border-slate-200/80 rounded-2xl shadow-xl overflow-hidden z-50 animate-fade-in origin-top-right transition-all">
           {/* Header */}
           <div className="px-4 py-3 border-b border-slate-100 bg-slate-50/50 flex items-center justify-between">
             <span className="font-bold text-xs text-slate-800">Notifications</span>
             {unreadCount > 0 && (
               <button
                 onClick={handleMarkAllAsRead}
-                className="text-[10px] text-blue-600 hover:text-blue-700 font-bold transition-colors focus:outline-none"
+                className="text-[10px] text-indigo-600 hover:text-indigo-700 font-bold transition-colors focus:outline-none"
               >
                 Mark all as read
               </button>

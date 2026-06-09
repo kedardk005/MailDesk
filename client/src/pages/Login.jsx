@@ -33,39 +33,43 @@ const Login = () => {
   };
 
   return (
-    <div className="min-h-screen flex bg-white font-sans overflow-hidden select-none">
+    <div className="min-h-screen flex bg-white font-sans overflow-hidden select-none relative">
       {/* Left half: Decorative Indigo Gradient (hidden on mobile) */}
-      <div className="hidden lg:flex lg:w-1/2 bg-gradient-to-tr from-indigo-600 via-indigo-500 to-violet-600 relative items-center justify-center p-12 overflow-hidden">
-        {/* Floating circles decoration */}
-        <div className="absolute top-12 left-12 h-32 w-32 bg-white/10 rounded-full blur-xl animate-pulse" />
-        <div className="absolute bottom-16 right-16 h-48 w-48 bg-white/5 rounded-full blur-2xl animate-pulse delay-700" />
+      <div className="hidden lg:flex lg:w-1/2 bg-gradient-to-tr from-indigo-600 via-indigo-500 to-purple-600 relative items-center justify-center p-12 overflow-hidden">
+        {/* Floating animated blobs */}
+        <div className="absolute top-10 left-10 h-72 w-72 bg-white/10 rounded-full blur-2xl animate-pulse" />
+        <div className="absolute bottom-10 right-10 h-96 w-96 bg-white/5 rounded-full blur-3xl animate-pulse delay-1000" />
         <div className="absolute top-1/2 left-1/3 h-56 w-56 bg-indigo-400/20 rounded-full blur-3xl pointer-events-none" />
 
         <div className="relative z-10 max-w-md text-white text-center space-y-6">
           <div className="mx-auto h-16 w-16 rounded-2xl bg-white/10 backdrop-blur-md flex items-center justify-center shadow-2xl border border-white/20">
-            <svg className="h-8 w-8 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z" />
+            <svg className="h-8 w-8 text-white" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+              <polyline points="22 12 16 12 14 15 10 15 8 12 2 12" />
+              <path d="M5.45 5.11L2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.45-6.89A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11z" />
             </svg>
           </div>
-          <h1 className="text-4xl font-extrabold tracking-tight">Welcome Back</h1>
-          <p className="text-white/80 leading-relaxed text-sm">
-            Sign in to manage your emails & tasks inside the workspace central manager app.
+          <h1 className="text-5xl font-black tracking-tight leading-none">MailDesk</h1>
+          <p className="text-white/80 leading-relaxed text-base font-semibold">
+            Where Emails Meet Action.
           </p>
         </div>
       </div>
 
       {/* Right half: Form card (full screen on mobile) */}
-      <div className="w-full lg:w-1/2 flex items-center justify-center px-6 sm:px-12 lg:px-20 bg-slate-50/50">
-        <div className="max-w-md w-full space-y-8 bg-white p-8 sm:p-10 rounded-3xl shadow-xl border border-slate-100 relative">
+      <div className="w-full lg:w-1/2 flex items-center justify-center px-6 sm:px-12 lg:px-20 bg-slate-50/30">
+        <div className="max-w-md w-full space-y-8 bg-white p-8 sm:p-10 rounded-3xl shadow-xl border border-slate-100/80 relative">
           <div>
-            <div className="mx-auto lg:mx-0 h-10 w-10 rounded-xl bg-indigo-600 flex items-center justify-center text-white font-black text-sm shadow-md shadow-indigo-600/15 mb-6">
-              CE
+            <div className="mx-auto lg:mx-0 h-11 w-11 rounded-2xl bg-gradient-to-tr from-indigo-600 to-purple-600 flex items-center justify-center text-white shadow-md shadow-indigo-600/10 mb-6">
+              <svg className="h-5 w-5 text-white" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+                <polyline points="22 12 16 12 14 15 10 15 8 12 2 12" />
+                <path d="M5.45 5.11L2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.45-6.89A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11z" />
+              </svg>
             </div>
-            <h2 className="text-2xl font-bold text-slate-800 tracking-tight">
-              Sign In
+            <h2 className="text-3xl font-black text-slate-900 tracking-tight leading-none">
+              Welcome back
             </h2>
-            <p className="mt-1.5 text-xs text-slate-400">
-              Welcome back. Enter your workspace details to continue.
+            <p className="mt-2 text-xs text-slate-500 font-medium leading-relaxed">
+              Manage Mails. Assign Tasks. Stay Ahead.
             </p>
           </div>
 
@@ -80,7 +84,7 @@ const Login = () => {
 
           <form className="mt-6 space-y-4" onSubmit={handleSubmit}>
             <div>
-              <label htmlFor="email" className="block text-[10px] font-semibold text-slate-500 uppercase tracking-wider mb-1">
+              <label htmlFor="email" className="block text-[10px] font-bold text-slate-400 uppercase tracking-wider mb-1">
                 Email Address
               </label>
               <input
@@ -88,7 +92,7 @@ const Login = () => {
                 name="email"
                 type="email"
                 required
-                className="mt-1 block w-full px-4 py-3 bg-white border border-slate-200 rounded-xl text-slate-850 placeholder-slate-400 focus:outline-none focus:ring-2 focus:ring-indigo-100 focus:border-indigo-500 transition-all duration-150 text-xs"
+                className="mt-1 block w-full px-4 py-3 bg-slate-50/50 hover:bg-slate-50/80 border border-slate-200/80 rounded-xl text-slate-900 placeholder-slate-400 focus:outline-none focus:ring-2 focus:ring-indigo-100 focus:border-indigo-500 transition-all duration-150 text-xs font-semibold focus:bg-white"
                 placeholder="you@example.com"
                 value={email}
                 onChange={(e) => setEmail(e.target.value)}
@@ -96,7 +100,7 @@ const Login = () => {
             </div>
 
             <div>
-              <label htmlFor="password" className="block text-[10px] font-semibold text-slate-500 uppercase tracking-wider mb-1">
+              <label htmlFor="password" className="block text-[10px] font-bold text-slate-400 uppercase tracking-wider mb-1">
                 Password
               </label>
               <input
@@ -104,7 +108,7 @@ const Login = () => {
                 name="password"
                 type="password"
                 required
-                className="mt-1 block w-full px-4 py-3 bg-white border border-slate-200 rounded-xl text-slate-850 placeholder-slate-400 focus:outline-none focus:ring-2 focus:ring-indigo-100 focus:border-indigo-500 transition-all duration-150 text-xs"
+                className="mt-1 block w-full px-4 py-3 bg-slate-50/50 hover:bg-slate-50/80 border border-slate-200/80 rounded-xl text-slate-900 placeholder-slate-400 focus:outline-none focus:ring-2 focus:ring-indigo-100 focus:border-indigo-500 transition-all duration-150 text-xs font-semibold focus:bg-white"
                 placeholder="••••••••"
                 value={password}
                 onChange={(e) => setPassword(e.target.value)}
@@ -115,7 +119,7 @@ const Login = () => {
               <button
                 type="submit"
                 disabled={loading}
-                className="w-full flex justify-center py-3.5 px-4 border border-transparent text-xs font-semibold rounded-xl text-white bg-indigo-600 hover:bg-indigo-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-indigo-500 transition-all duration-150 disabled:opacity-50 disabled:cursor-not-allowed shadow-md shadow-indigo-600/10 hover:shadow-lg active:scale-[0.98]"
+                className="w-full flex justify-center py-3.5 px-4 text-xs font-bold rounded-xl text-white bg-gradient-to-r from-indigo-600 to-purple-600 hover:from-indigo-700 hover:to-purple-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-indigo-500 transition-all duration-150 disabled:opacity-50 disabled:cursor-not-allowed shadow-[0_4px_15px_rgba(99,102,241,0.3)] hover:shadow-[0_6px_20px_rgba(99,102,241,0.4)] active:scale-[0.98]"
               >
                 {loading ? 'Signing In...' : 'Sign In'}
               </button>
@@ -123,9 +127,9 @@ const Login = () => {
           </form>
 
           <div className="text-center mt-6">
-            <p className="text-xs text-slate-455">
+            <p className="text-xs text-slate-500 font-semibold">
               Don't have an account?{' '}
-              <Link to="/register" className="font-semibold text-indigo-650 hover:text-indigo-700 transition-colors">
+              <Link to="/register" className="font-bold text-indigo-600 hover:text-indigo-700 transition-colors">
                 Create an account
               </Link>
             </p>

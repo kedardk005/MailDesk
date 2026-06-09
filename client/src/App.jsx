@@ -1,5 +1,6 @@
-import React from 'react';
+import React, { useEffect } from 'react';
 import { BrowserRouter as Router, Routes, Route, Navigate } from 'react-router-dom';
+import Landing from './pages/Landing';
 import Login from './pages/Login';
 import Register from './pages/Register';
 import Dashboard from './pages/Dashboard';
@@ -11,13 +12,24 @@ import ProtectedRoute from './components/ProtectedRoute';
 import AdminRoute from './components/AdminRoute';
 import ProtectedLayout from './components/ProtectedLayout';
 import Reports from './pages/admin/Reports';
+import { initCursorEffects } from './utils/cursorEffects';
+import { initScrollAnimations } from './utils/scrollAnimations';
 
 function App() {
+  useEffect(() => {
+    const cleanupCursor = initCursorEffects();
+    const cleanupScroll = initScrollAnimations();
+    return () => {
+      if (cleanupCursor) cleanupCursor();
+      if (cleanupScroll) cleanupScroll();
+    };
+  }, []);
+
   return (
     <Router>
       <Routes>
-        {/* Redirect base route to login */}
-        <Route path="/" element={<Navigate to="/login" replace />} />
+        {/* Landing Page Route */}
+        <Route path="/" element={<Landing />} />
         
         {/* Public Routes */}
         <Route path="/login" element={<Login />} />

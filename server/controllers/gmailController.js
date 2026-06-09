@@ -1,6 +1,7 @@
 const { google } = require('googleapis');
 const User = require('../models/User');
 const Email = require('../models/Email');
+const Task = require('../models/Task');
 const { logActivity } = require('../utils/activityLogger');
 
 // Helper to get OAuth2 Client
@@ -131,7 +132,7 @@ exports.handleOAuthCallback = async (req, res) => {
   }
 };
 
-// @desc    Manually fetch the last 20 emails
+// @desc    Manually fetch the last 50 emails
 // @route   POST /api/gmail/fetch
 // @access  Private
 exports.fetchEmails = async (req, res) => {
@@ -165,12 +166,12 @@ exports.fetchEmails = async (req, res) => {
 
     const gmail = google.gmail({ version: 'v1', auth: oauth2Client });
 
-    // Fetch list of last 20 messages
+    // Fetch list of last 50 messages
     let listRes;
     try {
       listRes = await gmail.users.messages.list({
         userId: 'me',
-        maxResults: 20
+        maxResults: 50
       });
     } catch (apiError) {
       console.error('Gmail List API Error:', apiError);
@@ -223,7 +224,8 @@ exports.fetchEmails = async (req, res) => {
         date,
         body: decodedBody,
         status: 'unassigned',
-        assignedTo: null
+        assignedTo: null,
+        fetchedBy: req.user._id
       });
 
       await emailRecord.save();
@@ -269,3 +271,108 @@ exports.getEmails = async (req, res) => {
     return res.status(500).json({ message: 'Server error. Failed to query emails.' });
   }
 };
+
+// @desc    Delete all emails (Admin only)
+// @route   DELETE /api/gmail/emails
+// @access  Private (Admin only)
+exports.deleteAllEmails = async (req, res) => {
+  try {
+    const result = await Email.deleteMany({});
+    await Task.updateMany({ linkedEmail: { $ne: null } }, { $set: { linkedEmail: null } });
+    
+    await logActivity(req.user._id, 'Gmail Delete All', `Cleared all emails (${result.deletedCount} emails deleted)`);
+
+    return res.status(200).json({
+      message: "All emails cleared",
+      count: result.deletedCount
+    });
+  } catch (error) {
+    console.error('Error in deleteAllEmails:', error);
+    return res.status(500).json({ message: 'Server error. Failed to clear emails.' });
+  }
+};
+
+// @desc    Delete single email (Admin, Head only)
+// @route   DELETE /api/gmail/emails/:id
+// @access  Private (Admin, Head only)
+exports.deleteSingleEmail = async (req, res) => {
+  try {
+    const emailId = req.params.id;
+    const email = await Email.findById(emailId);
+    if (!email) {
+      return res.status(404).json({ message: "Email not found" });
+    }
+    
+    await Email.findByIdAndDelete(emailId);
+    await Task.updateMany({ linkedEmail: emailId }, { $set: { linkedEmail: null } });
+    
+    await logActivity(req.user._id, 'Gmail Delete Single', `Deleted email: "${email.subject}"`);
+
+    return res.status(200).json({ message: "Email deleted" });
+  } catch (error) {
+    console.error('Error in deleteSingleEmail:', error);
+    return res.status(500).json({ message: 'Server error. Failed to delete email.' });
+  }
+};
+
+// @desc    Get Gmail connection status
+// @route   GET /api/gmail/status
+// @access  Private
+exports.getConnectedStatus = async (req, res) => {
+  try {
+    const user = await User.findById(req.user._id);
+    if (!user) {
+      return res.status(404).json({ message: "User not found" });
+    }
+    const isConnected = !!user.gmailAccessToken && user.gmailAccessToken !== "";
+    return res.status(200).json({
+      connected: isConnected,
+      email: user.email
+    });
+  } catch (error) {
+    console.error('Error in getConnectedStatus:', error);
+    return res.status(500).json({ message: 'Server error. Failed to check connected status.' });
+  }
+};
+
+// @desc    Disconnect Gmail account
+// @route   DELETE /api/gmail/disconnect
+// @access  Private
+exports.disconnectGmail = async (req, res) => {
+  try {
+    const userId = req.user._id;
+
+    // 1. Clear user tokens in DB
+    const user = await User.findById(userId);
+    if (!user) {
+      return res.status(404).json({ message: "User not found" });
+    }
+    user.gmailAccessToken = "";
+    user.gmailRefreshToken = "";
+    await user.save();
+
+    // 2. Find all emails fetched by this user
+    const emailsToDelete = await Email.find({ fetchedBy: userId });
+    const emailIds = emailsToDelete.map(e => e._id);
+
+    // 3. Delete the emails from collection
+    await Email.deleteMany({ fetchedBy: userId });
+
+    // 4. Update tasks that had linkedEmail in those emailIds
+    if (emailIds.length > 0) {
+      await Task.updateMany(
+        { linkedEmail: { $in: emailIds } },
+        { $set: { linkedEmail: null } }
+      );
+    }
+
+    await logActivity(userId, 'Gmail Disconnect', `Disconnected Gmail account for user ${user.email}`);
+
+    return res.status(200).json({ message: "Gmail disconnected successfully" });
+  } catch (error) {
+    console.error('Error in disconnectGmail:', error);
+    return res.status(500).json({ message: 'Server error. Failed to disconnect Gmail.' });
+  }
+};
+
+

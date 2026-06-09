@@ -430,7 +430,7 @@ const TaskList = () => {
             {(currentUser?.role === 'Admin' || currentUser?.role === 'Head') && (
               <button
                 onClick={() => setIsCreateOpen(true)}
-                className="px-5 py-3 rounded-xl bg-indigo-600 hover:bg-indigo-700 text-xs font-bold text-white shadow-md transition-all duration-200 flex items-center space-x-2 active:scale-[0.98] select-none"
+                className="px-5 py-3 rounded-xl bg-gradient-to-r from-indigo-600 to-purple-600 text-xs font-bold text-white shadow-md shadow-indigo-600/10 transition-all duration-200 flex items-center space-x-2 active:scale-[0.98] select-none"
               >
                 <svg className="h-4 w-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                   <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M12 6v6m0 0v6m0-6h6m-6 0H6" />
@@ -449,8 +449,8 @@ const TaskList = () => {
               onClick={() => setStatusFilter(filter)}
               className={`px-4 py-2 text-xs font-bold rounded-full border transition-all ${
                 statusFilter === filter
-                  ? 'bg-indigo-600 border-indigo-600 text-white shadow-md shadow-indigo-600/10'
-                  : 'bg-white border-slate-200 text-slate-500 hover:bg-slate-50 hover:text-slate-700'
+                  ? 'bg-gradient-to-r from-indigo-600 to-purple-600 border-transparent text-white shadow-md shadow-indigo-600/10'
+                  : 'bg-white border-slate-200 text-slate-500 hover:bg-slate-55 hover:text-slate-700'
               }`}
             >
               {filter}
@@ -601,7 +601,7 @@ const TaskList = () => {
                                 event.stopPropagation();
                                 openEditModal(task);
                               }}
-                              className="px-4 py-2 border-2 border-indigo-650 text-indigo-650 rounded-xl text-xs font-bold hover:bg-indigo-50 transition-all duration-200 ease-in-out"
+                              className="px-4 py-2 border-2 border-indigo-600 text-indigo-600 rounded-xl text-xs font-bold hover:bg-indigo-50 transition-all duration-200 ease-in-out"
                             >
                               Edit Task
                             </button>
@@ -652,8 +652,8 @@ const TaskList = () => {
 
       {/* MODAL: CREATE TASK */}
       {isCreateOpen && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 backdrop-blur-[4px] p-4 overflow-y-auto">
-          <div className="bg-white border border-slate-200 rounded-2xl max-w-lg w-full p-6 relative shadow-2xl animate-fade-in my-8 max-h-[90vh] overflow-y-auto select-none">
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 backdrop-blur-md p-4 overflow-y-auto">
+          <div className="bg-white/95 backdrop-blur-2xl border border-indigo-100 rounded-3xl max-w-lg w-full p-6 relative shadow-[0_25px_80px_rgba(99,102,241,0.2)] animate-fade-in my-8 max-h-[90vh] overflow-y-auto select-none">
             <div className="flex items-center justify-between mb-4">
               <div>
                 <h3 className="text-xl font-bold text-slate-800">Create New Task</h3>
@@ -797,7 +797,7 @@ const TaskList = () => {
                 <button
                   type="submit"
                   disabled={actionLoading}
-                  className="w-1/2 py-3 px-4 bg-indigo-600 hover:bg-indigo-700 rounded-xl text-sm font-semibold transition-colors text-white disabled:opacity-50 flex items-center justify-center space-x-2 shadow-md hover:translate-y-[-2px] active:translate-y-0"
+                  className="w-1/2 py-3 px-4 bg-gradient-to-r from-indigo-600 to-purple-600 rounded-xl text-sm font-semibold transition-all text-white disabled:opacity-50 flex items-center justify-center space-x-2 shadow-md hover:translate-y-[-2px] active:translate-y-0 active:scale-98"
                 >
                   {actionLoading ? (
                     <svg className="animate-spin h-5 w-5 text-white" fill="none" viewBox="0 0 24 24">
@@ -816,20 +816,20 @@ const TaskList = () => {
 
       {/* MODAL: EDIT TASK / DETAILS */}
       {isEditOpen && selectedTask && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 backdrop-blur-[4px] p-4 overflow-y-auto">
-          <div className="bg-white border border-slate-200 rounded-2xl max-w-lg w-full p-6 relative shadow-2xl animate-fade-in my-8 max-h-[90vh] overflow-y-auto select-none">
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 backdrop-blur-md p-4 overflow-y-auto">
+          <div className="bg-white/95 backdrop-blur-2xl border border-indigo-100 rounded-3xl max-w-lg w-full p-6 relative shadow-[0_25px_80px_rgba(99,102,241,0.2)] animate-fade-in my-8 max-h-[90vh] overflow-y-auto select-none">
             <div className="flex items-center justify-between mb-4">
               <div>
                 <h3 className="text-xl font-bold text-slate-800">
                   {currentUser.role === 'Admin' || currentUser.role === 'Head' ? 'Edit Task Records' : 'Task Details'}
                 </h3>
-                <p className="text-xs text-slate-505 mt-1">
+                <p className="text-xs text-slate-500 mt-1">
                   {currentUser.role === 'Admin' || currentUser.role === 'Head'
                     ? 'Update parameters or assign status changes.'
                     : 'Review assignment details below.'}
                 </p>
               </div>
-              <button onClick={() => { setIsEditOpen(false); setSelectedTask(null); }} className="text-slate-400 hover:text-slate-655 transition-colors">
+              <button onClick={() => { setIsEditOpen(false); setSelectedTask(null); }} className="text-slate-400 hover:text-slate-600 transition-colors">
                 <svg className="h-5 w-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                   <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M6 18L18 6M6 6l12 12" />
                 </svg>
@@ -983,7 +983,7 @@ const TaskList = () => {
                   <button
                     type="submit"
                     disabled={actionLoading}
-                    className="w-1/2 py-3 px-4 bg-indigo-600 hover:bg-indigo-700 text-white rounded-xl text-sm font-semibold transition-colors disabled:opacity-50 flex items-center justify-center space-x-2 shadow-md hover:translate-y-[-2px] active:translate-y-0"
+                    className="w-1/2 py-3 px-4 bg-gradient-to-r from-indigo-600 to-purple-600 text-white rounded-xl text-sm font-semibold transition-all disabled:opacity-50 flex items-center justify-center space-x-2 shadow-md hover:translate-y-[-2px] active:translate-y-0 active:scale-98"
                   >
                     {actionLoading ? (
                       <svg className="animate-spin h-5 w-5 text-white" fill="none" viewBox="0 0 24 24">

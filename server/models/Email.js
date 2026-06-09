@@ -31,6 +31,11 @@ const EmailSchema = new mongoose.Schema({
     enum: ['unassigned', 'assigned'],
     default: 'unassigned'
   },
+  fetchedBy: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'User',
+    default: null
+  },
   fetchedAt: {
     type: Date,
     default: Date.now

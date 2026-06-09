@@ -1,5 +1,7 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import api from '../api/axios';
+import CountUp from '../utils/countUp';
+import { initTilt } from '../utils/tiltEffect';
 
 const Dashboard = () => {
   const [fetching, setFetching] = useState(false);
@@ -7,6 +9,17 @@ const Dashboard = () => {
   const [tasks, setTasks] = useState([]);
   const [overallStats, setOverallStats] = useState(null);
   const [statsLoading, setStatsLoading] = useState(true);
+  const [gmailStatus, setGmailStatus] = useState({ connected: false, email: '' });
+  const containerRef = useRef(null);
+
+  useEffect(() => {
+    let cleanups = [];
+    if (!statsLoading && containerRef.current) {
+      const cards = containerRef.current.querySelectorAll('.tilt-stat-card');
+      cleanups = Array.from(cards).map(card => initTilt(card, 5, 800));
+    }
+    return () => cleanups.forEach(c => c());
+  }, [statsLoading, overallStats, tasks]);
   
   // Retrieve user details from localStorage
   const userString = localStorage.getItem('user');
@@ -38,6 +51,15 @@ const Dashboard = () => {
     }
   };
 
+  const fetchGmailStatus = async () => {
+    try {
+      const res = await api.get('/gmail/status');
+      setGmailStatus(res.data);
+    } catch (err) {
+      console.error('Error fetching Gmail status:', err);
+    }
+  };
+
   // Check query parameter on load
   useEffect(() => {
     const params = new URLSearchParams(window.location.search);
@@ -46,6 +68,7 @@ const Dashboard = () => {
       window.history.replaceState({}, document.title, '/dashboard');
     }
     fetchDashboardData();
+    fetchGmailStatus();
   }, []);
 
   const triggerAlert = (type, message) => {
@@ -64,6 +87,23 @@ const Dashboard = () => {
     } catch (err) {
       console.error('Error generating Gmail auth URL:', err);
       const message = err.response?.data?.message || 'Failed to start Google connection process.';
+      triggerAlert('error', message);
+    }
+  };
+
+  const handleDisconnectGmail = async () => {
+    if (!window.confirm("Are you sure? This will remove all synced emails from this account.")) {
+      return;
+    }
+    
+    try {
+      await api.delete('/gmail/disconnect');
+      setGmailStatus({ connected: false, email: '' });
+      triggerAlert('success', 'Gmail disconnected successfully.');
+      fetchDashboardData();
+    } catch (err) {
+      console.error('Error disconnecting Gmail:', err);
+      const message = err.response?.data?.message || 'Failed to disconnect Gmail. Please try again.';
       triggerAlert('error', message);
     }
   };
@@ -151,114 +191,158 @@ const Dashboard = () => {
           </div>
 
           {/* Stats Cards Section */}
-          <div className="space-y-4">
+          <div className="space-y-4" ref={containerRef}>
             <h2 className="text-sm font-bold text-slate-800 uppercase tracking-wide">
               {user.role === 'Employee' ? 'My Task Statistics' : 'Workspace Metrics'}
             </h2>
             {statsLoading ? (
               <div className="grid grid-cols-2 sm:grid-cols-4 gap-4">
                 {[...Array(user.role === 'Employee' ? 4 : 6)].map((_, i) => (
-                  <div key={i} className="bg-white border border-slate-200/80 rounded-2xl p-5 h-28 skeleton-shimmer" />
+                  <div key={i} className="bg-white border border-slate-100 rounded-2xl p-5 h-28 skeleton-shimmer" />
                 ))}
               </div>
             ) : user.role === 'Employee' ? (
               <div className="grid grid-cols-2 sm:grid-cols-4 gap-4">
                 {/* My Tasks */}
-                <div className="bg-white border border-slate-200/80 p-5 rounded-2xl flex flex-col justify-between hover-glow-card shadow-sm">
+                <div className="tilt-stat-card bg-white border border-slate-100 p-6 rounded-2xl flex flex-col justify-between shadow-sm hover:shadow-[0_20px_40px_rgba(99,102,241,0.08)] hover:-translate-y-1 transition-all duration-300">
                   <div className="flex items-center justify-between">
-                    <span className="text-[10px] font-bold text-slate-400 uppercase tracking-wider">Assigned</span>
-                    <div className="h-7 w-7 rounded-lg bg-indigo-50 text-indigo-600 flex items-center justify-center font-bold text-xs shrink-0">📋</div>
+                    <div className="h-8 w-8 rounded-lg bg-indigo-50 text-indigo-600 flex items-center justify-center font-bold text-xs shrink-0">📋</div>
+                    <span className="text-[9px] font-bold text-indigo-550 bg-indigo-50 border border-indigo-100 px-2.5 py-0.5 rounded-full uppercase tracking-wider font-mono">Active</span>
                   </div>
-                  <span className="text-2xl font-bold text-slate-800 mt-3">{tasks.length}</span>
+                  <div className="mt-4">
+                    <span className="text-3xl font-black text-slate-900 tracking-tight leading-none block">
+                      <CountUp end={tasks.length} />
+                    </span>
+                    <span className="text-xs font-semibold text-slate-500 block mt-2">Assigned Tasks</span>
+                  </div>
                 </div>
 
                 {/* Pending */}
-                <div className="bg-white border border-slate-200/80 p-5 rounded-2xl flex flex-col justify-between hover-glow-card shadow-sm">
+                <div className="tilt-stat-card bg-white border border-slate-100 p-6 rounded-2xl flex flex-col justify-between shadow-sm hover:shadow-[0_20px_40px_rgba(99,102,241,0.08)] hover:-translate-y-1 transition-all duration-300">
                   <div className="flex items-center justify-between">
-                    <span className="text-[10px] font-bold text-slate-400 uppercase tracking-wider">Pending</span>
-                    <div className="h-7 w-7 rounded-lg bg-amber-50 text-amber-500 flex items-center justify-center font-bold text-xs shrink-0">⏳</div>
+                    <div className="h-8 w-8 rounded-lg bg-amber-50 text-amber-500 flex items-center justify-center font-bold text-xs shrink-0">⏳</div>
+                    <span className="text-[9px] font-bold text-amber-600 bg-amber-50 border border-amber-100 px-2.5 py-0.5 rounded-full uppercase tracking-wider font-mono">Pending</span>
                   </div>
-                  <span className="text-2xl font-bold text-slate-800 mt-3">
-                    {tasks.filter(t => t.status === 'Pending').length}
-                  </span>
+                  <div className="mt-4">
+                    <span className="text-3xl font-black text-slate-900 tracking-tight leading-none block">
+                      <CountUp end={tasks.filter(t => t.status === 'Pending').length} />
+                    </span>
+                    <span className="text-xs font-semibold text-slate-500 block mt-2">Pending Tasks</span>
+                  </div>
                 </div>
 
                 {/* Completed */}
-                <div className="bg-white border border-slate-200/80 p-5 rounded-2xl flex flex-col justify-between hover-glow-card shadow-sm">
+                <div className="tilt-stat-card bg-white border border-slate-100 p-6 rounded-2xl flex flex-col justify-between shadow-sm hover:shadow-[0_20px_40px_rgba(99,102,241,0.08)] hover:-translate-y-1 transition-all duration-300">
                   <div className="flex items-center justify-between">
-                    <span className="text-[10px] font-bold text-slate-400 uppercase tracking-wider">Completed</span>
-                    <div className="h-7 w-7 rounded-lg bg-emerald-50 text-emerald-505 flex items-center justify-center font-bold text-xs shrink-0">✓</div>
+                    <div className="h-8 w-8 rounded-lg bg-emerald-50 text-emerald-500 flex items-center justify-center font-bold text-xs shrink-0">✓</div>
+                    <span className="text-[9px] font-bold text-emerald-600 bg-emerald-50 border border-emerald-100 px-2.5 py-0.5 rounded-full uppercase tracking-wider font-mono">On Track</span>
                   </div>
-                  <span className="text-2xl font-bold text-slate-800 mt-3">
-                    {tasks.filter(t => t.status === 'Completed').length}
-                  </span>
+                  <div className="mt-4">
+                    <span className="text-3xl font-black text-slate-900 tracking-tight leading-none block">
+                      <CountUp end={tasks.filter(t => t.status === 'Completed').length} />
+                    </span>
+                    <span className="text-xs font-semibold text-slate-500 block mt-2">Completed Tasks</span>
+                  </div>
                 </div>
 
                 {/* Late */}
-                <div className="bg-white border border-slate-200/80 p-5 rounded-2xl flex flex-col justify-between hover-glow-card shadow-sm">
+                <div className="tilt-stat-card bg-white border border-slate-100 p-6 rounded-2xl flex flex-col justify-between shadow-sm hover:shadow-[0_20px_40px_rgba(99,102,241,0.08)] hover:-translate-y-1 transition-all duration-300">
                   <div className="flex items-center justify-between">
-                    <span className="text-[10px] font-bold text-slate-400 uppercase tracking-wider">Late</span>
-                    <div className="h-7 w-7 rounded-lg bg-red-50 text-red-500 flex items-center justify-center font-bold text-xs shrink-0">⚠️</div>
+                    <div className="h-8 w-8 rounded-lg bg-red-50 text-red-500 flex items-center justify-center font-bold text-xs shrink-0">⚠️</div>
+                    <span className="text-[9px] font-bold text-red-500 bg-red-50 border border-red-100 px-2.5 py-0.5 rounded-full uppercase tracking-wider font-mono">Late</span>
                   </div>
-                  <span className="text-2xl font-bold text-slate-800 mt-3">
-                    {tasks.filter(t => t.status === 'Late').length}
-                  </span>
+                  <div className="mt-4">
+                    <span className="text-3xl font-black text-slate-900 tracking-tight leading-none block">
+                      <CountUp end={tasks.filter(t => t.status === 'Late').length} />
+                    </span>
+                    <span className="text-xs font-semibold text-slate-500 block mt-2">Overdue Tasks</span>
+                  </div>
                 </div>
               </div>
             ) : (
               <div className="grid grid-cols-2 sm:grid-cols-3 gap-4">
                 {/* Total Users */}
-                <div className="bg-white border border-slate-200/80 p-5 rounded-2xl flex flex-col justify-between hover-glow-card shadow-sm">
+                <div className="tilt-stat-card bg-white border border-slate-100 p-6 rounded-2xl flex flex-col justify-between shadow-sm hover:shadow-[0_20px_40px_rgba(99,102,241,0.08)] hover:-translate-y-1 transition-all duration-300">
                   <div className="flex items-center justify-between">
-                    <span className="text-[10px] font-bold text-slate-400 uppercase tracking-wider">Users</span>
-                    <div className="h-7 w-7 rounded-lg bg-slate-50 text-slate-500 flex items-center justify-center text-xs shrink-0">👥</div>
+                    <div className="h-8 w-8 rounded-lg bg-slate-50 text-slate-500 flex items-center justify-center text-xs shrink-0">👥</div>
+                    <span className="text-[9px] font-bold text-slate-400 bg-slate-50 border border-slate-100 px-2.5 py-0.5 rounded-full uppercase tracking-wider font-mono">Team</span>
                   </div>
-                  <span className="text-2xl font-bold text-slate-800 mt-3">{overallStats?.totalUsers || 0}</span>
+                  <div className="mt-4">
+                    <span className="text-3xl font-black text-slate-900 tracking-tight leading-none block">
+                      <CountUp end={overallStats?.totalUsers || 0} />
+                    </span>
+                    <span className="text-xs font-semibold text-slate-500 block mt-2">Workspace Users</span>
+                  </div>
                 </div>
 
                 {/* Total Emails */}
-                <div className="bg-white border border-slate-200/80 p-5 rounded-2xl flex flex-col justify-between hover-glow-card shadow-sm">
+                <div className="tilt-stat-card bg-white border border-slate-100 p-6 rounded-2xl flex flex-col justify-between shadow-sm hover:shadow-[0_20px_40px_rgba(99,102,241,0.08)] hover:-translate-y-1 transition-all duration-300">
                   <div className="flex items-center justify-between">
-                    <span className="text-[10px] font-bold text-slate-400 uppercase tracking-wider">Emails</span>
-                    <div className="h-7 w-7 rounded-lg bg-indigo-50 text-indigo-600 flex items-center justify-center text-xs shrink-0">✉️</div>
+                    <div className="h-8 w-8 rounded-lg bg-indigo-50 text-indigo-600 flex items-center justify-center text-xs shrink-0">✉️</div>
+                    <span className="text-[9px] font-bold text-indigo-600 bg-indigo-50 border border-indigo-100 px-2.5 py-0.5 rounded-full uppercase tracking-wider font-mono">Sync</span>
                   </div>
-                  <span className="text-2xl font-bold text-slate-800 mt-3">{overallStats?.totalEmails || 0}</span>
+                  <div className="mt-4">
+                    <span className="text-3xl font-black text-slate-900 tracking-tight leading-none block">
+                      <CountUp end={overallStats?.totalEmails || 0} />
+                    </span>
+                    <span className="text-xs font-semibold text-slate-500 block mt-2">Emails Synced</span>
+                  </div>
                 </div>
 
                 {/* Total Tasks */}
-                <div className="bg-white border border-slate-200/80 p-5 rounded-2xl flex flex-col justify-between hover-glow-card shadow-sm">
+                <div className="tilt-stat-card bg-white border border-slate-100 p-6 rounded-2xl flex flex-col justify-between shadow-sm hover:shadow-[0_20px_40px_rgba(99,102,241,0.08)] hover:-translate-y-1 transition-all duration-300">
                   <div className="flex items-center justify-between">
-                    <span className="text-[10px] font-bold text-slate-400 uppercase tracking-wider">Tasks</span>
-                    <div className="h-7 w-7 rounded-lg bg-slate-50 text-slate-550 flex items-center justify-center text-xs shrink-0">📋</div>
+                    <div className="h-8 w-8 rounded-lg bg-purple-50 text-purple-600 flex items-center justify-center text-xs shrink-0">📋</div>
+                    <span className="text-[9px] font-bold text-purple-600 bg-purple-50 border border-purple-100 px-2.5 py-0.5 rounded-full uppercase tracking-wider font-mono">Workload</span>
                   </div>
-                  <span className="text-2xl font-bold text-slate-800 mt-3">{overallStats?.totalTasks || 0}</span>
+                  <div className="mt-4">
+                    <span className="text-3xl font-black text-slate-900 tracking-tight leading-none block">
+                      <CountUp end={overallStats?.totalTasks || 0} />
+                    </span>
+                    <span className="text-xs font-semibold text-slate-500 block mt-2">Total Tasks Logged</span>
+                  </div>
                 </div>
 
                 {/* Pending */}
-                <div className="bg-white border border-slate-200/80 p-5 rounded-2xl flex flex-col justify-between hover-glow-card shadow-sm">
+                <div className="tilt-stat-card bg-white border border-slate-100 p-6 rounded-2xl flex flex-col justify-between shadow-sm hover:shadow-[0_20px_40px_rgba(99,102,241,0.08)] hover:-translate-y-1 transition-all duration-300">
                   <div className="flex items-center justify-between">
-                    <span className="text-[10px] font-bold text-slate-400 uppercase tracking-wider">Pending</span>
-                    <div className="h-7 w-7 rounded-lg bg-amber-50 text-amber-500 flex items-center justify-center text-xs shrink-0">⏳</div>
+                    <div className="h-8 w-8 rounded-lg bg-amber-50 text-amber-500 flex items-center justify-center text-xs shrink-0">⏳</div>
+                    <span className="text-[9px] font-bold text-amber-600 bg-amber-50 border border-amber-100 px-2.5 py-0.5 rounded-full uppercase tracking-wider font-mono">Pending</span>
                   </div>
-                  <span className="text-2xl font-bold text-slate-800 mt-3">{overallStats?.totalPending || 0}</span>
+                  <div className="mt-4">
+                    <span className="text-3xl font-black text-slate-900 tracking-tight leading-none block">
+                      <CountUp end={overallStats?.totalPending || 0} />
+                    </span>
+                    <span className="text-xs font-semibold text-slate-500 block mt-2">Pending Tasks</span>
+                  </div>
                 </div>
 
                 {/* Completed */}
-                <div className="bg-white border border-slate-200/80 p-5 rounded-2xl flex flex-col justify-between hover-glow-card shadow-sm">
+                <div className="tilt-stat-card bg-white border border-slate-100 p-6 rounded-2xl flex flex-col justify-between shadow-sm hover:shadow-[0_20px_40px_rgba(99,102,241,0.08)] hover:-translate-y-1 transition-all duration-300">
                   <div className="flex items-center justify-between">
-                    <span className="text-[10px] font-bold text-slate-400 uppercase tracking-wider">Completed</span>
-                    <div className="h-7 w-7 rounded-lg bg-emerald-50 text-emerald-500 flex items-center justify-center text-xs shrink-0">✓</div>
+                    <div className="h-8 w-8 rounded-lg bg-emerald-50 text-emerald-500 flex items-center justify-center text-xs shrink-0">✓</div>
+                    <span className="text-[9px] font-bold text-emerald-600 bg-emerald-50 border border-emerald-100 px-2.5 py-0.5 rounded-full uppercase tracking-wider font-mono">Resolved</span>
                   </div>
-                  <span className="text-2xl font-bold text-slate-800 mt-3">{overallStats?.totalCompleted || 0}</span>
+                  <div className="mt-4">
+                    <span className="text-3xl font-black text-slate-900 tracking-tight leading-none block">
+                      <CountUp end={overallStats?.totalCompleted || 0} />
+                    </span>
+                    <span className="text-xs font-semibold text-slate-500 block mt-2">Tasks Completed</span>
+                  </div>
                 </div>
 
                 {/* Late */}
-                <div className="bg-white border border-slate-200/80 p-5 rounded-2xl flex flex-col justify-between hover-glow-card shadow-sm">
+                <div className="tilt-stat-card bg-white border border-slate-100 p-6 rounded-2xl flex flex-col justify-between shadow-sm hover:shadow-[0_20px_40px_rgba(99,102,241,0.08)] hover:-translate-y-1 transition-all duration-300">
                   <div className="flex items-center justify-between">
-                    <span className="text-[10px] font-bold text-slate-400 uppercase tracking-wider">Late</span>
-                    <div className="h-7 w-7 rounded-lg bg-red-50 text-red-500 flex items-center justify-center text-xs shrink-0">⚠️</div>
+                    <div className="h-8 w-8 rounded-lg bg-red-50 text-red-500 flex items-center justify-center text-xs shrink-0">⚠️</div>
+                    <span className="text-[9px] font-bold text-red-500 bg-red-50 border border-red-100 px-2.5 py-0.5 rounded-full uppercase tracking-wider font-mono">Late</span>
                   </div>
-                  <span className="text-2xl font-bold text-slate-800 mt-3">{overallStats?.totalLate || 0}</span>
+                  <div className="mt-4">
+                    <span className="text-3xl font-black text-slate-900 tracking-tight leading-none block">
+                      <CountUp end={overallStats?.totalLate || 0} />
+                    </span>
+                    <span className="text-xs font-semibold text-slate-500 block mt-2">Tasks Overdue</span>
+                  </div>
                 </div>
               </div>
             )}
@@ -269,46 +353,78 @@ const Dashboard = () => {
           <div className="space-y-6">
             {/* Gmail Connection Card */}
             <div className="bg-white border border-slate-200/80 rounded-2xl p-6 shadow-sm flex flex-col space-y-4">
-              <div className="flex items-start space-x-3.5">
-                <div className="h-10 w-10 rounded-xl bg-red-50 border border-red-100 text-red-500 flex items-center justify-center shrink-0">
-                  <svg className="h-5 w-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M3 8l7.89 5.26a2 2 0 002.22 0L21 8M5 19h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v10a2 2 0 002 2z" />
-                  </svg>
-                </div>
-                <div>
-                  <h3 className="text-sm font-bold text-slate-800 tracking-tight">Gmail Connection</h3>
-                  <p className="text-xs text-slate-450 mt-1 leading-relaxed">
-                    Connect account to synchronise email streams into task cards.
-                  </p>
-                </div>
-              </div>
-
-              <div className="grid grid-cols-1 gap-2 pt-2">
-                <button
-                  onClick={handleConnectGmail}
-                  className="w-full flex justify-center items-center gap-2 py-2.5 px-4 rounded-xl text-xs font-bold text-white bg-indigo-600 hover:bg-indigo-700 transition-all duration-150 shadow-md active:scale-[0.98]"
-                >
-                  <span>Link Gmail Account</span>
-                </button>
-
-                <button
-                  onClick={handleFetchEmails}
-                  disabled={fetching}
-                  className="w-full flex justify-center items-center gap-2 py-2.5 px-4 rounded-xl text-xs font-bold text-white bg-indigo-600 hover:bg-indigo-700 transition-all duration-150 disabled:opacity-50 disabled:cursor-not-allowed shadow-md active:scale-[0.98]"
-                >
-                  {fetching ? (
-                    <span className="flex items-center gap-2">
-                      <svg className="animate-spin h-4 w-4 text-white" fill="none" viewBox="0 0 24 24">
-                        <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
-                        <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z" />
+              {gmailStatus.connected ? (
+                <>
+                  <div className="flex items-start space-x-3.5">
+                    <div className="h-10 w-10 rounded-xl bg-emerald-50 border border-emerald-100 text-emerald-500 flex items-center justify-center shrink-0">
+                      <svg className="h-5 w-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M3 8l7.89 5.26a2 2 0 002.22 0L21 8M5 19h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v10a2 2 0 002 2z" />
                       </svg>
-                      <span>Synchronising...</span>
-                    </span>
-                  ) : (
-                    <span>Synchronise Emails</span>
-                  )}
-                </button>
-              </div>
+                    </div>
+                    <div className="min-w-0 flex-grow">
+                      <div className="flex items-center gap-2">
+                        <h3 className="text-sm font-bold text-slate-800 tracking-tight">Gmail Connected</h3>
+                        <span className="h-2 w-2 rounded-full bg-emerald-500 animate-pulse shrink-0" />
+                      </div>
+                      <p className="text-xs text-slate-500 font-bold truncate mt-1">
+                        {gmailStatus.email}
+                      </p>
+                    </div>
+                  </div>
+
+                  <div className="grid grid-cols-1 gap-2 pt-2">
+                    <button
+                      onClick={handleFetchEmails}
+                      disabled={fetching}
+                      className="w-full flex justify-center items-center gap-2 py-2.5 px-4 rounded-xl text-xs font-bold text-white bg-indigo-600 hover:bg-indigo-700 transition-all duration-150 disabled:opacity-50 disabled:cursor-not-allowed shadow-md active:scale-[0.98]"
+                    >
+                      {fetching ? (
+                        <span className="flex items-center gap-2">
+                          <svg className="animate-spin h-4 w-4 text-white" fill="none" viewBox="0 0 24 24">
+                            <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+                            <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z" />
+                          </svg>
+                          <span>Synchronising...</span>
+                        </span>
+                      ) : (
+                        <span>Synchronise Emails</span>
+                      )}
+                    </button>
+
+                    <button
+                      onClick={handleDisconnectGmail}
+                      className="w-full flex justify-center items-center gap-2 py-2.5 px-4 rounded-xl text-xs font-bold text-red-650 bg-red-50 hover:bg-red-100 border border-red-200/60 transition-all duration-150 shadow-sm active:scale-[0.98]"
+                    >
+                      <span>Disconnect Gmail</span>
+                    </button>
+                  </div>
+                </>
+              ) : (
+                <>
+                  <div className="flex items-start space-x-3.5">
+                    <div className="h-10 w-10 rounded-xl bg-red-50 border border-red-100 text-red-500 flex items-center justify-center shrink-0">
+                      <svg className="h-5 w-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M3 8l7.89 5.26a2 2 0 002.22 0L21 8M5 19h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v10a2 2 0 002 2z" />
+                      </svg>
+                    </div>
+                    <div>
+                      <h3 className="text-sm font-bold text-slate-800 tracking-tight">Gmail Connection</h3>
+                      <p className="text-xs text-slate-450 mt-1 leading-relaxed">
+                        Connect account to synchronise email streams into task cards.
+                      </p>
+                    </div>
+                  </div>
+
+                  <div className="grid grid-cols-1 gap-2 pt-2">
+                    <button
+                      onClick={handleConnectGmail}
+                      className="w-full flex justify-center items-center gap-2 py-2.5 px-4 rounded-xl text-xs font-bold text-white bg-indigo-600 hover:bg-indigo-700 transition-all duration-150 shadow-md active:scale-[0.98]"
+                    >
+                      <span>Connect Gmail</span>
+                    </button>
+                  </div>
+                </>
+              )}
             </div>
           </div>
         )}
