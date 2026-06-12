@@ -2,31 +2,26 @@ import React, { useState } from 'react';
 import { useNavigate, Link } from 'react-router-dom';
 import api from '../api/axios';
 
-const Login = () => {
+const ForgotPassword = () => {
   const [email, setEmail] = useState('');
-  const [password, setPassword] = useState('');
+  const [message, setMessage] = useState('');
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(false);
-  const navigate = useNavigate();
 
   const handleSubmit = async (e) => {
     e.preventDefault();
     setError('');
+    setMessage('');
     setLoading(true);
 
     try {
-      const response = await api.post('/auth/login', { email, password });
-      
-      // Save token and user to localStorage
-      localStorage.setItem('token', response.data.token);
-      localStorage.setItem('user', JSON.stringify(response.data.user));
-      
-      // Redirect to dashboard
-      navigate('/dashboard');
+      const response = await api.post('/auth/forgot-password', { email });
+      setMessage(response.data.message || 'If that email is registered, we have sent a temporary password.');
+      setEmail('');
     } catch (err) {
-      console.error('Login error:', err);
-      const message = err.response?.data?.message || 'Login failed. Please check your credentials and try again.';
-      setError(message);
+      console.error('Forgot password error:', err);
+      const msg = err.response?.data?.message || 'Failed to submit password reset request. Please try again.';
+      setError(msg);
     } finally {
       setLoading(false);
     }
@@ -36,26 +31,24 @@ const Login = () => {
     <div className="min-h-screen flex bg-white font-sans overflow-hidden select-none relative">
       {/* Left half: Decorative Indigo Gradient (hidden on mobile) */}
       <div className="hidden lg:flex lg:w-1/2 bg-gradient-to-tr from-indigo-600 via-indigo-500 to-purple-600 relative items-center justify-center p-12 overflow-hidden">
-        {/* Floating animated blobs */}
         <div className="absolute top-10 left-10 h-72 w-72 bg-white/10 rounded-full blur-2xl animate-pulse" />
         <div className="absolute bottom-10 right-10 h-96 w-96 bg-white/5 rounded-full blur-3xl animate-pulse delay-1000" />
         <div className="absolute top-1/2 left-1/3 h-56 w-56 bg-indigo-400/20 rounded-full blur-3xl pointer-events-none" />
 
         <div className="relative z-10 max-w-md text-white text-center space-y-6">
           <div className="mx-auto h-16 w-16 rounded-2xl bg-white/10 backdrop-blur-md flex items-center justify-center shadow-2xl border border-white/20">
-            <svg className="h-8 w-8 text-white" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
-              <polyline points="22 12 16 12 14 15 10 15 8 12 2 12" />
-              <path d="M5.45 5.11L2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.45-6.89A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11z" />
+            <svg className="h-8 w-8 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2.5" d="M15 7a2 2 0 012 2m-2-2a2 2 0 00-2 2m2-2a2 2 0 002-2m0 0a2 2 0 00-2-2m2 12a2 2 0 012-2m-2 2a2 2 0 00-2-2m2 2a2 2 0 002 2m0 0a2 2 0 00-2 2M5 18v-1a5 5 0 0110 0v1H5z" />
             </svg>
           </div>
           <h1 className="text-5xl font-black tracking-tight leading-none">MailDesk</h1>
           <p className="text-white/80 leading-relaxed text-base font-semibold">
-            Where Emails Meet Action.
+            Retrieve credentials securely.
           </p>
         </div>
       </div>
 
-      {/* Right half: Form card (full screen on mobile) */}
+      {/* Right half: Form card */}
       <div className="w-full lg:w-1/2 flex items-center justify-center px-6 sm:px-12 lg:px-20 bg-slate-50/30">
         <div className="max-w-md w-full space-y-8 bg-white p-8 sm:p-10 rounded-3xl shadow-xl border border-slate-100/80 relative">
           <div>
@@ -66,10 +59,10 @@ const Login = () => {
               </svg>
             </div>
             <h2 className="text-3xl font-black text-slate-900 tracking-tight leading-none">
-              Welcome back
+              Reset Password
             </h2>
             <p className="mt-2 text-xs text-slate-500 font-medium leading-relaxed">
-              Manage Mails. Assign Tasks. Stay Ahead.
+              Enter your email below to receive a secure, unique temporary password.
             </p>
           </div>
 
@@ -79,6 +72,15 @@ const Login = () => {
                 <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" />
               </svg>
               <span>{error}</span>
+            </div>
+          )}
+
+          {message && (
+            <div className="bg-emerald-50 border border-emerald-100 text-emerald-600 p-4 rounded-xl text-xs flex items-start space-x-2">
+              <svg className="h-4 w-4 shrink-0 mt-0.5 text-emerald-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z" />
+              </svg>
+              <span>{message}</span>
             </div>
           )}
 
@@ -99,44 +101,22 @@ const Login = () => {
               />
             </div>
 
-            <div>
-              <label htmlFor="password" className="block text-[10px] font-bold text-slate-400 uppercase tracking-wider mb-1">
-                Password
-              </label>
-              <input
-                id="password"
-                name="password"
-                type="password"
-                required
-                className="mt-1 block w-full px-4 py-3 bg-slate-50/50 hover:bg-slate-50/80 border border-slate-200/80 rounded-xl text-slate-900 placeholder-slate-400 focus:outline-none focus:ring-2 focus:ring-indigo-100 focus:border-indigo-500 transition-all duration-150 text-xs font-semibold focus:bg-white"
-                placeholder="••••••••"
-                value={password}
-                onChange={(e) => setPassword(e.target.value)}
-              />
-            </div>
-
-            <div className="flex items-center justify-end">
-              <Link to="/forgot-password" className="text-[10px] font-bold text-indigo-600 hover:text-indigo-700 transition-colors">
-                Forgot Password?
-              </Link>
-            </div>
-
             <div className="pt-2">
               <button
                 type="submit"
                 disabled={loading}
                 className="w-full flex justify-center py-3.5 px-4 text-xs font-bold rounded-xl text-white bg-gradient-to-r from-indigo-600 to-purple-600 hover:from-indigo-700 hover:to-purple-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-indigo-500 transition-all duration-150 disabled:opacity-50 disabled:cursor-not-allowed shadow-[0_4px_15px_rgba(99,102,241,0.3)] hover:shadow-[0_6px_20px_rgba(99,102,241,0.4)] active:scale-[0.98]"
               >
-                {loading ? 'Signing In...' : 'Sign In'}
+                {loading ? 'Submitting...' : 'Send Temporary Password'}
               </button>
             </div>
           </form>
 
           <div className="text-center mt-6">
             <p className="text-xs text-slate-500 font-semibold">
-              Don't have an account?{' '}
-              <Link to="/register" className="font-bold text-indigo-600 hover:text-indigo-700 transition-colors">
-                Create an account
+              Remembered your credentials?{' '}
+              <Link to="/login" className="font-bold text-indigo-600 hover:text-indigo-700 transition-colors">
+                Log In
               </Link>
             </p>
           </div>
@@ -146,4 +126,4 @@ const Login = () => {
   );
 };
 
-export default Login;
+export default ForgotPassword;

@@ -16,7 +16,7 @@ const ManageUsers = () => {
 
   // Form states
   const [newUser, setNewUser] = useState({ name: '', email: '', password: '', role: 'Employee' });
-  const [editUser, setEditUser] = useState({ id: '', name: '', email: '', role: 'Employee' });
+  const [editUser, setEditUser] = useState({ id: '', name: '', email: '', role: 'Employee', status: 'Approved' });
   const [deleteUserId, setDeleteUserId] = useState('');
 
   const navigate = useNavigate();
@@ -89,7 +89,8 @@ const ManageUsers = () => {
       await api.put(`/users/${editUser.id}`, {
         name: editUser.name,
         email: editUser.email,
-        role: editUser.role
+        role: editUser.role,
+        status: editUser.status
       });
       triggerAlert('success', `User '${editUser.name}' updated successfully.`);
       setIsEditOpen(false);
@@ -97,6 +98,23 @@ const ManageUsers = () => {
     } catch (err) {
       console.error('Error updating user:', err);
       const message = err.response?.data?.message || 'Failed to update user.';
+      triggerAlert('error', message);
+    } finally {
+      setActionLoading(false);
+    }
+  };
+
+  const handleUpdateStatus = async (userId, newStatus, userName) => {
+    setActionLoading(true);
+    try {
+      await api.put(`/users/${userId}`, {
+        status: newStatus
+      });
+      triggerAlert('success', `User '${userName}' has been ${newStatus.toLowerCase()} successfully.`);
+      fetchUsers();
+    } catch (err) {
+      console.error(`Error updating status for user ${userId}:`, err);
+      const message = err.response?.data?.message || 'Failed to update user status.';
       triggerAlert('error', message);
     } finally {
       setActionLoading(false);
@@ -133,7 +151,8 @@ const ManageUsers = () => {
       id: user._id,
       name: user.name,
       email: user.email,
-      role: user.role
+      role: user.role,
+      status: user.status || 'Approved'
     });
     setIsEditOpen(true);
   };
@@ -223,6 +242,7 @@ const ManageUsers = () => {
                   <th scope="col" className="px-6 py-4">User</th>
                   <th scope="col" className="px-6 py-4">Email</th>
                   <th scope="col" className="px-6 py-4">Role</th>
+                  <th scope="col" className="px-6 py-4">Status</th>
                   <th scope="col" className="px-6 py-4 text-right">Actions</th>
                 </tr>
               </thead>
@@ -237,6 +257,14 @@ const ManageUsers = () => {
                     roleClass = 'bg-red-50 border-red-100 text-red-600';
                   } else if (user.role === 'Head') {
                     roleClass = 'bg-purple-50 border-purple-100 text-purple-650';
+                  }
+
+                  // Status label color
+                  let statusClass = 'bg-emerald-50 border-emerald-100 text-emerald-600';
+                  if (user.status === 'Pending') {
+                    statusClass = 'bg-amber-50 border-amber-100 text-amber-600 animate-pulse';
+                  } else if (user.status === 'Rejected') {
+                    statusClass = 'bg-red-50 border-red-100 text-red-600';
                   }
 
                   return (
@@ -262,7 +290,30 @@ const ManageUsers = () => {
                           {user.role}
                         </span>
                       </td>
+                      <td className="px-6 py-4 whitespace-nowrap">
+                        <span className={`inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-bold border ${statusClass}`}>
+                          {user.status || 'Approved'}
+                        </span>
+                      </td>
                       <td className="px-6 py-4 whitespace-nowrap text-right space-x-3">
+                        {user.status === 'Pending' && (
+                          <>
+                            <button
+                              onClick={() => handleUpdateStatus(user._id, 'Approved', user.name)}
+                              disabled={actionLoading}
+                              className="text-emerald-600 hover:text-emerald-700 text-sm font-semibold transition-colors"
+                            >
+                              Approve
+                            </button>
+                            <button
+                              onClick={() => handleUpdateStatus(user._id, 'Rejected', user.name)}
+                              disabled={actionLoading}
+                              className="text-red-500 hover:text-red-600 text-sm font-semibold transition-colors"
+                            >
+                              Reject
+                            </button>
+                          </>
+                        )}
                         <button
                           onClick={() => openEditModal(user)}
                           className="text-indigo-600 hover:text-indigo-700 text-sm font-semibold transition-colors"
@@ -433,6 +484,19 @@ const ManageUsers = () => {
                   <option value="Employee">Employee</option>
                   <option value="Head">Head</option>
                   <option value="Admin">Admin</option>
+                </select>
+              </div>
+
+              <div>
+                <label className="block text-xs font-semibold text-slate-500 uppercase tracking-wider mb-1">Status</label>
+                <select
+                  className="w-full px-4 py-3 bg-white border border-slate-200 rounded-xl text-slate-805 focus:outline-none focus:ring-2 focus:ring-indigo-150 focus:border-indigo-505 text-sm transition-all duration-200"
+                  value={editUser.status}
+                  onChange={(e) => setEditUser({ ...editUser, status: e.target.value })}
+                >
+                  <option value="Approved">Approved</option>
+                  <option value="Pending">Pending</option>
+                  <option value="Rejected">Rejected</option>
                 </select>
               </div>
 

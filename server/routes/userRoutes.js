@@ -7,7 +7,8 @@ const {
   updateUser,
   deleteUser,
   getActivityLogs,
-  updateUserProfile
+  updateUserProfile,
+  changePassword
 } = require('../controllers/userController');
 const { protect, authorizeRoles } = require('../middleware/authMiddleware');
 
@@ -16,6 +17,9 @@ router.use(protect);
 
 // PUT /api/users/profile - Update own profile (all roles)
 router.put('/profile', updateUserProfile);
+
+// PUT /api/users/change-password - Change own password (all roles)
+router.put('/change-password', changePassword);
 
 // GET /api/users - Get all users (accessible by Admin and Head for assignment lists)
 // POST /api/users - Create new Head/Employee user (Admin only)

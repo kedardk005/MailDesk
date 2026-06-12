@@ -1,6 +1,7 @@
 const User = require('../models/User');
 const bcrypt = require('bcryptjs');
 const ActivityLog = require('../models/ActivityLog');
+const { logActivity } = require('../utils/activityLogger');
 
 // @desc    Get all users
 // @route   GET /api/users
@@ -91,7 +92,7 @@ exports.createUser = async (req, res) => {
 // @access  Private/Admin
 exports.updateUser = async (req, res) => {
   try {
-    const { name, email, role } = req.body;
+    const { name, email, role, status } = req.body;
 
     // Find user
     const user = await User.findById(req.params.id);
@@ -106,6 +107,50 @@ exports.updateUser = async (req, res) => {
         return res.status(400).json({ message: 'Invalid role selection.' });
       }
       user.role = role;
+    }
+
+    // Handle status changes & email dispatch
+    if (status) {
+      const allowedStatuses = ['Pending', 'Approved', 'Rejected'];
+      if (!allowedStatuses.includes(status)) {
+        return res.status(400).json({ message: 'Invalid status selection.' });
+      }
+      
+      const wasPending = user.status === 'Pending';
+      user.status = status;
+      
+      if (wasPending && status === 'Approved') {
+        try {
+          const { sendEmail } = require('../utils/emailHelper');
+          const emailSubject = 'Your MailDesk Account has been Approved!';
+          
+          // Plain text fallback
+          const emailBody = `Hello ${user.name},\n\nGreat news! Your request to join MailDesk as an Administrator has been approved. You can now log in to the workspace at your convenience using your email address.\n\nBest regards,\nThe MailDesk Team`;
+          
+          // Rich HTML well-formatted email
+          const emailHtml = `
+            <div style="font-family: 'Helvetica Neue', Helvetica, Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px; border: 1px solid #e2e8f0; border-radius: 12px; background-color: #ffffff;">
+              <div style="text-align: center; padding-bottom: 20px; border-bottom: 1px solid #f1f5f9;">
+                <h1 style="color: #4f46e5; margin: 0; font-size: 24px; font-weight: 800;">MailDesk</h1>
+              </div>
+              <div style="padding: 20px 0;">
+                <p style="font-size: 16px; line-height: 1.6; color: #334155;">Hello <strong>${user.name}</strong>,</p>
+                <p style="font-size: 16px; line-height: 1.6; color: #334155;">Great news! Your request to join the workspace as an <strong>Administrator</strong> has been reviewed and <strong>approved</strong> by an existing administrator.</p>
+                <div style="margin: 24px 0; text-align: center;">
+                  <a href="${process.env.FRONTEND_URL || 'http://localhost:5173'}/login" style="background-color: #4f46e5; color: #ffffff; text-decoration: none; padding: 12px 24px; font-size: 14px; font-weight: 700; border-radius: 8px; display: inline-block;">Log In to MailDesk</a>
+                </div>
+                <p style="font-size: 14px; line-height: 1.6; color: #64748b;">You can log in using your registered email: <strong>${user.email}</strong></p>
+              </div>
+              <div style="padding-top: 20px; border-top: 1px solid #f1f5f9; text-align: center; font-size: 12px; color: #94a3b8;">
+                <p style="margin: 0;">This is an automated workspace notification sent from MailDesk.</p>
+              </div>
+            </div>
+          `;
+          await sendEmail(user.email, emailSubject, emailBody, emailHtml);
+        } catch (emailErr) {
+          console.error('Failed to send approval email notification:', emailErr);
+        }
+      }
     }
 
     if (name) {
@@ -132,6 +177,7 @@ exports.updateUser = async (req, res) => {
       name: updatedUser.name,
       email: updatedUser.email,
       role: updatedUser.role,
+      status: updatedUser.status,
       createdAt: updatedUser.createdAt
     };
 
@@ -236,5 +282,43 @@ exports.updateUserProfile = async (req, res) => {
   } catch (error) {
     console.error('Error in updateUserProfile:', error);
     return res.status(500).json({ message: 'Server error. Failed to update profile.' });
+  }
+};
+
+// @desc    Change password of the logged-in user
+// @route   PUT /api/users/change-password
+// @access  Private
+exports.changePassword = async (req, res) => {
+  try {
+    const { currentPassword, newPassword } = req.body;
+
+    if (!currentPassword || !newPassword) {
+      return res.status(400).json({ message: 'Current password and new password are required.' });
+    }
+
+    const user = await User.findById(req.user._id);
+    if (!user) {
+      return res.status(404).json({ message: 'User not found.' });
+    }
+
+    // Compare current password
+    const isMatch = await bcrypt.compare(currentPassword, user.password);
+    if (!isMatch) {
+      return res.status(400).json({ message: 'Incorrect current password.' });
+    }
+
+    // Hash the new password
+    const salt = await bcrypt.genSalt(10);
+    const hashedPassword = await bcrypt.hash(newPassword, salt);
+
+    user.password = hashedPassword;
+    await user.save();
+
+    await logActivity(user._id, 'Password Change', `Successfully changed account password`);
+
+    return res.status(200).json({ message: 'Password changed successfully.' });
+  } catch (error) {
+    console.error('Error in changePassword:', error);
+    return res.status(500).json({ message: 'Server error. Failed to change password.' });
   }
 };

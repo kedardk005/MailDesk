@@ -2,6 +2,15 @@ import React, { useState, useEffect, useRef } from 'react';
 import { useNavigate, Link } from 'react-router-dom';
 import api from '../api/axios';
 
+const renderEmailContent = (body) => {
+  if (!body) return '<html><body><span style="font-family: sans-serif; font-size: 13px; color: #94a3b8; font-style: italic;">This email has no text content.</span></body></html>';
+  const isHtml = /<[a-z][\s\S]*>/i.test(body);
+  const styledBody = isHtml 
+    ? body 
+    : `<div style="white-space: pre-wrap; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; font-size: 13px; line-height: 1.5; color: #334155;">${body.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')}</div>`;
+  return `<html><head><style>body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; font-size: 13px; line-height: 1.5; color: #334155; margin: 12px; word-break: break-word; } img { max-width: 100%; height: auto; display: block; margin: 8px 0; }</style></head><body>${styledBody}</body></html>`;
+};
+
 const TaskList = () => {
   const [tasks, setTasks] = useState([]);
   const [loading, setLoading] = useState(true);
@@ -805,8 +814,14 @@ const TaskList = () => {
                           <p className="text-xs font-semibold text-slate-800">{task.linkedEmail.subject}</p>
                           <p className="text-[10px] text-slate-450">From: {task.linkedEmail.from}</p>
                           {task.linkedEmail.body && (
-                            <div className="bg-slate-50 p-3 rounded-lg max-h-32 overflow-y-auto text-xs text-slate-650 font-sans whitespace-pre-wrap mt-1 select-text">
-                              {task.linkedEmail.body}
+                            <div className="mt-1">
+                              <iframe
+                                srcDoc={renderEmailContent(task.linkedEmail.body)}
+                                title="Email Body"
+                                sandbox="allow-same-origin allow-popups allow-popups-to-escape-sandbox"
+                                className="w-full border border-slate-150 rounded-xl bg-slate-50/50"
+                                style={{ minHeight: '120px', height: '160px', resize: 'vertical' }}
+                              />
                             </div>
                           )}
                         </div>
@@ -1183,8 +1198,14 @@ const TaskList = () => {
                   <p className="text-xs font-semibold text-slate-800">{selectedTask.linkedEmail.subject}</p>
                   <p className="text-[10px] text-slate-455">From: {selectedTask.linkedEmail.from}</p>
                   {selectedTask.linkedEmail.body && (
-                    <div className="bg-white border border-slate-200 p-3 rounded-xl max-h-32 overflow-y-auto text-xs text-slate-650 font-sans whitespace-pre-wrap mt-2 select-text">
-                      {selectedTask.linkedEmail.body}
+                    <div className="mt-2">
+                      <iframe
+                        srcDoc={renderEmailContent(selectedTask.linkedEmail.body)}
+                        title="Linked Email Body"
+                        sandbox="allow-same-origin allow-popups allow-popups-to-escape-sandbox"
+                        className="w-full border border-slate-250 rounded-xl bg-white shadow-inner"
+                        style={{ minHeight: '150px', height: '220px', resize: 'vertical' }}
+                      />
                     </div>
                   )}
                 </div>

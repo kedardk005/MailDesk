@@ -2,6 +2,7 @@ import React, { useState, useEffect, useRef } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
 import CountUp from '../utils/countUp';
 import { initTilt } from '../utils/tiltEffect';
+import { initCursorEffects } from '../utils/cursorEffects';
 import api from '../api/axios';
 
 const Landing = () => {
@@ -27,6 +28,9 @@ const Landing = () => {
   };
 
   useEffect(() => {
+    // Initialize custom cursor effects locally on Landing page
+    const cleanupCursor = initCursorEffects();
+
     // Fetch real-time statistics if logged in
     const fetchRealStats = async () => {
       const token = localStorage.getItem('token');
@@ -96,6 +100,7 @@ const Landing = () => {
     const interval = setInterval(handleScrollReveal, 100);
 
     return () => {
+      if (cleanupCursor) cleanupCursor();
       cleanupMockup();
       cleanupsFeature.forEach((cleanup) => cleanup());
       revealObserver.disconnect();

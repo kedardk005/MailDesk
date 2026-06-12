@@ -19,19 +19,24 @@ const Register = () => {
     setLoading(true);
 
     try {
-      await api.post('/auth/register', {
+      const res = await api.post('/auth/register', {
         name,
         email,
         password,
         role
       });
       
-      setSuccess('Account created successfully! Redirecting to login...');
+      const isPending = res.data?.user?.status === 'Pending';
+      if (isPending) {
+        setSuccess('Account created successfully! Administrator approval is required before you can log in.');
+      } else {
+        setSuccess('Account created successfully! Redirecting to login...');
+      }
       
-      // Redirect to login after 2 seconds
+      // Redirect to login: longer delay for pending admins so they can read the notice
       setTimeout(() => {
         navigate('/login');
-      }, 2000);
+      }, isPending ? 5000 : 2000);
     } catch (err) {
       console.error('Registration error:', err);
       const message = err.response?.data?.message || 'Registration failed. Please check your details.';

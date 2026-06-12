@@ -9,7 +9,7 @@ const Dashboard = () => {
   const [tasks, setTasks] = useState([]);
   const [overallStats, setOverallStats] = useState(null);
   const [statsLoading, setStatsLoading] = useState(true);
-  const [gmailStatus, setGmailStatus] = useState({ connected: false, email: '' });
+  const [gmailStatus, setGmailStatus] = useState({ connected: false, gmailEmail: '' });
   const containerRef = useRef(null);
 
   useEffect(() => {
@@ -98,7 +98,7 @@ const Dashboard = () => {
     
     try {
       await api.delete('/gmail/disconnect');
-      setGmailStatus({ connected: false, email: '' });
+      setGmailStatus({ connected: false, gmailEmail: '' });
       triggerAlert('success', 'Gmail disconnected successfully.');
       fetchDashboardData();
     } catch (err) {
@@ -366,9 +366,11 @@ const Dashboard = () => {
                         <h3 className="text-sm font-bold text-slate-800 tracking-tight">Gmail Connected</h3>
                         <span className="h-2 w-2 rounded-full bg-emerald-500 animate-pulse shrink-0" />
                       </div>
-                      <p className="text-xs text-slate-500 font-bold truncate mt-1">
-                        {gmailStatus.email}
-                      </p>
+                      <div className="mt-1 flex">
+                        <span className="px-2.5 py-0.5 rounded-full text-[10px] font-bold bg-emerald-50 border border-emerald-100 text-emerald-600">
+                          Connected: {gmailStatus.gmailEmail}
+                        </span>
+                      </div>
                     </div>
                   </div>
 
@@ -408,7 +410,7 @@ const Dashboard = () => {
                       </svg>
                     </div>
                     <div>
-                      <h3 className="text-sm font-bold text-slate-800 tracking-tight">Gmail Connection</h3>
+                      <h3 className="text-sm font-bold text-slate-800 tracking-tight">No Gmail Connected</h3>
                       <p className="text-xs text-slate-450 mt-1 leading-relaxed">
                         Connect account to synchronise email streams into task cards.
                       </p>

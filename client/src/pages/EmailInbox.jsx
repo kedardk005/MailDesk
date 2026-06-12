@@ -1,7 +1,15 @@
 import React, { useState, useEffect } from 'react';
 import { useNavigate, Link } from 'react-router-dom';
 import api from '../api/axios';
-import { jwtDecode } from 'jwt-decode';
+
+const renderEmailContent = (body) => {
+  if (!body) return '<html><body><span style="font-family: sans-serif; font-size: 13px; color: #94a3b8; font-style: italic;">This email has no text content.</span></body></html>';
+  const isHtml = /<[a-z][\s\S]*>/i.test(body);
+  const styledBody = isHtml 
+    ? body 
+    : `<div style="white-space: pre-wrap; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; font-size: 13px; line-height: 1.5; color: #334155;">${body.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')}</div>`;
+  return `<html><head><style>body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; font-size: 13px; line-height: 1.5; color: #334155; margin: 12px; word-break: break-word; } img { max-width: 100%; height: auto; display: block; margin: 8px 0; }</style></head><body>${styledBody}</body></html>`;
+};
 
 const EmailInbox = () => {
   const [emails, setEmails] = useState([]);
@@ -19,19 +27,11 @@ const EmailInbox = () => {
     const userString = localStorage.getItem('user');
     if (userString) {
       try {
-        setCurrentUser(JSON.parse(userString));
+        const parsedUser = JSON.parse(userString);
+        setCurrentUser(parsedUser);
+        setUserRole(parsedUser.role);
       } catch (err) {
         console.error('Error parsing current user:', err);
-      }
-    }
-
-    const token = localStorage.getItem('token');
-    if (token) {
-      try {
-        const decoded = jwtDecode(token);
-        setUserRole(decoded.role);
-      } catch (err) {
-        console.error('Error decoding token for role:', err);
       }
     }
 
@@ -329,10 +329,15 @@ const EmailInbox = () => {
 
                     {/* Email Text Body container */}
                     {email.body ? (
-                      <div
-                        className="bg-white border border-slate-200/85 rounded-xl p-4 text-xs text-slate-700 leading-relaxed break-words overflow-hidden max-w-full select-text email-body-rendered"
-                        dangerouslySetInnerHTML={{ __html: email.body }}
-                      />
+                      <div className="email-body-rendered-container">
+                        <iframe
+                          srcDoc={renderEmailContent(email.body)}
+                          title="Email Content"
+                          sandbox="allow-same-origin allow-popups allow-popups-to-escape-sandbox"
+                          className="w-full border border-slate-200 rounded-xl bg-white shadow-inner"
+                          style={{ minHeight: '200px', height: '300px', resize: 'vertical' }}
+                        />
+                      </div>
                     ) : (
                       <div className="bg-white border border-slate-200/85 rounded-xl p-4 text-xs text-slate-700 leading-relaxed whitespace-pre-wrap break-words overflow-hidden max-w-full select-text">
                         <span className="italic text-slate-400">This email has no text content.</span>

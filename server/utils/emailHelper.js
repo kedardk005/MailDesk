@@ -15,8 +15,9 @@ const transporter = nodemailer.createTransport({
  * @param {String} to - Recipient email address
  * @param {String} subject - Email subject
  * @param {String} body - Email plain-text body
+ * @param {String} [html] - Email HTML body (optional)
  */
-const sendEmail = async (to, subject, body) => {
+const sendEmail = async (to, subject, body, html = null) => {
   try {
     const sender = process.env.SENDER_EMAIL;
     const password = process.env.SENDER_APP_PASSWORD;
@@ -32,6 +33,10 @@ const sendEmail = async (to, subject, body) => {
       subject,
       text: body
     };
+
+    if (html) {
+      mailOptions.html = html;
+    }
 
     const info = await transporter.sendMail(mailOptions);
     console.log(`[EMAIL SENT] to: ${to}, MessageID: ${info.messageId}, Subject: "${subject}"`);

@@ -3,6 +3,7 @@ import { BrowserRouter as Router, Routes, Route, Navigate } from 'react-router-d
 import Landing from './pages/Landing';
 import Login from './pages/Login';
 import Register from './pages/Register';
+import ForgotPassword from './pages/ForgotPassword';
 import Dashboard from './pages/Dashboard';
 import ManageUsers from './pages/admin/ManageUsers';
 import ActivityLog from './pages/admin/ActivityLog';
@@ -13,15 +14,12 @@ import ProtectedRoute from './components/ProtectedRoute';
 import AdminRoute from './components/AdminRoute';
 import ProtectedLayout from './components/ProtectedLayout';
 import Reports from './pages/admin/Reports';
-import { initCursorEffects } from './utils/cursorEffects';
 import { initScrollAnimations } from './utils/scrollAnimations';
 
 function App() {
   useEffect(() => {
-    const cleanupCursor = initCursorEffects();
     const cleanupScroll = initScrollAnimations();
     return () => {
-      if (cleanupCursor) cleanupCursor();
       if (cleanupScroll) cleanupScroll();
     };
   }, []);
@@ -35,6 +33,7 @@ function App() {
         {/* Public Routes */}
         <Route path="/login" element={<Login />} />
         <Route path="/register" element={<Register />} />
+        <Route path="/forgot-password" element={<ForgotPassword />} />
         
         {/* Protected Routes Wrapper */}
         <Route

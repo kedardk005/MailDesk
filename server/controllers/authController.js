@@ -45,12 +45,22 @@ exports.registerUser = async (req, res) => {
     const salt = await bcrypt.genSalt(10);
     const hashedPassword = await bcrypt.hash(password, salt);
 
+    // Determine user status: New admins require approval if an approved admin already exists
+    let status = 'Approved';
+    if (role === 'Admin') {
+      const approvedAdminExists = await User.findOne({ role: 'Admin', status: 'Approved' });
+      if (approvedAdminExists) {
+        status = 'Pending';
+      }
+    }
+
     // Save new user to MongoDB
     const newUser = new User({
       name: name.trim(),
       email: emailNormalized,
       password: hashedPassword,
-      role
+      role,
+      status
     });
 
     const savedUser = await newUser.save();
@@ -64,6 +74,7 @@ exports.registerUser = async (req, res) => {
       name: savedUser.name,
       email: savedUser.email,
       role: savedUser.role,
+      status: savedUser.status,
       birthdate: savedUser.birthdate,
       phoneNumber: savedUser.phoneNumber,
       createdAt: savedUser.createdAt
@@ -104,6 +115,14 @@ exports.loginUser = async (req, res) => {
       return res.status(400).json({ message: 'Invalid credentials. Incorrect password.' });
     }
 
+    // Check account status
+    if (user.status === 'Pending') {
+      return res.status(401).json({ message: 'Your administrator account is pending approval from an existing administrator.' });
+    }
+    if (user.status === 'Rejected') {
+      return res.status(401).json({ message: 'Your registration request has been rejected by an administrator.' });
+    }
+
     // Generate JWT token
     const token = generateToken(user);
 
@@ -113,6 +132,7 @@ exports.loginUser = async (req, res) => {
       name: user.name,
       email: user.email,
       role: user.role,
+      status: user.status,
       birthdate: user.birthdate,
       phoneNumber: user.phoneNumber,
       createdAt: user.createdAt
@@ -127,5 +147,87 @@ exports.loginUser = async (req, res) => {
   } catch (error) {
     console.error('Error in loginUser:', error);
     return res.status(500).json({ message: 'Server error. Please try again later.' });
+  }
+};
+
+// @desc    Forgot Password - generates a temporary password and sends it via email
+// @route   POST /api/auth/forgot-password
+// @access  Public
+exports.forgotPassword = async (req, res) => {
+  try {
+    const { email } = req.body;
+
+    if (!email) {
+      return res.status(400).json({ message: 'Please provide email address.' });
+    }
+
+    const emailNormalized = email.toLowerCase().trim();
+    const user = await User.findOne({ email: emailNormalized });
+    
+    // For security reasons, do not explicitly confirm if user does not exist
+    if (!user) {
+      return res.status(200).json({ message: 'If a user with this email exists, a temporary password has been sent to it.' });
+    }
+
+    // Generate unique random password of 10 characters
+    const generateTempPassword = () => {
+      const chars = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#$';
+      let pass = '';
+      for (let i = 0; i < 10; i++) {
+        pass += chars.charAt(Math.floor(Math.random() * chars.length));
+      }
+      return pass;
+    };
+    const tempPassword = generateTempPassword();
+
+    // Debug: write password to file for local testing
+    try {
+      const fs = require('fs');
+      const path = require('path');
+      fs.writeFileSync(path.join(__dirname, '../temp_password.txt'), tempPassword, 'utf8');
+      console.log(`[DEBUG] Saved temporary password for ${user.email} to temp_password.txt: ${tempPassword}`);
+    } catch (fsErr) {
+      console.error('[DEBUG ERROR] Failed to write temp_password.txt:', fsErr);
+    }
+
+    // Hash temporary password
+    const salt = await bcrypt.genSalt(10);
+    const hashedPassword = await bcrypt.hash(tempPassword, salt);
+
+    user.password = hashedPassword;
+    await user.save();
+
+    // Send email helper
+    const { sendEmail } = require('../utils/emailHelper');
+    const emailSubject = 'MailDesk - Temporary Password Request';
+    
+    const emailBody = `Hello ${user.name},\n\nYou requested a password reset for MailDesk. Use the following temporary password to log in:\n\nTemporary Password: ${tempPassword}\n\nOnce logged in, please go to your Profile to set a new password.\n\nBest regards,\nThe MailDesk Team`;
+    
+    const emailHtml = `
+      <div style="font-family: 'Helvetica Neue', Helvetica, Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px; border: 1px solid #e2e8f0; border-radius: 12px; background-color: #ffffff;">
+        <div style="text-align: center; padding-bottom: 20px; border-bottom: 1px solid #f1f5f9;">
+          <h1 style="color: #4f46e5; margin: 0; font-size: 24px; font-weight: 800;">MailDesk</h1>
+        </div>
+        <div style="padding: 20px 0;">
+          <p style="font-size: 16px; line-height: 1.6; color: #334155;">Hello <strong>${user.name}</strong>,</p>
+          <p style="font-size: 16px; line-height: 1.6; color: #334155;">You requested a temporary password for your MailDesk account. Use the unique password credentials below to log in:</p>
+          <div style="margin: 24px 0; padding: 16px; background-color: #f8fafc; border: 1px solid #e2e8f0; border-radius: 8px; text-align: center; font-family: monospace; font-size: 18px; font-weight: 700; color: #4f46e5; letter-spacing: 1.5px;">
+            ${tempPassword}
+          </div>
+          <p style="font-size: 14px; line-height: 1.6; color: #ef4444; font-weight: 600;">Important Safety Warning: Once logged in, go directly to your My Profile page inside the system and change this password immediately.</p>
+        </div>
+        <div style="padding-top: 20px; border-top: 1px solid #f1f5f9; text-align: center; font-size: 12px; color: #94a3b8;">
+          <p style="margin: 0;">If you did not request this password reset, please secure your email account.</p>
+        </div>
+      </div>
+    `;
+    
+    await sendEmail(user.email, emailSubject, emailBody, emailHtml);
+    await logActivity(user._id, 'Password Reset Request', `Sent temporary password reset email`);
+
+    return res.status(200).json({ message: 'If a user with this email exists, a temporary password has been sent to it.' });
+  } catch (error) {
+    console.error('Error in forgotPassword:', error);
+    return res.status(500).json({ message: 'Server error. Failed to process password reset.' });
   }
 };

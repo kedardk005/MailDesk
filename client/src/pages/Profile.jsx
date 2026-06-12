@@ -16,6 +16,12 @@ const Profile = () => {
     birthdate: ''
   });
 
+  // Password reset/change states
+  const [currentPassword, setCurrentPassword] = useState('');
+  const [newPassword, setNewPassword] = useState('');
+  const [confirmPassword, setConfirmPassword] = useState('');
+  const [passwordSaving, setPasswordSaving] = useState(false);
+
   useEffect(() => {
     fetchProfile();
   }, []);
@@ -115,6 +121,39 @@ const Profile = () => {
     }
   };
 
+  const handlePasswordSubmit = async (e) => {
+    e.preventDefault();
+    if (!currentPassword || !newPassword || !confirmPassword) {
+      triggerAlert('error', 'Please fill in all password fields.');
+      return;
+    }
+    if (newPassword !== confirmPassword) {
+      triggerAlert('error', 'New password and confirm password do not match.');
+      return;
+    }
+    if (newPassword.length < 6) {
+      triggerAlert('error', 'New password must be at least 6 characters long.');
+      return;
+    }
+
+    setPasswordSaving(true);
+    try {
+      await api.put('/users/change-password', {
+        currentPassword,
+        newPassword
+      });
+      triggerAlert('success', 'Password updated successfully!');
+      setCurrentPassword('');
+      setNewPassword('');
+      setConfirmPassword('');
+    } catch (err) {
+      console.error('Password change error:', err);
+      triggerAlert('error', err.response?.data?.message || 'Failed to update password.');
+    } finally {
+      setPasswordSaving(false);
+    }
+  };
+
   const getInitials = (name) => {
     if (!name) return '?';
     return name.split(' ').map((n) => n[0]).join('').toUpperCase().slice(0, 2);
@@ -182,78 +221,137 @@ const Profile = () => {
       </div>
 
       <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
-        {/* Profile Settings Form Card */}
-        <div className="md:col-span-2 bg-white border border-slate-200 rounded-3xl p-6 shadow-sm">
-          <h3 className="text-lg font-bold text-slate-800 mb-1">Account Information</h3>
-          <p className="text-xs text-slate-400 mb-6">Edit your name, birthday, and contact profile.</p>
+        {/* Left column: stacked settings cards */}
+        <div className="md:col-span-2 space-y-6">
+          {/* Profile Settings Form Card */}
+          <div className="bg-white border border-slate-200 rounded-3xl p-6 shadow-sm">
+            <h3 className="text-lg font-bold text-slate-800 mb-1">Account Information</h3>
+            <p className="text-xs text-slate-400 mb-6">Edit your name, birthday, and contact profile.</p>
 
-          <form onSubmit={handleSubmit} className="space-y-4">
-            <div>
-              <label className="block text-[10px] font-bold text-slate-400 uppercase tracking-wider mb-1">Full Name</label>
-              <input
-                type="text"
-                required
-                className="block w-full px-4 py-3 bg-white border border-slate-200 rounded-xl text-slate-800 focus:outline-none focus:ring-2 focus:ring-indigo-150 focus:border-indigo-500 text-sm transition-all duration-200"
-                value={formData.name}
-                onChange={(e) => setFormData({ ...formData, name: e.target.value })}
-              />
-            </div>
-
-            <div>
-              <label className="block text-[10px] font-bold text-slate-400 uppercase tracking-wider mb-1">Email Address</label>
-              <input
-                type="email"
-                required
-                className="block w-full px-4 py-3 bg-white border border-slate-200 rounded-xl text-slate-800 focus:outline-none focus:ring-2 focus:ring-indigo-150 focus:border-indigo-500 text-sm transition-all duration-200"
-                value={formData.email}
-                onChange={(e) => setFormData({ ...formData, email: e.target.value })}
-              />
-            </div>
-
-            <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+            <form onSubmit={handleSubmit} className="space-y-4">
               <div>
-                <label className="block text-[10px] font-bold text-slate-400 uppercase tracking-wider mb-1">Birthdate</label>
+                <label className="block text-[10px] font-bold text-slate-400 uppercase tracking-wider mb-1">Full Name</label>
                 <input
-                  type="date"
-                  className="block w-full px-4 py-3 bg-white border border-slate-200 rounded-xl text-slate-800 focus:outline-none focus:ring-2 focus:ring-indigo-150 focus:border-indigo-500 text-sm transition-all duration-200 cursor-pointer"
-                  value={formData.birthdate}
-                  onChange={(e) => setFormData({ ...formData, birthdate: e.target.value })}
+                  type="text"
+                  required
+                  className="block w-full px-4 py-3 bg-white border border-slate-200 rounded-xl text-slate-800 focus:outline-none focus:ring-2 focus:ring-indigo-150 focus:border-indigo-500 text-sm transition-all duration-200"
+                  value={formData.name}
+                  onChange={(e) => setFormData({ ...formData, name: e.target.value })}
                 />
               </div>
 
               <div>
-                <label className="block text-[10px] font-bold text-slate-400 uppercase tracking-wider mb-1">Phone Number</label>
+                <label className="block text-[10px] font-bold text-slate-400 uppercase tracking-wider mb-1">Email Address</label>
                 <input
-                  type="tel"
-                  placeholder="e.g. +1 555-0199"
-                  className="block w-full px-4 py-3 bg-white border border-slate-200 rounded-xl text-slate-800 placeholder-slate-400 focus:outline-none focus:ring-2 focus:ring-indigo-150 focus:border-indigo-500 text-sm transition-all duration-200"
-                  value={formData.phoneNumber}
-                  onChange={(e) => setFormData({ ...formData, phoneNumber: e.target.value })}
+                  type="email"
+                  required
+                  className="block w-full px-4 py-3 bg-white border border-slate-200 rounded-xl text-slate-800 focus:outline-none focus:ring-2 focus:ring-indigo-150 focus:border-indigo-500 text-sm transition-all duration-200"
+                  value={formData.email}
+                  onChange={(e) => setFormData({ ...formData, email: e.target.value })}
                 />
               </div>
-            </div>
 
-            <div>
-              <label className="block text-[10px] font-bold text-slate-400 uppercase tracking-wider mb-1">Account Role</label>
-              <input
-                type="text"
-                disabled
-                className="block w-full px-4 py-3 bg-slate-50 border border-slate-200 rounded-xl text-slate-450 text-sm cursor-not-allowed select-none"
-                value={profile?.role || ''}
-              />
-              <span className="text-[10px] text-slate-400 mt-1 block">Roles are managed by your administrator.</span>
-            </div>
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                <div>
+                  <label className="block text-[10px] font-bold text-slate-400 uppercase tracking-wider mb-1">Birthdate</label>
+                  <input
+                    type="date"
+                    className="block w-full px-4 py-3 bg-white border border-slate-200 rounded-xl text-slate-800 focus:outline-none focus:ring-2 focus:ring-indigo-150 focus:border-indigo-500 text-sm transition-all duration-200 cursor-pointer"
+                    value={formData.birthdate}
+                    onChange={(e) => setFormData({ ...formData, birthdate: e.target.value })}
+                  />
+                </div>
 
-            <div className="pt-4 border-t border-slate-100 flex justify-end">
-              <button
-                type="submit"
-                disabled={saving}
-                className="px-6 py-3 bg-gradient-to-r from-indigo-600 to-purple-600 text-xs font-bold text-white rounded-xl shadow-md shadow-indigo-600/10 hover:shadow-indigo-600/20 active:scale-[0.98] transition-all disabled:opacity-50"
-              >
-                {saving ? 'Saving changes...' : 'Save Profile Details'}
-              </button>
-            </div>
-          </form>
+                <div>
+                  <label className="block text-[10px] font-bold text-slate-400 uppercase tracking-wider mb-1">Phone Number</label>
+                  <input
+                    type="tel"
+                    placeholder="e.g. +1 555-0199"
+                    className="block w-full px-4 py-3 bg-white border border-slate-200 rounded-xl text-slate-800 placeholder-slate-400 focus:outline-none focus:ring-2 focus:ring-indigo-150 focus:border-indigo-500 text-sm transition-all duration-200"
+                    value={formData.phoneNumber}
+                    onChange={(e) => setFormData({ ...formData, phoneNumber: e.target.value })}
+                  />
+                </div>
+              </div>
+
+              <div>
+                <label className="block text-[10px] font-bold text-slate-400 uppercase tracking-wider mb-1">Account Role</label>
+                <input
+                  type="text"
+                  disabled
+                  className="block w-full px-4 py-3 bg-slate-50 border border-slate-200 rounded-xl text-slate-450 text-sm cursor-not-allowed select-none"
+                  value={profile?.role || ''}
+                />
+                <span className="text-[10px] text-slate-400 mt-1 block">Roles are managed by your administrator.</span>
+              </div>
+
+              <div className="pt-4 border-t border-slate-100 flex justify-end">
+                <button
+                  type="submit"
+                  disabled={saving}
+                  className="px-6 py-3 bg-gradient-to-r from-indigo-600 to-purple-600 text-xs font-bold text-white rounded-xl shadow-md shadow-indigo-600/10 hover:shadow-indigo-600/20 active:scale-[0.98] transition-all disabled:opacity-50"
+                >
+                  {saving ? 'Saving changes...' : 'Save Profile Details'}
+                </button>
+              </div>
+            </form>
+          </div>
+
+          {/* Security Settings Card */}
+          <div className="bg-white border border-slate-200 rounded-3xl p-6 shadow-sm">
+            <h3 className="text-lg font-bold text-slate-800 mb-1">Security Settings</h3>
+            <p className="text-xs text-slate-400 mb-6">Update your account password to keep your session secure.</p>
+
+            <form onSubmit={handlePasswordSubmit} className="space-y-4">
+              <div>
+                <label className="block text-[10px] font-bold text-slate-400 uppercase tracking-wider mb-1">Current Password</label>
+                <input
+                  type="password"
+                  required
+                  placeholder="••••••••"
+                  className="block w-full px-4 py-3 bg-white border border-slate-200 rounded-xl text-slate-800 focus:outline-none focus:ring-2 focus:ring-indigo-150 focus:border-indigo-500 text-sm transition-all duration-200"
+                  value={currentPassword}
+                  onChange={(e) => setCurrentPassword(e.target.value)}
+                />
+              </div>
+
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                <div>
+                  <label className="block text-[10px] font-bold text-slate-400 uppercase tracking-wider mb-1">New Password</label>
+                  <input
+                    type="password"
+                    required
+                    placeholder="••••••••"
+                    className="block w-full px-4 py-3 bg-white border border-slate-200 rounded-xl text-slate-800 focus:outline-none focus:ring-2 focus:ring-indigo-150 focus:border-indigo-500 text-sm transition-all duration-200"
+                    value={newPassword}
+                    onChange={(e) => setNewPassword(e.target.value)}
+                  />
+                </div>
+
+                <div>
+                  <label className="block text-[10px] font-bold text-slate-400 uppercase tracking-wider mb-1">Confirm New Password</label>
+                  <input
+                    type="password"
+                    required
+                    placeholder="••••••••"
+                    className="block w-full px-4 py-3 bg-white border border-slate-200 rounded-xl text-slate-800 focus:outline-none focus:ring-2 focus:ring-indigo-150 focus:border-indigo-500 text-sm transition-all duration-200"
+                    value={confirmPassword}
+                    onChange={(e) => setConfirmPassword(e.target.value)}
+                  />
+                </div>
+              </div>
+
+              <div className="pt-4 border-t border-slate-100 flex justify-end">
+                <button
+                  type="submit"
+                  disabled={passwordSaving}
+                  className="px-6 py-3 bg-gradient-to-r from-indigo-600 to-purple-600 text-xs font-bold text-white rounded-xl shadow-md shadow-indigo-600/10 hover:shadow-indigo-600/20 active:scale-[0.98] transition-all disabled:opacity-50"
+                >
+                  {passwordSaving ? 'Updating password...' : 'Update Password'}
+                </button>
+              </div>
+            </form>
+          </div>
         </div>
 
         {/* Gmail Sync Management Panel Card */}

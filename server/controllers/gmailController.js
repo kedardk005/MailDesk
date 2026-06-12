@@ -38,16 +38,47 @@ const getBodyText = (payload) => {
   }
 
   if (payload.parts) {
-    // 1. Try to find text/plain
-    let data = findPart(payload.parts, 'text/plain');
+    // 1. Try to find text/html first to get formatting and inline images
+    let data = findPart(payload.parts, 'text/html');
     if (data) return data;
 
-    // 2. Fallback to text/html
-    data = findPart(payload.parts, 'text/html');
+    // 2. Fallback to text/plain
+    data = findPart(payload.parts, 'text/plain');
     if (data) return data;
   }
 
   return '';
+};
+
+// Recursive helper to find all inline image parts within message payload
+const getInlineImages = (payload) => {
+  const images = [];
+
+  const traverse = (part) => {
+    if (part.mimeType && part.mimeType.startsWith('image/') && part.headers) {
+      const contentIdHeader = part.headers.find(h => h.name.toLowerCase() === 'content-id');
+      if (contentIdHeader) {
+        let contentId = contentIdHeader.value;
+        // Strip angle brackets often present in Content-ID values (e.g. <image001.png@...>)
+        contentId = contentId.replace(/^<|>$/g, '');
+        images.push({
+          contentId,
+          mimeType: part.mimeType,
+          attachmentId: part.body ? part.body.attachmentId : null,
+          data: part.body ? part.body.data : null
+        });
+      }
+    }
+
+    if (part.parts) {
+      for (const p of part.parts) {
+        traverse(p);
+      }
+    }
+  };
+
+  traverse(payload);
+  return images;
 };
 
 // Helper to search for header names in a case-insensitive manner
@@ -100,6 +131,7 @@ exports.handleOAuthCallback = async (req, res) => {
 
     // Exchange code for access and refresh tokens
     const { tokens } = await oauth2Client.getToken(code);
+    oauth2Client.setCredentials(tokens);
     
     // Find user using Mongoose ID passed via OAuth 'state'
     const user = await User.findById(state);
@@ -112,11 +144,22 @@ exports.handleOAuthCallback = async (req, res) => {
       return res.status(403).send('Access denied. Employees are not authorized to connect Gmail.');
     }
 
-    // Save tokens to MongoDB
+    // Call Gmail API to fetch the user's profile and actual Gmail email address
+    let gmailAddress = "";
+    try {
+      const gmail = google.gmail({ version: 'v1', auth: oauth2Client });
+      const profile = await gmail.users.getProfile({ userId: 'me' });
+      gmailAddress = profile.data.emailAddress || "";
+    } catch (apiErr) {
+      console.error('Error fetching Gmail profile during OAuth:', apiErr);
+    }
+
+    // Save tokens and Gmail address to MongoDB
     user.gmailAccessToken = tokens.access_token;
     if (tokens.refresh_token) {
       user.gmailRefreshToken = tokens.refresh_token;
     }
+    user.gmailEmail = gmailAddress;
     await user.save();
 
     console.log(`Successfully saved Google credentials for user: ${user.email}`);
@@ -200,6 +243,38 @@ const syncUserEmails = async (user, isManual = false) => {
       // Base64url decoding
       const base64Body = rawBody.replace(/-/g, '+').replace(/_/g, '/');
       decodedBody = Buffer.from(base64Body, 'base64').toString('utf-8');
+    }
+
+    // Process inline images and fetch/replace cid references
+    const inlineImages = getInlineImages(payload);
+    if (inlineImages.length > 0 && decodedBody) {
+      for (const img of inlineImages) {
+        let base64Data = '';
+        if (img.data) {
+          base64Data = img.data;
+        } else if (img.attachmentId) {
+          try {
+            const attachRes = await gmail.users.messages.attachments.get({
+              userId: 'me',
+              messageId: message.id,
+              id: img.attachmentId
+            });
+            base64Data = attachRes.data.data || '';
+          } catch (attachErr) {
+            console.error(`[GMAIL SYNC] Failed to fetch inline image attachment ${img.contentId}:`, attachErr);
+          }
+        }
+
+        if (base64Data) {
+          const standardBase64 = base64Data.replace(/-/g, '+').replace(/_/g, '/');
+          const dataUrl = `data:${img.mimeType};base64,${standardBase64}`;
+          
+          // Escape special characters in contentId to use in RegExp
+          const escapedCid = img.contentId.replace(/[-\/\\^$*+?.()|[\]{}]/g, '\\$&');
+          const regex = new RegExp(`cid:<?${escapedCid}>?`, 'gi');
+          decodedBody = decodedBody.replace(regex, dataUrl);
+        }
+      }
     }
 
     // Save email to DB
@@ -338,7 +413,7 @@ exports.getConnectedStatus = async (req, res) => {
     const isConnected = !!user.gmailAccessToken && user.gmailAccessToken !== "";
     return res.status(200).json({
       connected: isConnected,
-      email: user.email
+      gmailEmail: user.gmailEmail || ""
     });
   } catch (error) {
     console.error('Error in getConnectedStatus:', error);
@@ -360,6 +435,7 @@ exports.disconnectGmail = async (req, res) => {
     }
     user.gmailAccessToken = "";
     user.gmailRefreshToken = "";
+    user.gmailEmail = "";
     await user.save();
 
     // 2. Find all emails fetched by this user

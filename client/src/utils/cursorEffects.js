@@ -1,6 +1,8 @@
 export function initCursorEffects() {
   if (typeof window === 'undefined') return;
 
+  document.body.classList.add('custom-cursor-active');
+
   // Remove existing cursor elements if any
   const existingDot = document.getElementById('custom-cursor-dot');
   const existingRing = document.getElementById('custom-cursor-ring');
@@ -237,6 +239,7 @@ export function initCursorEffects() {
     window.removeEventListener('click', onClickRipple);
     cancelAnimationFrame(animationId);
     
+    document.body.classList.remove('custom-cursor-active');
     if (dot) dot.remove();
     if (ring) ring.remove();
     trailDots.forEach(trail => trail.el.remove());

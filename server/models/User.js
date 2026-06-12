@@ -31,6 +31,10 @@ const UserSchema = new mongoose.Schema({
     type: String,
     default: null
   },
+  gmailEmail: {
+    type: String,
+    default: ""
+  },
   birthdate: {
     type: Date,
     default: null
@@ -38,6 +42,11 @@ const UserSchema = new mongoose.Schema({
   phoneNumber: {
     type: String,
     default: ''
+  },
+  status: {
+    type: String,
+    enum: ['Pending', 'Approved', 'Rejected'],
+    default: 'Approved'
   },
   createdAt: {
     type: Date,
