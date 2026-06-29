@@ -39,6 +39,14 @@ const EmailSchema = new mongoose.Schema({
   fetchedAt: {
     type: Date,
     default: Date.now
+  },
+  labelIds: {
+    type: [String],
+    default: []
+  },
+  toEmail: {
+    type: String,
+    default: ''
   }
 });
 

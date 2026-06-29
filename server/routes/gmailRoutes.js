@@ -8,12 +8,13 @@ const {
   deleteAllEmails,
   deleteSingleEmail,
   getConnectedStatus,
-  disconnectGmail
+  disconnectGmail,
+  disconnectLinkedAccount
 } = require('../controllers/gmailController');
 const { protect, authorizeRoles } = require('../middleware/authMiddleware');
 
-// GET /api/gmail/auth-url - Generate Google OAuth URL (protected, Admin/Head only)
-router.get('/auth-url', protect, authorizeRoles('Admin', 'Head'), getAuthUrl);
+// GET /api/gmail/auth-url - Generate Google OAuth URL (protected, Admin only)
+router.get('/auth-url', protect, authorizeRoles('Admin'), getAuthUrl);
 
 // GET /api/gmail/oauth/callback - Google redirect target (public callback)
 router.get('/oauth/callback', handleOAuthCallback);
@@ -35,5 +36,8 @@ router.get('/status', protect, getConnectedStatus);
 
 // DELETE /api/gmail/disconnect - Disconnect connected Gmail account (protected)
 router.delete('/disconnect', protect, disconnectGmail);
+
+// DELETE /api/gmail/linked-account - Disconnect a specific extra linked Gmail account (Admin only)
+router.delete('/linked-account', protect, authorizeRoles('Admin'), disconnectLinkedAccount);
 
 module.exports = router;

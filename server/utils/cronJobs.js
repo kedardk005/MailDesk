@@ -70,8 +70,8 @@ const startCronJobs = (io) => {
     }
   });
 
-  // Schedule to run every 30 minutes
-  cron.schedule('*/30 * * * *', async () => {
+  // Schedule to run every 10 minutes
+  cron.schedule('*/10 * * * *', async () => {
     try {
       console.log('[CRON] Starting automatic email synchronization for connected users...');
       

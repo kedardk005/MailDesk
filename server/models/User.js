@@ -35,6 +35,16 @@ const UserSchema = new mongoose.Schema({
     type: String,
     default: ""
   },
+  linkedGmailAccounts: {
+    type: [
+      {
+        gmailEmail: { type: String, required: true },
+        gmailAccessToken: { type: String, default: null },
+        gmailRefreshToken: { type: String, default: null }
+      }
+    ],
+    default: []
+  },
   birthdate: {
     type: Date,
     default: null

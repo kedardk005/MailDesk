@@ -91,6 +91,7 @@ const getHeader = (headers, name) => {
 // @desc    Generate Google OAuth2 authorization URL
 // @route   GET /api/gmail/auth-url
 // @access  Private
+// Query param: ?mode=extra  → stores tokens in linkedGmailAccounts instead of primary slot
 exports.getAuthUrl = async (req, res) => {
   try {
     const oauth2Client = getOAuth2Client();
@@ -100,13 +101,15 @@ exports.getAuthUrl = async (req, res) => {
       'https://www.googleapis.com/auth/gmail.modify'
     ];
 
-    // Generate authorization URL
-    // State stores the user ID to associate tokens correctly in the public callback
+    // Encode userId + mode into state so callback knows where to save tokens
+    const mode = req.query.mode === 'extra' ? 'extra' : 'primary';
+    const statePayload = `${req.user._id.toString()}:${mode}`;
+
     const authUrl = oauth2Client.generateAuthUrl({
-      access_type: 'offline', // Request refresh token
-      prompt: 'consent',      // Force consent screen to guarantee refresh token is returned
+      access_type: 'offline',
+      prompt: 'consent',
       scope: scopes,
-      state: req.user._id.toString()
+      state: statePayload
     });
 
     return res.status(200).json({ authUrl });
@@ -127,6 +130,10 @@ exports.handleOAuthCallback = async (req, res) => {
       return res.status(400).send('Authorization code or state parameter is missing.');
     }
 
+    // Decode state: "userId:mode" (mode = 'primary' | 'extra')
+    const [userId, mode] = state.split(':');
+    const isExtra = mode === 'extra';
+
     const oauth2Client = getOAuth2Client();
 
     // Exchange code for access and refresh tokens
@@ -134,14 +141,14 @@ exports.handleOAuthCallback = async (req, res) => {
     oauth2Client.setCredentials(tokens);
     
     // Find user using Mongoose ID passed via OAuth 'state'
-    const user = await User.findById(state);
+    const user = await User.findById(userId);
     if (!user) {
       return res.status(404).send('User associated with OAuth session not found.');
     }
 
-    // Block Employees from connecting Gmail
-    if (user.role === 'Employee') {
-      return res.status(403).send('Access denied. Employees are not authorized to connect Gmail.');
+    // Only Admins can connect Gmail accounts
+    if (user.role !== 'Admin') {
+      return res.status(403).send('Access denied. Only Admin users are authorized to connect Gmail accounts.');
     }
 
     // Call Gmail API to fetch the user's profile and actual Gmail email address
@@ -154,98 +161,112 @@ exports.handleOAuthCallback = async (req, res) => {
       console.error('Error fetching Gmail profile during OAuth:', apiErr);
     }
 
-    // Save tokens and Gmail address to MongoDB
-    user.gmailAccessToken = tokens.access_token;
-    if (tokens.refresh_token) {
-      user.gmailRefreshToken = tokens.refresh_token;
+    if (!gmailAddress) {
+      return res.status(400).send('Failed to fetch Gmail profile email address. Please make sure Gmail access is enabled.');
     }
-    user.gmailEmail = gmailAddress;
-    await user.save();
 
-    console.log(`Successfully saved Google credentials for user: ${user.email}`);
+    if (isExtra) {
+      // Store as a linked (extra) account — do not overwrite primary tokens
+      const alreadyLinked = user.linkedGmailAccounts.some(a => a.gmailEmail === gmailAddress);
+      if (!alreadyLinked) {
+        user.linkedGmailAccounts.push({
+          gmailEmail: gmailAddress,
+          gmailAccessToken: tokens.access_token,
+          gmailRefreshToken: tokens.refresh_token || null
+        });
+        await user.save();
+        console.log(`[GMAIL] Linked extra account ${gmailAddress} to user ${user.email}`);
+        await logActivity(user._id, 'Gmail Link Extra', `Linked extra Gmail account: ${gmailAddress}`);
+      } else {
+        // Update tokens if account already exists
+        const acct = user.linkedGmailAccounts.find(a => a.gmailEmail === gmailAddress);
+        if (acct) {
+          acct.gmailAccessToken = tokens.access_token;
+          if (tokens.refresh_token) acct.gmailRefreshToken = tokens.refresh_token;
+        }
+        await user.save();
+        console.log(`[GMAIL] Refreshed tokens for linked account ${gmailAddress}`);
+      }
+    } else {
+      // Save as primary Gmail account
+      user.gmailAccessToken = tokens.access_token;
+      if (tokens.refresh_token) {
+        user.gmailRefreshToken = tokens.refresh_token;
+      }
+      user.gmailEmail = gmailAddress;
+      await user.save();
+      console.log(`Successfully saved primary Google credentials for user: ${user.email}`);
+      await logActivity(user._id, 'Gmail Connection', `Connected Gmail account: ${gmailAddress}`);
+    }
 
-    await logActivity(user._id, 'Gmail Connection', `Connected Gmail account: ${user.email}`);
+    // Run deduplication to clean up duplicates workspace-wide
+    await deduplicateConnections();
 
-    // Redirect to dashboard page
+    // Redirect to inbox so user sees the new account immediately
     const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:5173';
-    return res.redirect(`${frontendUrl}/dashboard?gmail=connected`);
+    return res.redirect(`${frontendUrl}/inbox?gmail=connected`);
   } catch (error) {
     console.error('OAuth callback exchange error:', error);
     return res.status(500).send('Failed to complete Google authentication. Please try again.');
   }
 };
 
-// Helper to perform Gmail fetching for a specific user document
-const syncUserEmails = async (user, isManual = false) => {
-  if (!user || !user.gmailAccessToken) {
-    throw new Error('Gmail account not connected or user is invalid.');
-  }
-
-  console.log(`[GMAIL SYNC] Syncing emails for ${user.email} (Manual: ${isManual})...`);
-
+// Low-level helper: sync a single Gmail credential set (access/refresh tokens + inboxEmail)
+const syncAccountEmails = async (user, accessToken, refreshToken, inboxEmail, isManual = false) => {
   const oauth2Client = getOAuth2Client();
-  oauth2Client.setCredentials({
-    access_token: user.gmailAccessToken,
-    refresh_token: user.gmailRefreshToken
-  });
+  oauth2Client.setCredentials({ access_token: accessToken, refresh_token: refreshToken });
 
-  // Handle token refresh events automatically
-  oauth2Client.on('tokens', async (tokens) => {
-    console.log('[GMAIL SYNC] Google OAuth2 tokens refreshed.');
-    if (tokens.access_token) {
-      user.gmailAccessToken = tokens.access_token;
-    }
-    if (tokens.refresh_token) {
-      user.gmailRefreshToken = tokens.refresh_token;
+  // Auto-save refreshed tokens
+  oauth2Client.on('tokens', async (newTokens) => {
+    if (inboxEmail === user.gmailEmail) {
+      // Primary account
+      if (newTokens.access_token) user.gmailAccessToken = newTokens.access_token;
+      if (newTokens.refresh_token) user.gmailRefreshToken = newTokens.refresh_token;
+    } else {
+      // Linked account
+      const acct = user.linkedGmailAccounts.find(a => a.gmailEmail === inboxEmail);
+      if (acct) {
+        if (newTokens.access_token) acct.gmailAccessToken = newTokens.access_token;
+        if (newTokens.refresh_token) acct.gmailRefreshToken = newTokens.refresh_token;
+      }
     }
     await user.save();
   });
 
   const gmail = google.gmail({ version: 'v1', auth: oauth2Client });
 
-  // Fetch list of last 50 messages
   const listRes = await gmail.users.messages.list({
     userId: 'me',
-    maxResults: 50
+    maxResults: 50,
+    includeSpamTrash: true
   });
 
   const messages = listRes.data.messages || [];
-  console.log(`[GMAIL SYNC] Gmail API returned ${messages.length} messages from mailbox.`);
+  console.log(`[GMAIL SYNC] ${inboxEmail}: ${messages.length} messages found.`);
 
-  let newEmailsCount = 0;
+  let newCount = 0;
 
   for (const message of messages) {
-    // Check if messageId already exists in DB
     const exists = await Email.findOne({ messageId: message.id });
-    if (exists) {
-      continue;
-    }
+    if (exists) continue;
 
-    // Fetch detailed message payload
-    const msgDetails = await gmail.users.messages.get({
-      userId: 'me',
-      id: message.id
-    });
-
+    const msgDetails = await gmail.users.messages.get({ userId: 'me', id: message.id });
     const payload = msgDetails.data.payload;
     const headers = payload.headers;
+    const labelIds = msgDetails.data.labelIds || [];
 
-    // Extract subject, from, and date headers
     const subject = getHeader(headers, 'subject') || '(No Subject)';
     const from = getHeader(headers, 'from') || 'Unknown Sender';
     const dateStr = getHeader(headers, 'date');
     const date = dateStr ? new Date(dateStr) : new Date();
 
-    // Extract and decode text body
     const rawBody = getBodyText(payload);
     let decodedBody = '';
     if (rawBody) {
-      // Base64url decoding
       const base64Body = rawBody.replace(/-/g, '+').replace(/_/g, '/');
       decodedBody = Buffer.from(base64Body, 'base64').toString('utf-8');
     }
 
-    // Process inline images and fetch/replace cid references
     const inlineImages = getInlineImages(payload);
     if (inlineImages.length > 0 && decodedBody) {
       for (const img of inlineImages) {
@@ -261,15 +282,12 @@ const syncUserEmails = async (user, isManual = false) => {
             });
             base64Data = attachRes.data.data || '';
           } catch (attachErr) {
-            console.error(`[GMAIL SYNC] Failed to fetch inline image attachment ${img.contentId}:`, attachErr);
+            console.error(`[GMAIL SYNC] Failed to fetch attachment ${img.contentId}:`, attachErr);
           }
         }
-
         if (base64Data) {
           const standardBase64 = base64Data.replace(/-/g, '+').replace(/_/g, '/');
           const dataUrl = `data:${img.mimeType};base64,${standardBase64}`;
-          
-          // Escape special characters in contentId to use in RegExp
           const escapedCid = img.contentId.replace(/[-\/\\^$*+?.()|[\]{}]/g, '\\$&');
           const regex = new RegExp(`cid:<?${escapedCid}>?`, 'gi');
           decodedBody = decodedBody.replace(regex, dataUrl);
@@ -277,7 +295,6 @@ const syncUserEmails = async (user, isManual = false) => {
       }
     }
 
-    // Save email to DB
     const emailRecord = new Email({
       messageId: message.id,
       subject,
@@ -286,46 +303,99 @@ const syncUserEmails = async (user, isManual = false) => {
       body: decodedBody,
       status: 'unassigned',
       assignedTo: null,
-      fetchedBy: user._id
+      fetchedBy: user._id,
+      labelIds,
+      toEmail: inboxEmail
     });
 
     await emailRecord.save();
-    console.log(`[GMAIL SYNC] Saved new email: "${subject}" from ${from}`);
-    newEmailsCount++;
+    console.log(`[GMAIL SYNC] Saved: "${subject}" to ${inboxEmail}`);
+    newCount++;
   }
 
-  console.log(`[GMAIL SYNC] Sync complete. Added ${newEmailsCount} new emails.`);
+  return newCount;
+};
 
-  // Log activity
+// High-level helper: sync ALL accounts (primary + linked) for a user
+const syncUserEmails = async (user, isManual = false) => {
+  if (!user) throw new Error('Invalid user.');
+
+  let totalNew = 0;
+
+  // 1. Sync primary account (if connected)
+  if (user.gmailAccessToken) {
+    console.log(`[GMAIL SYNC] Syncing primary account: ${user.gmailEmail}`);
+    const count = await syncAccountEmails(
+      user, user.gmailAccessToken, user.gmailRefreshToken, user.gmailEmail, isManual
+    );
+    totalNew += count;
+  }
+
+  // 2. Sync all linked (extra) accounts
+  for (const acct of (user.linkedGmailAccounts || [])) {
+    if (acct.gmailAccessToken) {
+      console.log(`[GMAIL SYNC] Syncing linked account: ${acct.gmailEmail}`);
+      try {
+        const count = await syncAccountEmails(
+          user, acct.gmailAccessToken, acct.gmailRefreshToken, acct.gmailEmail, isManual
+        );
+        totalNew += count;
+      } catch (err) {
+        console.error(`[GMAIL SYNC] Failed for linked account ${acct.gmailEmail}:`, err.message);
+      }
+    }
+  }
+
+  console.log(`[GMAIL SYNC] Total new emails this sync: ${totalNew}`);
+
   const activityType = isManual ? 'Gmail Fetch' : 'Gmail Fetch Auto';
-  const activityDesc = isManual 
-    ? `Manually fetched Gmail emails (Found ${newEmailsCount} new emails)`
-    : `Automatically fetched Gmail emails (Found ${newEmailsCount} new emails)`;
+  const activityDesc = isManual
+    ? `Manually fetched Gmail emails (Found ${totalNew} new emails)`
+    : `Automatically fetched Gmail emails (Found ${totalNew} new emails)`;
   await logActivity(user._id, activityType, activityDesc);
 
-  return newEmailsCount;
+  return totalNew;
 };
 
 // Export syncUserEmails for cron job usage
 exports.syncUserEmails = syncUserEmails;
 
-// @desc    Manually fetch the last 50 emails
+// @desc    Manually fetch emails from all connected accounts
 // @route   POST /api/gmail/fetch
 // @access  Private
 exports.fetchEmails = async (req, res) => {
   try {
-    // Retrieve user from DB to access fresh tokens
-    const user = await User.findById(req.user._id);
-    if (!user || !user.gmailAccessToken) {
-      console.log('Fetch abort: user or gmailAccessToken missing in DB.');
-      return res.status(400).json({ message: 'Gmail account not connected. Please authenticate first.' });
+    let totalCount = 0;
+
+    if (req.user.role === 'Admin' || req.user.role === 'Head') {
+      // Find all users who have a connected Gmail account
+      const users = await User.find({
+        gmailAccessToken: { $ne: null, $ne: "" }
+      });
+
+      if (users.length > 0) {
+        for (const u of users) {
+          try {
+            console.log(`[MANUAL SYNC] Syncing emails for user: ${u.email}`);
+            const count = await syncUserEmails(u, true);
+            totalCount += count;
+          } catch (syncError) {
+            console.error(`[MANUAL SYNC ERROR] Failed to sync for user ${u.email}:`, syncError);
+          }
+        }
+      }
+    } else {
+      const user = await User.findById(req.user._id);
+      if (!user || !user.gmailAccessToken) {
+        console.log('Fetch abort: user or gmailAccessToken missing in DB.');
+        return res.status(400).json({ message: 'Gmail account not connected. Please authenticate first.' });
+      }
+      totalCount = await syncUserEmails(user, true);
     }
 
-    const count = await syncUserEmails(user, true);
-
     return res.status(200).json({
-      message: 'Emails fetched successfully',
-      count
+      message: 'Emails fetched successfully from all connected accounts',
+      count: totalCount
     });
   } catch (error) {
     console.error('Error in fetchEmails:', error);
@@ -349,6 +419,7 @@ exports.getEmails = async (req, res) => {
 
     const emails = await Email.find(query)
       .populate('assignedTo', 'name email')
+      .populate('fetchedBy', 'name email gmailEmail')
       .sort({ date: -1 });
 
     return res.status(200).json(emails);
@@ -406,18 +477,138 @@ exports.deleteSingleEmail = async (req, res) => {
 // @access  Private
 exports.getConnectedStatus = async (req, res) => {
   try {
-    const user = await User.findById(req.user._id);
-    if (!user) {
+    // Clean up duplicates and blanks first
+    await deduplicateConnections();
+
+    const currentUser = await User.findById(req.user._id);
+    if (!currentUser) {
       return res.status(404).json({ message: "User not found" });
     }
-    const isConnected = !!user.gmailAccessToken && user.gmailAccessToken !== "";
+    const isConnected = !!currentUser.gmailAccessToken && currentUser.gmailAccessToken !== "";
+    
+    // Admin and Head can see all connected accounts in the workspace
+    let linkedAccounts = (currentUser.linkedGmailAccounts || []).map(a => ({
+      gmailEmail: a.gmailEmail,
+      connected: !!a.gmailAccessToken,
+      ownerName: 'Me',
+      isOtherUser: false,
+      userId: currentUser._id.toString()
+    }));
+
+    if (currentUser.role === 'Admin' || currentUser.role === 'Head') {
+      // Find other users with connected accounts
+      const otherUsers = await User.find({
+        _id: { $ne: currentUser._id },
+        gmailAccessToken: { $ne: null, $ne: "" }
+      });
+
+      for (const u of otherUsers) {
+        // Add their primary account
+        linkedAccounts.push({
+          gmailEmail: u.gmailEmail,
+          connected: true,
+          ownerName: u.name,
+          isOtherUser: true,
+          userId: u._id.toString()
+        });
+
+        // Add their linked accounts
+        for (const la of (u.linkedGmailAccounts || [])) {
+          linkedAccounts.push({
+            gmailEmail: la.gmailEmail,
+            connected: !!la.gmailAccessToken,
+            ownerName: u.name,
+            isOtherUser: true,
+            userId: u._id.toString()
+          });
+        }
+      }
+    }
+
     return res.status(200).json({
       connected: isConnected,
-      gmailEmail: user.gmailEmail || ""
+      gmailEmail: currentUser.gmailEmail || "",
+      linkedAccounts
     });
   } catch (error) {
     console.error('Error in getConnectedStatus:', error);
     return res.status(500).json({ message: 'Server error. Failed to check connected status.' });
+  }
+};
+
+// @desc    Disconnect a specific linked (extra) Gmail account
+// @route   DELETE /api/gmail/linked-account
+// @access  Private (Admin, Head only)
+exports.disconnectLinkedAccount = async (req, res) => {
+  try {
+    const { gmailEmail, userId } = req.body;
+    if (!gmailEmail && !userId) {
+      return res.status(400).json({ message: 'Either gmailEmail or userId is required.' });
+    }
+
+    // Determine target user
+    let targetUserId = req.user._id;
+    if (userId && req.user.role === 'Admin') {
+      targetUserId = userId;
+    }
+
+    const user = await User.findById(targetUserId);
+    if (!user) {
+      return res.status(404).json({ message: 'User not found.' });
+    }
+
+    // If gmailEmail is empty or blank, clear blank connections for this user
+    if (!gmailEmail) {
+      // Clear blank primary account
+      if (!user.gmailEmail) {
+        user.gmailAccessToken = "";
+        user.gmailRefreshToken = "";
+        user.gmailEmail = "";
+      }
+      // Remove blank linked accounts
+      user.linkedGmailAccounts = user.linkedGmailAccounts.filter(a => !!a.gmailEmail);
+      await user.save();
+      await logActivity(req.user._id, 'Gmail Clean Blank Accounts', `Cleared blank Gmail connections for user ${user.email}`);
+      return res.status(200).json({ message: 'Blank connection cleared successfully.' });
+    }
+
+    let isPrimary = false;
+    let before = 0;
+    let after = 0;
+
+    if (user.gmailEmail === gmailEmail) {
+      isPrimary = true;
+      user.gmailAccessToken = "";
+      user.gmailRefreshToken = "";
+      user.gmailEmail = "";
+      await user.save();
+    } else {
+      before = user.linkedGmailAccounts.length;
+      user.linkedGmailAccounts = user.linkedGmailAccounts.filter(
+        a => a.gmailEmail !== gmailEmail
+      );
+      after = user.linkedGmailAccounts.length;
+      await user.save();
+    }
+
+    if (!isPrimary && before === after) {
+      return res.status(404).json({ message: 'Linked account not found.' });
+    }
+
+    // Delete all emails fetched from this account (identified by toEmail or fetchedBy)
+    const emailsToDelete = await Email.find({ toEmail: gmailEmail, fetchedBy: targetUserId });
+    const emailIds = emailsToDelete.map(e => e._id);
+    await Email.deleteMany({ toEmail: gmailEmail, fetchedBy: targetUserId });
+    if (emailIds.length > 0) {
+      await Task.updateMany({ linkedEmail: { $in: emailIds } }, { $set: { linkedEmail: null } });
+    }
+
+    await logActivity(req.user._id, 'Gmail Unlink Account', `Unlinked Gmail account ${gmailEmail} of user ${user.email}`);
+
+    return res.status(200).json({ message: `${gmailEmail} disconnected successfully.` });
+  } catch (error) {
+    console.error('Error in disconnectLinkedAccount:', error);
+    return res.status(500).json({ message: 'Server error. Failed to disconnect linked account.' });
   }
 };
 
@@ -459,6 +650,59 @@ exports.disconnectGmail = async (req, res) => {
   } catch (error) {
     console.error('Error in disconnectGmail:', error);
     return res.status(500).json({ message: 'Server error. Failed to disconnect Gmail.' });
+  }
+};
+
+// Workspace-wide deduplication and cleanup helper
+const deduplicateConnections = async () => {
+  try {
+    const users = await User.find({});
+    const seenEmails = new Set();
+
+    for (const u of users) {
+      let modified = false;
+
+      // 1. Check and clean primary connection
+      const hasPrimary = !!u.gmailAccessToken || !!u.gmailEmail;
+      if (hasPrimary) {
+        const emailLower = (u.gmailEmail || "").toLowerCase().trim();
+        // If the email is blank or it has already been registered elsewhere, clear it
+        if (!emailLower || seenEmails.has(emailLower)) {
+          u.gmailAccessToken = null;
+          u.gmailRefreshToken = null;
+          u.gmailEmail = "";
+          modified = true;
+          console.log(`[DEDUPLICATE] Cleared duplicate/invalid primary account for user: ${u.email}`);
+        } else {
+          seenEmails.add(emailLower);
+        }
+      }
+
+      // 2. Check and clean linked extra accounts
+      if (u.linkedGmailAccounts && u.linkedGmailAccounts.length > 0) {
+        const originalLength = u.linkedGmailAccounts.length;
+        u.linkedGmailAccounts = u.linkedGmailAccounts.filter(acct => {
+          const emailLower = (acct.gmailEmail || "").toLowerCase().trim();
+          // If the email is blank or has already been registered elsewhere, remove it
+          if (!emailLower || seenEmails.has(emailLower)) {
+            console.log(`[DEDUPLICATE] Removed duplicate/invalid linked account ${acct.gmailEmail || "(blank)"} from user: ${u.email}`);
+            return false;
+          }
+          seenEmails.add(emailLower);
+          return true;
+        });
+
+        if (u.linkedGmailAccounts.length !== originalLength) {
+          modified = true;
+        }
+      }
+
+      if (modified) {
+        await u.save();
+      }
+    }
+  } catch (err) {
+    console.error('[DEDUPLICATE ERROR] Failed to clean duplicates:', err);
   }
 };
 

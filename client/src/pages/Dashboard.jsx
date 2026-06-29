@@ -54,7 +54,11 @@ const Dashboard = () => {
   const fetchGmailStatus = async () => {
     try {
       const res = await api.get('/gmail/status');
-      setGmailStatus(res.data);
+      setGmailStatus({
+        connected: res.data.connected,
+        gmailEmail: res.data.gmailEmail || '',
+        linkedAccounts: res.data.linkedAccounts || []
+      });
     } catch (err) {
       console.error('Error fetching Gmail status:', err);
     }
@@ -126,7 +130,7 @@ const Dashboard = () => {
     }
   };
 
-  const showWorkspaceCards = user.role !== 'Employee';
+  const showWorkspaceCards = user.role === 'Admin';
 
   return (
     <main className="flex-grow max-w-7xl w-full mx-auto px-4 sm:px-6 lg:px-8 py-8 animate-fade-in select-none">
@@ -366,10 +370,16 @@ const Dashboard = () => {
                         <h3 className="text-sm font-bold text-slate-800 tracking-tight">Gmail Connected</h3>
                         <span className="h-2 w-2 rounded-full bg-emerald-500 animate-pulse shrink-0" />
                       </div>
-                      <div className="mt-1 flex">
-                        <span className="px-2.5 py-0.5 rounded-full text-[10px] font-bold bg-emerald-50 border border-emerald-100 text-emerald-600">
-                          Connected: {gmailStatus.gmailEmail}
+                      <div className="mt-1 flex flex-col gap-1">
+                        <span className="px-2.5 py-0.5 rounded-full text-[10px] font-bold bg-emerald-50 border border-emerald-100 text-emerald-600 w-fit">
+                          Primary: {gmailStatus.gmailEmail}
                         </span>
+                        {(gmailStatus.linkedAccounts || []).map(acct => (
+                          <span key={acct.gmailEmail} className="px-2.5 py-0.5 rounded-full text-[10px] font-bold bg-indigo-50 border border-indigo-100 text-indigo-600 w-fit flex items-center gap-1">
+                            <span className="h-1.5 w-1.5 rounded-full bg-indigo-400 inline-block" />
+                            {acct.gmailEmail} {acct.ownerName && acct.ownerName !== 'Me' ? `(${acct.ownerName})` : ''}
+                          </span>
+                        ))}
                       </div>
                     </div>
                   </div>
@@ -386,18 +396,28 @@ const Dashboard = () => {
                             <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
                             <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z" />
                           </svg>
-                          <span>Synchronising...</span>
+                          <span>Synchronising all accounts...</span>
                         </span>
                       ) : (
-                        <span>Synchronise Emails</span>
+                        <span>Synchronise Emails ({1 + (gmailStatus.linkedAccounts?.length || 0)} accounts)</span>
                       )}
                     </button>
+
+                    <a
+                      href="/inbox?tab=accounts"
+                      className="w-full flex justify-center items-center gap-2 py-2.5 px-4 rounded-xl text-xs font-bold text-indigo-600 bg-indigo-50 hover:bg-indigo-100 border border-indigo-100 transition-all duration-150 shadow-sm active:scale-[0.98]"
+                    >
+                      <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M3 8l7.89 5.26a2 2 0 002.22 0L21 8M5 19h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v10a2 2 0 002 2z" />
+                      </svg>
+                      <span>Manage Accounts in Inbox</span>
+                    </a>
 
                     <button
                       onClick={handleDisconnectGmail}
                       className="w-full flex justify-center items-center gap-2 py-2.5 px-4 rounded-xl text-xs font-bold text-red-650 bg-red-50 hover:bg-red-100 border border-red-200/60 transition-all duration-150 shadow-sm active:scale-[0.98]"
                     >
-                      <span>Disconnect Gmail</span>
+                      <span>Disconnect Primary Gmail</span>
                     </button>
                   </div>
                 </>

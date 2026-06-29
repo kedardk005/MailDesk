@@ -159,9 +159,9 @@ const TaskList = () => {
           const assignable = usersRes.data.filter(u => u.role === 'Head' || u.role === 'Employee');
           setUsers(assignable);
 
-          // 3. Fetch unassigned emails
+          // 3. Fetch unassigned emails (excluding spam)
           const emailsRes = await api.get('/gmail/emails');
-          const unassigned = emailsRes.data.filter(e => e.status === 'unassigned');
+          const unassigned = emailsRes.data.filter(e => e.status === 'unassigned' && !e.labelIds?.includes('SPAM'));
           setUnassignedEmails(unassigned);
         }
       }
