@@ -42,6 +42,11 @@ const TaskSchema = new mongoose.Schema({
     ref: 'User',
     default: null
   },
+  priority: {
+    type: String,
+    enum: ['Low', 'Medium', 'High', 'Urgent'],
+    default: 'Medium'
+  },
   createdAt: {
     type: Date,
     default: Date.now

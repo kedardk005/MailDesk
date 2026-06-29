@@ -11,7 +11,7 @@ const { sendEmail } = require('../utils/emailHelper');
 // @access  Private (Admin, Head only)
 exports.createTask = async (req, res) => {
   try {
-    const { title, description, linkedEmail, assignedTo, clientName, deadline, notes } = req.body;
+    const { title, description, linkedEmail, assignedTo, clientName, deadline, notes, priority } = req.body;
 
     // Validate required fields
     if (!title || !assignedTo || !clientName || !deadline) {
@@ -27,6 +27,7 @@ exports.createTask = async (req, res) => {
       clientName: clientName.trim(),
       deadline,
       notes: notes ? notes.trim() : '',
+      priority: priority || 'Medium',
       createdBy: req.user._id,
       status: 'Pending'
     });
@@ -168,7 +169,7 @@ exports.updateTask = async (req, res) => {
       }
     } else {
       // Admin/Head can update all fields
-      const { title, description, assignedTo, clientName, deadline, notes, status } = req.body;
+      const { title, description, assignedTo, clientName, deadline, notes, status, priority } = req.body;
 
       if (title !== undefined) task.title = title.trim();
       if (description !== undefined) task.description = description.trim();
@@ -176,6 +177,7 @@ exports.updateTask = async (req, res) => {
       if (deadline !== undefined) task.deadline = deadline;
       if (notes !== undefined) task.notes = notes.trim();
       if (status !== undefined) task.status = status;
+      if (priority !== undefined) task.priority = priority;
 
       // Handle changes to task assignee
       if (assignedTo !== undefined && assignedTo !== task.assignedTo?.toString()) {

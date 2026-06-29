@@ -2,6 +2,16 @@ import React, { useState, useEffect, useRef } from 'react';
 import { useNavigate, Link } from 'react-router-dom';
 import api from '../api/axios';
 
+const getPriorityStyle = (priority) => {
+  const styles = {
+    Low:    { background: '#f0fdf4', color: '#166534', border: '1px solid #bbf7d0' },
+    Medium: { background: '#fefce8', color: '#854d0e', border: '1px solid #fde68a' },
+    High:   { background: '#fff7ed', color: '#9a3412', border: '1px solid #fed7aa' },
+    Urgent: { background: '#fef2f2', color: '#991b1b', border: '1px solid #fecaca' },
+  };
+  return styles[priority] || styles['Medium'];
+};
+
 const renderEmailContent = (body) => {
   if (!body) return '<html><body><span style="font-family: sans-serif; font-size: 13px; color: #94a3b8; font-style: italic;">This email has no text content.</span></body></html>';
   const isHtml = /<[a-z][\s\S]*>/i.test(body);
@@ -18,6 +28,7 @@ const TaskList = () => {
   const [alert, setAlert] = useState({ type: '', message: '' });
   const [creatorFilter, setCreatorFilter] = useState('');
   const [statusFilter, setStatusFilter] = useState('All');
+  const [priorityFilter, setPriorityFilter] = useState('All');
   const [expandedTaskId, setExpandedTaskId] = useState(null);
 
   // View mode & Calendar states
@@ -41,7 +52,8 @@ const TaskList = () => {
     assignedTo: '',
     linkedEmail: '',
     deadline: '',
-    notes: ''
+    notes: '',
+    priority: 'Medium'
   });
 
   // Client search suggestions states (Create Task)
@@ -59,7 +71,8 @@ const TaskList = () => {
     assignedTo: '',
     deadline: '',
     notes: '',
-    status: 'Pending'
+    status: 'Pending',
+    priority: 'Medium'
   });
 
   // Client search suggestions states (Edit Task)
@@ -195,7 +208,8 @@ const TaskList = () => {
         assignedTo: newTask.assignedTo,
         linkedEmail: newTask.linkedEmail || undefined,
         deadline: newTask.deadline,
-        notes: newTask.notes
+        notes: newTask.notes,
+        priority: newTask.priority
       });
 
       triggerAlert('success', `Task '${newTask.title}' successfully initialized.`);
@@ -207,7 +221,8 @@ const TaskList = () => {
         assignedTo: '',
         linkedEmail: '',
         deadline: '',
-        notes: ''
+        notes: '',
+        priority: 'Medium'
       });
       setClientSearchQuery('');
       fetchTasks();
@@ -245,7 +260,8 @@ const TaskList = () => {
         assignedTo: editForm.assignedTo,
         deadline: editForm.deadline,
         notes: editForm.notes,
-        status: editForm.status
+        status: editForm.status,
+        priority: editForm.priority
       });
 
       triggerAlert('success', 'Task records successfully updated.');
@@ -303,7 +319,8 @@ const TaskList = () => {
       assignedTo: task.assignedTo?._id || '',
       deadline: task.deadline ? new Date(task.deadline).toISOString().slice(0, 16) : '',
       notes: task.notes || '',
-      status: task.status
+      status: task.status,
+      priority: task.priority || 'Medium'
     });
     setEditClientSearchQuery(task.clientName);
     setIsEditOpen(true);
@@ -410,12 +427,15 @@ const TaskList = () => {
     ).values()
   );
 
-  // Apply creator and status filters
+  // Apply creator, status, and priority filters
   const filteredTasks = tasks.filter(task => {
     if (creatorFilter && task.createdBy?._id !== creatorFilter) {
       return false;
     }
     if (statusFilter !== 'All' && task.status !== statusFilter) {
+      return false;
+    }
+    if (priorityFilter !== 'All' && (task.priority || 'Medium') !== priorityFilter) {
       return false;
     }
     return true;
@@ -506,6 +526,21 @@ const TaskList = () => {
                 </select>
               </div>
             )}
+            <div className="flex items-center space-x-2">
+              <span className="text-xs text-slate-400 font-semibold uppercase tracking-wider">Priority:</span>
+              <select
+                value={priorityFilter}
+                onChange={e => setPriorityFilter(e.target.value)}
+                style={{ padding: '7px 10px', fontSize: '13px', borderRadius: '6px', border: '1px solid #e2e8f0', background: 'white', cursor: 'pointer' }}
+                className="text-xs font-semibold text-slate-700"
+              >
+                <option value="All">All priorities</option>
+                <option value="Urgent">Urgent</option>
+                <option value="High">High</option>
+                <option value="Medium">Medium</option>
+                <option value="Low">Low</option>
+              </select>
+            </div>
             {(currentUser?.role === 'Admin' || currentUser?.role === 'Head') && (
               <button
                 onClick={() => setIsCreateOpen(true)}
@@ -643,7 +678,8 @@ const TaskList = () => {
                           assignedTo: '',
                           linkedEmail: '',
                           deadline: dateStr,
-                          notes: ''
+                          notes: '',
+                          priority: 'Medium'
                         });
                         setClientSearchQuery('');
                         setIsCreateOpen(true);
@@ -761,6 +797,12 @@ const TaskList = () => {
                       }`}>
                         {task.status}
                       </span>
+                      <span style={{
+                        fontSize: '11px', fontWeight: 600, padding: '2px 8px', borderRadius: '20px',
+                        ...getPriorityStyle(task.priority)
+                      }}>
+                        {task.priority || 'Medium'}
+                      </span>
                       <svg
                         className={`h-4 w-4 text-slate-400 transform transition-transform duration-200 ${
                           isExpanded ? 'rotate-180 text-indigo-600' : ''
@@ -793,7 +835,7 @@ const TaskList = () => {
                         </div>
                       </div>
 
-                      <div className="grid grid-cols-1 sm:grid-cols-3 gap-4 border-t border-slate-100 pt-4 text-xs text-slate-500">
+                      <div className="grid grid-cols-1 sm:grid-cols-4 gap-4 border-t border-slate-100 pt-4 text-xs text-slate-500">
                         <div>
                           <span className="font-semibold text-slate-400 uppercase tracking-wider text-[10px] block">Assigned To</span>
                           <span className="text-slate-750 font-medium">{task.assignedTo ? `${task.assignedTo.name} (${task.assignedTo.email})` : 'Unassigned'}</span>
@@ -805,6 +847,15 @@ const TaskList = () => {
                         <div>
                           <span className="font-semibold text-slate-400 uppercase tracking-wider text-[10px] block">Deadline</span>
                           <span className="text-slate-750 font-medium">{formatDate(task.deadline)}</span>
+                        </div>
+                        <div>
+                          <span className="font-semibold text-slate-400 uppercase tracking-wider text-[10px] block">Priority</span>
+                          <span style={{
+                            display: 'inline-block', fontSize: '11px', fontWeight: 600, padding: '2px 8px', borderRadius: '20px', marginTop: '2px',
+                            ...getPriorityStyle(task.priority)
+                          }}>
+                            {task.priority || 'Medium'}
+                          </span>
                         </div>
                       </div>
 
@@ -1013,6 +1064,20 @@ const TaskList = () => {
               </div>
 
               <div>
+                <label className="block text-xs font-semibold text-slate-500 uppercase tracking-wider mb-1">Priority</label>
+                <select
+                  value={newTask.priority}
+                  onChange={e => setNewTask(prev => ({ ...prev, priority: e.target.value }))}
+                  className="block w-full px-4 py-3 bg-white border border-slate-200 rounded-xl text-slate-805 focus:outline-none focus:ring-2 focus:ring-indigo-150 focus:border-indigo-500 text-sm transition-all duration-200"
+                >
+                  <option value="Low">Low</option>
+                  <option value="Medium">Medium</option>
+                  <option value="High">High</option>
+                  <option value="Urgent">Urgent</option>
+                </select>
+              </div>
+
+              <div>
                 <label className="block text-xs font-semibold text-slate-500 uppercase tracking-wider mb-1">Notes</label>
                 <textarea
                   placeholder="Internal notes or pointers..."
@@ -1065,6 +1130,12 @@ const TaskList = () => {
                     ? 'Update parameters or assign status changes.'
                     : 'Review assignment details below.'}
                 </p>
+                <div className="mt-2" style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                  <span style={{ fontSize: '12px', color: '#64748b' }}>Priority:</span>
+                  <span style={{ fontSize: '12px', fontWeight: 600, padding: '2px 10px', borderRadius: '20px', ...getPriorityStyle(selectedTask?.priority) }}>
+                    {selectedTask?.priority || 'Medium'}
+                  </span>
+                </div>
               </div>
               <button onClick={() => { setIsEditOpen(false); setSelectedTask(null); }} className="text-slate-400 hover:text-slate-600 transition-colors">
                 <svg className="h-5 w-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -1179,6 +1250,21 @@ const TaskList = () => {
                   value={editForm.deadline}
                   onChange={(e) => setEditForm({ ...editForm, deadline: e.target.value })}
                 />
+              </div>
+
+              <div>
+                <label className="block text-xs font-semibold text-slate-500 uppercase tracking-wider mb-1">Priority</label>
+                <select
+                  disabled={currentUser.role === 'Employee'}
+                  value={editForm.priority}
+                  onChange={e => setEditForm(prev => ({ ...prev, priority: e.target.value }))}
+                  className="block w-full px-4 py-3 bg-white border border-slate-200 rounded-xl text-slate-805 focus:outline-none focus:ring-2 focus:ring-indigo-150 focus:border-indigo-505 text-sm disabled:bg-slate-50 disabled:text-slate-500 transition-all duration-200"
+                >
+                  <option value="Low">Low</option>
+                  <option value="Medium">Medium</option>
+                  <option value="High">High</option>
+                  <option value="Urgent">Urgent</option>
+                </select>
               </div>
 
               <div>
