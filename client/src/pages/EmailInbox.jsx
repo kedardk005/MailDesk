@@ -25,6 +25,9 @@ const EmailInbox = () => {
   const [connectingExtra, setConnectingExtra] = useState(false);
   const [disconnectingAccount, setDisconnectingAccount] = useState(null);
   const [hasDownloaded, setHasDownloaded] = useState(localStorage.getItem('emailsDownloaded') === 'true');
+  const [replyOpenId, setReplyOpenId] = useState(null);
+  const [replyText, setReplyText] = useState('');
+  const [replying, setReplying] = useState(false);
 
   const navigate = useNavigate();
 
@@ -299,6 +302,21 @@ const EmailInbox = () => {
       console.error('Failed to delete email:', err);
       const message = err.response?.data?.message || 'Failed to delete email. Please try again.';
       triggerAlert('error', message);
+    }
+  };
+
+  const handleSendReply = async (emailId) => {
+    if (!replyText.trim()) return;
+    setReplying(true);
+    try {
+      await api.post(`/gmail/emails/${emailId}/reply`, { replyBody: replyText });
+      triggerAlert('success', 'Reply sent successfully.');
+      setReplyOpenId(null);
+      setReplyText('');
+    } catch (err) {
+      triggerAlert('error', err.response?.data?.message || 'Failed to send reply.');
+    } finally {
+      setReplying(false);
     }
   };
 
@@ -848,6 +866,58 @@ const EmailInbox = () => {
                     ) : (
                       <div className="bg-white border border-slate-200/85 rounded-xl p-4 text-xs text-slate-700 leading-relaxed whitespace-pre-wrap break-words overflow-hidden max-w-full select-text">
                         <span className="italic text-slate-400">This email has no text content.</span>
+                      </div>
+                    )}
+
+                    {/* Reply panel — shown only for Admin/Head */}
+                    {(userRole === 'Admin' || userRole === 'Head') && (
+                      <div style={{ borderTop: '1px solid #e2e8f0', padding: '12px 16px' }}>
+                        {replyOpenId === email._id ? (
+                          <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
+                            <textarea
+                              value={replyText}
+                              onChange={e => setReplyText(e.target.value)}
+                              placeholder={`Reply to ${email.from}...`}
+                              rows={5}
+                              style={{
+                                width: '100%', resize: 'vertical', padding: '10px 12px',
+                                fontSize: '13px', borderRadius: '8px',
+                                border: '1px solid #cbd5e1', outline: 'none',
+                                fontFamily: 'inherit', lineHeight: '1.5', boxSizing: 'border-box'
+                              }}
+                            />
+                            <div style={{ display: 'flex', gap: '8px', justifyContent: 'flex-end' }}>
+                              <button
+                                onClick={() => { setReplyOpenId(null); setReplyText(''); }}
+                                style={{ padding: '7px 16px', fontSize: '13px', borderRadius: '6px', border: '1px solid #cbd5e1', background: 'white', cursor: 'pointer' }}
+                              >
+                                Cancel
+                              </button>
+                              <button
+                                onClick={() => handleSendReply(email._id)}
+                                disabled={replying || !replyText.trim()}
+                                style={{
+                                  padding: '7px 16px', fontSize: '13px', borderRadius: '6px',
+                                  border: 'none', background: replying ? '#94a3b8' : '#4f46e5',
+                                  color: 'white', cursor: replying ? 'not-allowed' : 'pointer'
+                                }}
+                              >
+                                {replying ? 'Sending...' : 'Send Reply'}
+                              </button>
+                            </div>
+                          </div>
+                        ) : (
+                          <button
+                            onClick={() => { setReplyOpenId(email._id); setReplyText(''); }}
+                            style={{
+                              display: 'flex', alignItems: 'center', gap: '6px',
+                              padding: '7px 14px', fontSize: '13px', borderRadius: '6px',
+                              border: '1px solid #cbd5e1', background: 'white', cursor: 'pointer'
+                            }}
+                          >
+                            ↩ Reply
+                          </button>
+                        )}
                       </div>
                     )}
 

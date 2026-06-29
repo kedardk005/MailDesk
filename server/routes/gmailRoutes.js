@@ -9,7 +9,8 @@ const {
   deleteSingleEmail,
   getConnectedStatus,
   disconnectGmail,
-  disconnectLinkedAccount
+  disconnectLinkedAccount,
+  replyToEmail
 } = require('../controllers/gmailController');
 const { protect, authorizeRoles } = require('../middleware/authMiddleware');
 
@@ -24,6 +25,9 @@ router.post('/fetch', protect, authorizeRoles('Admin', 'Head'), fetchEmails);
 
 // GET /api/gmail/emails - Gets all fetched emails matching user authorization scope (protected, Admin/Head only)
 router.get('/emails', protect, authorizeRoles('Admin', 'Head'), getEmails);
+
+// POST /api/gmail/emails/:id/reply - Send a reply to an email
+router.post('/emails/:id/reply', protect, authorizeRoles('Admin', 'Head'), replyToEmail);
 
 // DELETE /api/gmail/emails - Clear all emails (protected, Admin only)
 router.delete('/emails', protect, authorizeRoles('Admin'), deleteAllEmails);

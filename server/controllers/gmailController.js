@@ -707,3 +707,120 @@ const deduplicateConnections = async () => {
 };
 
 
+// @desc    Send a reply to an email via Gmail API
+// @route   POST /api/gmail/emails/:id/reply
+// @access  Private (Admin, Head only)
+exports.replyToEmail = async (req, res) => {
+  try {
+    const { replyBody } = req.body;
+    const emailId = req.params.id;
+
+    if (!replyBody || !replyBody.trim()) {
+      return res.status(400).json({ message: 'Reply body is required.' });
+    }
+
+    // Load the original email from DB
+    const email = await Email.findById(emailId);
+    if (!email) return res.status(404).json({ message: 'Email not found.' });
+
+    // Find the user who owns the account this email arrived on (toEmail)
+    // It could be their primary or a linked account
+    const user = await User.findById(req.user._id);
+    if (!user) return res.status(404).json({ message: 'User not found.' });
+
+    let accessToken = null;
+    let refreshToken = null;
+    const targetInbox = email.toEmail;
+
+    if (user.gmailEmail === targetInbox) {
+      accessToken = user.gmailAccessToken;
+      refreshToken = user.gmailRefreshToken;
+    } else {
+      const linked = (user.linkedGmailAccounts || []).find(a => a.gmailEmail === targetInbox);
+      if (linked) {
+        accessToken = linked.gmailAccessToken;
+        refreshToken = linked.gmailRefreshToken;
+      }
+    }
+
+    // If this user doesn't own the inbox, find the Admin who does
+    if (!accessToken) {
+      const allAdmins = await User.find({ role: 'Admin' });
+      for (const admin of allAdmins) {
+        if (admin.gmailEmail === targetInbox) {
+          accessToken = admin.gmailAccessToken;
+          refreshToken = admin.gmailRefreshToken;
+          break;
+        }
+        const linked = (admin.linkedGmailAccounts || []).find(a => a.gmailEmail === targetInbox);
+        if (linked) {
+          accessToken = linked.gmailAccessToken;
+          refreshToken = linked.gmailRefreshToken;
+          break;
+        }
+      }
+    }
+
+    if (!accessToken) {
+      return res.status(400).json({ message: 'No connected Gmail account found for this inbox. Please reconnect.' });
+    }
+
+    const oauth2Client = getOAuth2Client();
+    oauth2Client.setCredentials({ access_token: accessToken, refresh_token: refreshToken });
+
+    const gmail = google.gmail({ version: 'v1', auth: oauth2Client });
+
+    // Fetch original message from Gmail to get proper headers (Message-ID, References, thread)
+    let originalMessageId = '';
+    let references = '';
+    let threadId = '';
+    try {
+      const original = await gmail.users.messages.get({ userId: 'me', id: email.messageId, format: 'metadata', metadataHeaders: ['Message-ID', 'References', 'In-Reply-To'] });
+      threadId = original.data.threadId || '';
+      const headers = original.data.payload?.headers || [];
+      const msgIdHeader = headers.find(h => h.name.toLowerCase() === 'message-id');
+      const refsHeader = headers.find(h => h.name.toLowerCase() === 'references');
+      originalMessageId = msgIdHeader ? msgIdHeader.value : '';
+      references = refsHeader ? `${refsHeader.value} ${originalMessageId}` : originalMessageId;
+    } catch (e) {
+      console.warn('[REPLY] Could not fetch original headers:', e.message);
+    }
+
+    // Extract plain sender address from "Name <email@domain.com>" format
+    const toAddress = email.from.match(/<(.+?)>/) ? email.from.match(/<(.+?)>/)[1] : email.from;
+    const replySubject = email.subject.startsWith('Re:') ? email.subject : `Re: ${email.subject}`;
+
+    // Build RFC 2822 raw email
+    const rawLines = [
+      `From: ${targetInbox}`,
+      `To: ${toAddress}`,
+      `Subject: ${replySubject}`,
+      `In-Reply-To: ${originalMessageId}`,
+      `References: ${references}`,
+      'Content-Type: text/plain; charset="UTF-8"',
+      'MIME-Version: 1.0',
+      '',
+      replyBody.trim()
+    ];
+
+    const rawEmail = rawLines.join('\r\n');
+    const encodedEmail = Buffer.from(rawEmail).toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+
+    await gmail.users.messages.send({
+      userId: 'me',
+      requestBody: {
+        raw: encodedEmail,
+        ...(threadId ? { threadId } : {})
+      }
+    });
+
+    await logActivity(req.user._id, 'Email Reply', `Replied to email "${email.subject}" from ${email.from}`);
+
+    return res.status(200).json({ message: 'Reply sent successfully.' });
+  } catch (error) {
+    console.error('Error in replyToEmail:', error);
+    return res.status(500).json({ message: 'Server error. Failed to send reply.' });
+  }
+};
+
+
