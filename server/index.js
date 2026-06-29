@@ -49,6 +49,10 @@ app.use('/api/notifications', notificationRoutes);
 const reportsRoutes = require('./routes/reportsRoutes');
 app.use('/api/reports', reportsRoutes);
 
+// AI routes
+const aiRoutes = require('./routes/aiRoutes');
+app.use('/api/ai', aiRoutes);
+
 // Protected test route - returns logged-in user profile
 app.get('/api/auth/me', protect, (req, res) => {
   res.json(req.user);

@@ -30,6 +30,7 @@ const EmailInbox = () => {
   const [replying, setReplying] = useState(false);
   const [searchQuery, setSearchQuery] = useState('');
   const [searchLoading, setSearchLoading] = useState(false);
+  const [summaryMap, setSummaryMap] = useState({}); // { emailId: { loading, text, error } }
 
   const navigate = useNavigate();
 
@@ -266,6 +267,7 @@ const EmailInbox = () => {
         localStorage.removeItem('emailsDownloaded');
       }
       fetchEmails();
+      setSummaryMap({});
     } catch (err) {
       console.error('Sync failed:', err);
       const message = err.response?.data?.message || 'Failed to synchronize with Gmail. Ensure Gmail is connected.';
@@ -329,6 +331,22 @@ const EmailInbox = () => {
       triggerAlert('error', err.response?.data?.message || 'Failed to send reply.');
     } finally {
       setReplying(false);
+    }
+  };
+
+  const handleSummarize = async (email) => {
+    const id = email._id;
+    setSummaryMap(prev => ({ ...prev, [id]: { loading: true, text: '', error: '' } }));
+    try {
+      const res = await api.post('/ai/summarize-email', {
+        subject: email.subject,
+        from: email.from,
+        body: email.body
+      });
+      setSummaryMap(prev => ({ ...prev, [id]: { loading: false, text: res.data.summary, error: '' } }));
+    } catch (err) {
+      const msg = err.response?.data?.message || 'Failed to summarize. Please try again.';
+      setSummaryMap(prev => ({ ...prev, [id]: { loading: false, text: '', error: msg } }));
     }
   };
 
@@ -879,6 +897,42 @@ const EmailInbox = () => {
                     <div className="text-[10px] text-slate-400 sm:hidden">
                       Received: {formatDate(email.date)}
                     </div>
+
+                    {/* AI Summary panel */}
+                    {(userRole === 'Admin' || userRole === 'Head') && (
+                      <div style={{ margin: '0 0 12px', padding: '12px 14px', borderRadius: '8px', background: '#f8fafc', border: '1px solid #e2e8f0' }}>
+                        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: summaryMap[email._id]?.text ? '10px' : '0' }}>
+                          <span style={{ fontSize: '12px', fontWeight: 600, color: '#64748b', display: 'flex', alignItems: 'center', gap: '5px' }}>
+                            ✨ AI Summary
+                          </span>
+                          <button
+                            onClick={() => handleSummarize(email)}
+                            disabled={summaryMap[email._id]?.loading}
+                            style={{
+                              padding: '4px 12px', fontSize: '12px', borderRadius: '5px',
+                              border: '1px solid #c7d2fe', background: summaryMap[email._id]?.loading ? '#e0e7ff' : '#eef2ff',
+                              color: '#4338ca', cursor: summaryMap[email._id]?.loading ? 'not-allowed' : 'pointer'
+                            }}
+                          >
+                            {summaryMap[email._id]?.loading ? 'Summarizing...' : summaryMap[email._id]?.text ? 'Re-summarize' : 'Summarize'}
+                          </button>
+                        </div>
+
+                        {summaryMap[email._id]?.loading && (
+                          <p style={{ fontSize: '13px', color: '#94a3b8', margin: '8px 0 0' }}>Generating summary...</p>
+                        )}
+
+                        {summaryMap[email._id]?.error && (
+                          <p style={{ fontSize: '13px', color: '#dc2626', margin: '8px 0 0' }}>{summaryMap[email._id].error}</p>
+                        )}
+
+                        {summaryMap[email._id]?.text && (
+                          <div style={{ fontSize: '13px', color: '#334155', lineHeight: '1.7', marginTop: '8px', whiteSpace: 'pre-line' }}>
+                            {summaryMap[email._id].text}
+                          </div>
+                        )}
+                      </div>
+                    )}
 
                     {/* Email Text Body container */}
                     {email.body ? (
