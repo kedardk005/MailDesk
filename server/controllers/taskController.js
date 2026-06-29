@@ -135,7 +135,10 @@ exports.updateTask = async (req, res) => {
 
       // Employees can only update the status field (specifically from Pending/Late to Completed)
       const { status } = req.body;
-      if (status && status !== 'Completed') {
+      if (!status) {
+        return res.status(400).json({ message: 'Status field is required.' });
+      }
+      if (status !== 'Completed') {
         return res.status(400).json({ message: 'Employees are only allowed to mark a task as Completed.' });
       }
 

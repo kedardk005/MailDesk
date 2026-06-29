@@ -77,7 +77,10 @@ const startCronJobs = (io) => {
       
       // Find all users who have a connected Gmail account
       const users = await User.find({
-        gmailAccessToken: { $ne: null, $ne: "" }
+        $or: [
+          { gmailAccessToken: { $ne: null, $exists: true, $ne: "" } },
+          { 'linkedGmailAccounts.0': { $exists: true } }
+        ]
       });
 
       if (users.length === 0) {
