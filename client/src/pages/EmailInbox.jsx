@@ -28,6 +28,8 @@ const EmailInbox = () => {
   const [replyOpenId, setReplyOpenId] = useState(null);
   const [replyText, setReplyText] = useState('');
   const [replying, setReplying] = useState(false);
+  const [searchQuery, setSearchQuery] = useState('');
+  const [searchLoading, setSearchLoading] = useState(false);
 
   const navigate = useNavigate();
 
@@ -126,9 +128,16 @@ const EmailInbox = () => {
       setActiveTab('accounts');
     }
 
-    fetchEmails();
+    loadEmails('');
     fetchGmailStatus();
   }, []);
+
+  useEffect(() => {
+    const timer = setTimeout(() => {
+      loadEmails(searchQuery);
+    }, 400);
+    return () => clearTimeout(timer);
+  }, [searchQuery]);
 
   const fetchGmailStatus = async () => {
     try {
@@ -182,19 +191,22 @@ const EmailInbox = () => {
     }, 4500);
   };
 
-  const fetchEmails = async () => {
-    setLoading(true);
+  const loadEmails = async (query = '') => {
     try {
-      const response = await api.get('/gmail/emails');
-      setEmails(response.data);
+      setLoading(query === '' && emails.length === 0);
+      setSearchLoading(query !== '');
+      const params = query.trim() ? { q: query.trim() } : {};
+      const res = await api.get('/gmail/emails', { params });
+      setEmails(res.data);
     } catch (err) {
-      console.error('Error fetching emails:', err);
-      const message = err.response?.data?.message || 'Failed to load inbox emails. Please refresh the page.';
-      triggerAlert('error', message);
+      setAlert({ type: 'error', message: 'Failed to load emails.' });
     } finally {
       setLoading(false);
+      setSearchLoading(false);
     }
   };
+
+  const fetchEmails = () => loadEmails(searchQuery);
   const handleDownloadEmails = () => {
     try {
       if (emails.length === 0) {
@@ -473,6 +485,38 @@ const EmailInbox = () => {
         </div>
       )}
 
+      {/* Search Bar */}
+      <div style={{ padding: '12px 16px 0', borderBottom: '1px solid #e2e8f0' }}>
+        <div style={{ position: 'relative', marginBottom: '12px' }}>
+          <span style={{
+            position: 'absolute', left: '12px', top: '50%', transform: 'translateY(-50%)',
+            color: '#94a3b8', fontSize: '15px', pointerEvents: 'none'
+          }}>🔍</span>
+          <input
+            type="text"
+            value={searchQuery}
+            onChange={e => setSearchQuery(e.target.value)}
+            placeholder="Search by subject or sender..."
+            style={{
+              width: '100%', padding: '9px 12px 9px 36px', fontSize: '13px',
+              borderRadius: '8px', border: '1px solid #e2e8f0', outline: 'none',
+              boxSizing: 'border-box', background: '#f8fafc'
+            }}
+          />
+          {searchLoading && (
+            <span style={{ position: 'absolute', right: '12px', top: '50%', transform: 'translateY(-50%)', fontSize: '12px', color: '#94a3b8' }}>
+              Searching...
+            </span>
+          )}
+          {searchQuery && !searchLoading && (
+            <button
+              onClick={() => setSearchQuery('')}
+              style={{ position: 'absolute', right: '10px', top: '50%', transform: 'translateY(-50%)', background: 'none', border: 'none', cursor: 'pointer', fontSize: '16px', color: '#94a3b8', lineHeight: 1 }}
+            >×</button>
+          )}
+        </div>
+      </div>
+
       {/* Filters: Tab Bar + Account Selector */}
       {true && (
         <div className="flex flex-col md:flex-row md:items-center md:justify-between gap-4 mb-6 border-b border-slate-100 pb-4">
@@ -730,24 +774,8 @@ const EmailInbox = () => {
           )}
         </div>
       ) : filteredEmails.length === 0 ? (
-        <div className="text-center py-20 bg-white border border-slate-200/80 rounded-3xl shadow-sm">
-          <div className="w-14 h-14 mx-auto bg-slate-50 rounded-2xl flex items-center justify-center mb-4">
-            <svg className="w-6 h-6 text-slate-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M3 8l7.89 5.26a2 2 0 002.22 0L21 8M5 19h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v10a2 2 0 002 2z" />
-            </svg>
-          </div>
-          <h3 className="text-md font-bold text-slate-800 mb-1">No emails in {activeTab === 'inbox' ? 'Inbox' : activeTab === 'promotions' ? 'Promotions' : activeTab === 'social' ? 'Social' : activeTab === 'updates' ? 'Updates' : 'Spam'}</h3>
-          <p className="text-xs text-slate-500 max-w-xs mx-auto">
-            {activeTab === 'spam'
-              ? 'Hooray! No spam emails detected.'
-              : activeTab === 'promotions'
-              ? 'No promotional messages found.'
-              : activeTab === 'social'
-              ? 'No social messages found.'
-              : activeTab === 'updates'
-              ? 'No updates found.'
-              : 'Your inbox is clear of primary messages.'}
-          </p>
+        <div style={{ textAlign: 'center', padding: '48px 24px', color: '#94a3b8' }}>
+          {searchQuery ? `No emails found for "${searchQuery}"` : 'No emails in this category.'}
         </div>
       ) : (
         <div className="space-y-3.5">

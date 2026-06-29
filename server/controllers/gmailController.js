@@ -403,18 +403,28 @@ exports.fetchEmails = async (req, res) => {
   }
 };
 
-// @desc    Get emails from database
-// @route   GET /api/gmail/emails
-// @access  Private
 exports.getEmails = async (req, res) => {
   try {
+    const { q } = req.query;
     let query = {};
 
-    // Role checks
-    // Employee: see only emails assigned to them
-    // Admin/Head: see all emails
     if (req.user.role === 'Employee') {
-      query = { assignedTo: req.user._id };
+      query.assignedTo = req.user._id;
+    }
+
+    // If search query provided, add text search across subject and from fields
+    if (q && q.trim()) {
+      const searchRegex = new RegExp(q.trim(), 'i');
+      const searchConditions = [
+        { subject: searchRegex },
+        { from: searchRegex }
+      ];
+      // Merge with existing role filter
+      if (query.assignedTo) {
+        query = { assignedTo: query.assignedTo, $or: searchConditions };
+      } else {
+        query.$or = searchConditions;
+      }
     }
 
     const emails = await Email.find(query)
