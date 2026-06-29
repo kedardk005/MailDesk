@@ -1,4 +1,5 @@
 # MailDesk 📧
+
 ### *Where Emails Meet Action.*
 
 A full-stack web application for centralized company email and task management — built for teams that need structure, accountability, and real-time collaboration.
@@ -30,12 +31,12 @@ Built with a role-based system (Admin, Head, Employee) so every team member sees
 
 | Layer | Technology |
 |---|---|
-| Frontend | React + Vite + Tailwind CSS + React Router |
-| Backend | Node.js + Express.js |
+| Frontend | React 19 + Vite + Tailwind CSS + React Router v7 |
+| Backend | Node.js + Express.js v5 |
 | Database | MongoDB Atlas + Mongoose |
 | Authentication | JWT (JSON Web Tokens) |
 | Gmail Integration | Gmail API + Google OAuth 2.0 |
-| Real-time | Socket.io |
+| Real-time | Socket.io v4 |
 | Email Notifications | Nodemailer |
 | Cron Jobs | node-cron |
 
@@ -45,8 +46,8 @@ Built with a role-based system (Admin, Head, Employee) so every team member sees
 
 | Role | Permissions |
 |---|---|
-| **Admin** | Full control — manage users, view all emails & tasks, generate reports, connect/disconnect Gmail |
-| **Head** | View all emails, create and assign tasks to employees, receive completion/delay notifications |
+| **Admin** | Full control — manage users, view all emails & tasks, generate all reports, connect/disconnect Gmail |
+| **Head** | View all emails, create and assign tasks to employees, view overall & timeline reports, receive completion/delay notifications |
 | **Employee** | View assigned emails & tasks only, mark tasks as complete |
 
 ---
@@ -54,29 +55,40 @@ Built with a role-based system (Admin, Head, Employee) so every team member sees
 ## 📁 Project Structure
 
 ```
-maildesk/
-├── client/                          # React Vite Frontend
+MailDesk/
+├── client/                          # React + Vite Frontend
 │   ├── src/
 │   │   ├── api/
-│   │   │   └── axios.js             # Axios instance with JWT interceptor
+│   │   │   └── axios.js             # Axios instance with JWT + 401 interceptor
 │   │   ├── components/
+│   │   │   ├── AdminRoute.jsx       # Admin-only route guard
+│   │   │   ├── AdminOrHeadRoute.jsx # Admin + Head route guard
+│   │   │   ├── ProtectedRoute.jsx   # Auth route guard
+│   │   │   ├── ProtectedLayout.jsx  # Shared layout for protected pages
 │   │   │   ├── Navbar.jsx
 │   │   │   ├── Sidebar.jsx
-│   │   │   └── NotificationBell.jsx
+│   │   │   └── NotificationBell.jsx # Real-time Socket.io notifications
 │   │   ├── pages/
 │   │   │   ├── Landing.jsx          # Public landing page
 │   │   │   ├── Login.jsx
 │   │   │   ├── Register.jsx
+│   │   │   ├── ForgotPassword.jsx
 │   │   │   ├── Dashboard.jsx        # Role-based dashboard
 │   │   │   ├── EmailInbox.jsx       # Centralized inbox
 │   │   │   ├── TaskList.jsx         # Task management
+│   │   │   ├── Profile.jsx          # User profile & password change
 │   │   │   └── admin/
 │   │   │       ├── ManageUsers.jsx  # User management (Admin only)
-│   │   │       └── Reports.jsx      # Analytics (Admin only)
+│   │   │       ├── ActivityLog.jsx  # Activity logs (Admin only)
+│   │   │       └── Reports.jsx      # Analytics (Admin + Head)
 │   │   └── utils/
+│   │       ├── countUp.jsx
 │   │       ├── cursorEffects.js
-│   │       ├── tiltEffect.js
-│   │       └── scrollAnimations.js
+│   │       ├── moduleCursor.js
+│   │       ├── scrollAnimations.js
+│   │       └── tiltEffect.js
+│   ├── .env                         # VITE_API_URL for dev
+│   ├── .env.production              # VITE_API_URL for production
 │   └── package.json
 │
 ├── server/                          # Node.js + Express Backend
@@ -96,6 +108,7 @@ maildesk/
 │   │   ├── Email.js
 │   │   ├── Task.js
 │   │   ├── Notification.js
+│   │   ├── ActivityLog.js
 │   │   └── Client.js
 │   ├── routes/
 │   │   ├── authRoutes.js
@@ -105,14 +118,14 @@ maildesk/
 │   │   ├── notificationRoutes.js
 │   │   └── reportsRoutes.js
 │   ├── utils/
+│   │   ├── activityLogger.js
 │   │   ├── notificationHelper.js
 │   │   ├── emailHelper.js           # Nodemailer setup
-│   │   └── cronJobs.js              # Deadline checker
+│   │   └── cronJobs.js              # Deadline checker + auto email sync
 │   ├── seeders/
 │   │   └── clientSeeder.js
 │   └── index.js                     # Express server entry point
 │
-├── .env
 ├── .gitignore
 └── README.md
 ```
@@ -122,6 +135,7 @@ maildesk/
 ## ⚙️ Getting Started
 
 ### Prerequisites
+
 - Node.js v18+
 - MongoDB Atlas account (free tier works)
 - Google Cloud Console project with Gmail API enabled
@@ -130,26 +144,35 @@ maildesk/
 ### 1. Clone the Repository
 
 ```bash
-git clone https://github.com/yourusername/maildesk.git
-cd maildesk
+git clone https://github.com/kedardk005/MailDesk.git
+cd MailDesk
 ```
 
-### 2. Setup Environment Variables
+### 2. Setup Server Environment Variables
 
-Create a `.env` file in the `/server` directory:
+Create a `.env` file inside the `/server` directory:
 
 ```env
-PORT=5001
+PORT=5015
 MONGO_URI=your_mongodb_connection_string
 JWT_SECRET=your_jwt_secret_key
 GOOGLE_CLIENT_ID=your_google_client_id
 GOOGLE_CLIENT_SECRET=your_google_client_secret
-GOOGLE_REDIRECT_URI=http://localhost:5001/api/gmail/oauth/callback
+GOOGLE_REDIRECT_URI=http://localhost:5015/api/gmail/oauth/callback
 SENDER_EMAIL=your_sender_gmail@gmail.com
 SENDER_APP_PASSWORD=your_gmail_app_password
+ALLOWED_ORIGINS=http://localhost:5174
 ```
 
-### 3. Install Dependencies
+### 3. Setup Client Environment Variables
+
+Create a `.env` file inside the `/client` directory:
+
+```env
+VITE_API_URL=http://localhost:5015
+```
+
+### 4. Install Dependencies
 
 ```bash
 # Backend
@@ -161,7 +184,7 @@ cd ../client
 npm install
 ```
 
-### 4. Run the App
+### 5. Run the App
 
 ```bash
 # Start backend (from /server)
@@ -171,8 +194,8 @@ npm run dev
 npm run dev
 ```
 
-- Backend runs on: `http://localhost:5001`
-- Frontend runs on: `http://localhost:5173`
+- Backend runs on: `http://localhost:5015`
+- Frontend runs on: `http://localhost:5174`
 
 ---
 
@@ -183,29 +206,36 @@ npm run dev
 3. Enable **Gmail API** under APIs & Services
 4. Configure **OAuth Consent Screen** (External)
 5. Create **OAuth 2.0 Credentials** (Web Application)
-   - Authorized redirect URI: `http://localhost:5001/api/gmail/oauth/callback`
-6. Copy **Client ID** and **Client Secret** to `.env`
+   - Authorized redirect URI: `http://localhost:5015/api/gmail/oauth/callback`
+6. Copy **Client ID** and **Client Secret** to `server/.env`
 
 ---
 
 ## 📮 API Endpoints
 
 ### Auth
+
 | Method | Endpoint | Access |
 |---|---|---|
-| POST | `/api/auth/register` | Public |
+| POST | `/api/auth/register` | Public (Employee only) |
 | POST | `/api/auth/login` | Public |
+| POST | `/api/auth/forgot-password` | Public |
 | GET | `/api/auth/me` | Protected |
 
 ### Users
+
 | Method | Endpoint | Access |
 |---|---|---|
-| GET | `/api/users` | Admin |
+| GET | `/api/users` | Admin, Head |
 | POST | `/api/users` | Admin |
 | PUT | `/api/users/:id` | Admin |
 | DELETE | `/api/users/:id` | Admin |
+| PUT | `/api/users/profile` | All roles |
+| PUT | `/api/users/change-password` | All roles |
+| GET | `/api/users/activity-logs` | Admin |
 
 ### Gmail
+
 | Method | Endpoint | Access |
 |---|---|---|
 | GET | `/api/gmail/auth-url` | Protected |
@@ -218,22 +248,26 @@ npm run dev
 | DELETE | `/api/gmail/emails/:id` | Admin, Head |
 
 ### Tasks
+
 | Method | Endpoint | Access |
 |---|---|---|
-| GET | `/api/tasks` | Protected |
+| GET | `/api/tasks` | All roles |
 | POST | `/api/tasks` | Admin, Head |
-| PUT | `/api/tasks/:id` | Protected |
+| GET | `/api/tasks/:id` | All roles |
+| PUT | `/api/tasks/:id` | All roles |
 | DELETE | `/api/tasks/:id` | Admin, Head |
-| GET | `/api/tasks/clients` | Protected |
+| GET | `/api/tasks/clients` | All roles |
 
 ### Notifications
+
 | Method | Endpoint | Access |
 |---|---|---|
-| GET | `/api/notifications` | Protected |
-| PUT | `/api/notifications/read-all` | Protected |
-| PUT | `/api/notifications/:id/read` | Protected |
+| GET | `/api/notifications` | All roles |
+| PUT | `/api/notifications/read-all` | All roles |
+| PUT | `/api/notifications/:id/read` | All roles |
 
 ### Reports
+
 | Method | Endpoint | Access |
 |---|---|---|
 | GET | `/api/reports/overall` | Admin, Head |
@@ -248,30 +282,26 @@ npm run dev
 |---|---|---|
 | Task assigned to employee | Employee | In-app (Socket.io) |
 | Employee marks task complete | Head + Admin | In-app + Email |
-| Task goes past deadline | Employee + Head + Admin | In-app + Email |
+| Task goes past deadline | Employee + Head + Admin | In-app |
 
 ---
 
 ## 📊 Reports
 
-- **Overall Stats** — Total users, emails, tasks, pending, completed, late counts
-- **Employee Performance** — Per-employee breakdown with completion rate and progress bar
-- **Task Timeline** — Line chart of tasks created over last 30 days
+- **Overall Stats** — Total users, emails, tasks, pending, completed, and late counts
+- **Employee Performance** — Per-employee breakdown with completion rate (Admin only)
+- **Task Timeline** — Line chart of tasks created over the last 30 days
 - **CSV Export** — Download any report as a CSV file
 
 ---
 
 ## 🌐 Environment Notes
 
-> ⚠️ If `mongodb+srv://` connection string doesn't work (common with some ISPs in India), use the direct connection string from Atlas → Connect → Shell. It starts with `mongodb://` and includes shard addresses.
+> ⚠️ If the `mongodb+srv://` connection string doesn't work (common with some ISPs in India), use the direct connection string from Atlas → Connect → Shell. It starts with `mongodb://` and includes shard addresses.
 
-> ⚠️ For Nodemailer, use a Gmail **App Password** (not your regular Gmail password). Go to Google Account → Security → 2-Step Verification → App Passwords to generate one.
+> ⚠️ For Nodemailer, use a Gmail **App Password** — not your regular Gmail password. Go to Google Account → Security → 2-Step Verification → App Passwords to generate one.
 
----
-
-## 🤝 Contributing
-
-Pull requests are welcome. For major changes, please open an issue first to discuss what you'd like to change.
+> ⚠️ Gmail OAuth connections are Admin-only. Only Admin accounts can link Gmail inboxes to MailDesk.
 
 ---
 
@@ -285,7 +315,7 @@ Pull requests are welcome. For major changes, please open an issue first to disc
 
 **Kedar Kothari**  
 B.Tech Computer Engineering — CHARUSAT University  
-[GitHub](https://github.com/yourusername) · [LinkedIn](https://linkedin.com/in/yourprofile)
+[GitHub](https://github.com/kedardk005) · [LinkedIn](https://linkedin.com/in/kedar-kothari-253b6a259)
 
 ---
 
