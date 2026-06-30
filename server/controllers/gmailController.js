@@ -833,4 +833,80 @@ exports.replyToEmail = async (req, res) => {
   }
 };
 
+// @desc    Bulk assign multiple emails to an employee (converts them to Tasks)
+// @route   POST /api/gmail/emails/bulk-assign
+// @access  Private (Admin, Head only)
+exports.bulkAssignEmails = async (req, res) => {
+  try {
+    const { emailIds, assignedTo, deadline, priority } = req.body;
+
+    if (!emailIds || !Array.isArray(emailIds) || emailIds.length === 0) {
+      return res.status(400).json({ message: 'emailIds array is required.' });
+    }
+    if (!assignedTo) {
+      return res.status(400).json({ message: 'assignedTo user ID is required.' });
+    }
+
+    const assignee = await User.findById(assignedTo);
+    if (!assignee) {
+      return res.status(404).json({ message: 'Assignee not found.' });
+    }
+
+    const taskDeadline = deadline ? new Date(deadline) : new Date(Date.now() + 3 * 24 * 60 * 60 * 1000);
+    const taskPriority = priority || 'Medium';
+
+    const emails = await Email.find({ _id: { $in: emailIds } });
+    if (emails.length === 0) {
+      return res.status(404).json({ message: 'No matching emails found.' });
+    }
+
+    const { createNotification } = require('../utils/notificationHelper');
+    const io = req.app.get('io');
+    const createdTasks = [];
+
+    for (const email of emails) {
+      const task = new Task({
+        title: email.subject || 'Assigned Email',
+        description: email.body || '',
+        linkedEmail: email._id,
+        assignedTo: assignee._id,
+        clientName: email.from || 'Inbox Client',
+        deadline: taskDeadline,
+        priority: taskPriority,
+        createdBy: req.user._id,
+        status: 'Pending'
+      });
+
+      const savedTask = await task.save();
+      createdTasks.push(savedTask);
+
+      email.assignedTo = assignee._id;
+      email.status = 'assigned';
+      await email.save();
+    }
+
+    await createNotification(
+      assignee._id,
+      `You have been assigned ${emails.length} new tasks from the Inbox.`,
+      io,
+      null,
+      'task_assigned'
+    );
+
+    await logActivity(
+      req.user._id,
+      'Bulk Email Assignment',
+      `Assigned ${emails.length} emails to ${assignee.name}`
+    );
+
+    return res.status(200).json({
+      message: `Successfully assigned ${emails.length} emails to ${assignee.name}.`,
+      tasks: createdTasks
+    });
+  } catch (error) {
+    console.error('Error in bulkAssignEmails:', error);
+    return res.status(500).json({ message: 'Server error. Failed to bulk assign emails.' });
+  }
+};
+
 

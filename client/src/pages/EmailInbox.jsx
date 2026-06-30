@@ -32,6 +32,15 @@ const EmailInbox = () => {
   const [searchLoading, setSearchLoading] = useState(false);
   const [summaryMap, setSummaryMap] = useState({}); // { emailId: { loading, text, error } }
 
+  // Bulk selection states for Inbox
+  const [selectedEmailIds, setSelectedEmailIds] = useState(new Set());
+  const [selectAll, setSelectAll] = useState(false);
+  const [bulkAssignee, setBulkAssignee] = useState('');
+  const [bulkDeadline, setBulkDeadline] = useState('');
+  const [bulkPriority, setBulkPriority] = useState('Medium');
+  const [bulkLoading, setBulkLoading] = useState(false);
+  const [users, setUsers] = useState([]);
+
   const navigate = useNavigate();
 
   // Get unique source accounts that have fetched emails in the list
@@ -116,6 +125,9 @@ const EmailInbox = () => {
         const parsedUser = JSON.parse(userString);
         setCurrentUser(parsedUser);
         setUserRole(parsedUser.role);
+        if (parsedUser.role === 'Admin' || parsedUser.role === 'Head') {
+          fetchUsers();
+        }
       } catch (err) {
         console.error('Error parsing current user:', err);
       }
@@ -150,6 +162,74 @@ const EmailInbox = () => {
       });
     } catch (err) {
       console.error('Error checking Gmail status in Inbox:', err);
+    }
+  };
+
+  const fetchUsers = async () => {
+    try {
+      const res = await api.get('/users');
+      // Show all active assignable users
+      setUsers(res.data || []);
+    } catch (err) {
+      console.error('Failed to fetch users for bulk assign:', err);
+    }
+  };
+
+  const toggleEmailSelection = (emailId) => {
+    setSelectedEmailIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(emailId)) {
+        next.delete(emailId);
+      } else {
+        next.add(emailId);
+      }
+      return next;
+    });
+  };
+
+  const toggleSelectAll = () => {
+    if (selectAll) {
+      setSelectedEmailIds(new Set());
+    } else {
+      const ids = filteredEmails.map((e) => e._id);
+      setSelectedEmailIds(new Set(ids));
+    }
+    setSelectAll(!selectAll);
+  };
+
+  const clearSelection = () => {
+    setSelectedEmailIds(new Set());
+    setSelectAll(false);
+    setBulkAssignee('');
+    setBulkDeadline('');
+    setBulkPriority('Medium');
+  };
+
+  const handleBulkAssign = async () => {
+    if (selectedEmailIds.size === 0) return;
+    if (!bulkAssignee) {
+      triggerAlert('error', 'Please select an assignee.');
+      return;
+    }
+
+    setBulkLoading(true);
+    try {
+      const emailIdsArray = Array.from(selectedEmailIds);
+      const res = await api.post('/gmail/emails/bulk-assign', {
+        emailIds: emailIdsArray,
+        assignedTo: bulkAssignee,
+        deadline: bulkDeadline || undefined,
+        priority: bulkPriority
+      });
+
+      triggerAlert('success', res.data.message || `Successfully assigned ${selectedEmailIds.size} emails.`);
+      clearSelection();
+      fetchEmails();
+    } catch (err) {
+      console.error('Bulk assign failed:', err);
+      triggerAlert('error', err.response?.data?.message || 'Failed to bulk assign emails.');
+    } finally {
+      setBulkLoading(false);
     }
   };
 
@@ -796,28 +876,113 @@ const EmailInbox = () => {
           {searchQuery ? `No emails found for "${searchQuery}"` : 'No emails in this category.'}
         </div>
       ) : (
-        <div className="space-y-3.5">
-          {filteredEmails.map((email) => {
-            const isExpanded = expandedEmailId === email._id;
-            const senderInitial = email.from ? email.from.charAt(0).toUpperCase() : '✉️';
-            
-            return (
-              <div
-                key={email._id}
-                className={`bg-white border border-slate-200 rounded-2xl overflow-hidden shadow-sm hover-glow-card transition-all duration-300 ${
-                  email.status === 'unassigned' ? 'border-l-4 border-l-indigo-650' : 'border-l-4 border-l-transparent'
-                }`}
-              >
-                {/* Header Summary click section */}
-                <div
-                  onClick={() => toggleExpand(email._id)}
-                  className="p-5 flex items-center justify-between gap-4 cursor-pointer select-none"
+        <>
+          {/* Bulk Email Assignment Panel */}
+          {(userRole === 'Admin' || userRole === 'Head') && selectedEmailIds.size > 0 && (
+            <div className="bg-indigo-50 border border-indigo-150 rounded-2xl p-4 mb-4 flex flex-col md:flex-row md:items-center justify-between gap-4 animate-fade-in shadow-sm">
+              <div className="flex items-center space-x-3">
+                <span className="h-2.5 w-2.5 rounded-full bg-indigo-650 animate-pulse" />
+                <span className="text-xs font-bold text-slate-700">
+                  {selectedEmailIds.size} emails selected for task assignment
+                </span>
+              </div>
+              <div className="flex flex-wrap items-center gap-3">
+                <select
+                  value={bulkAssignee}
+                  onChange={(e) => setBulkAssignee(e.target.value)}
+                  className="bg-white border border-slate-200 rounded-xl px-3 py-2 text-xs font-semibold text-slate-700 focus:outline-none focus:ring-2 focus:ring-indigo-550/20 focus:border-indigo-550 shadow-sm min-w-[160px]"
                 >
-                  <div className="flex items-center space-x-3.5 min-w-0">
-                    {/* Avatar circle */}
-                    <div className="h-9 w-9 rounded-full bg-indigo-50 border border-indigo-100 flex items-center justify-center text-indigo-600 font-extrabold text-sm shrink-0">
-                      {senderInitial}
-                    </div>
+                  <option value="">-- Select Assignee --</option>
+                  {users.map((u) => (
+                    <option key={u._id} value={u._id}>
+                      {u.name} ({u.role})
+                    </option>
+                  ))}
+                </select>
+
+                <div className="flex items-center space-x-2">
+                  <span className="text-[10px] font-bold text-slate-500 uppercase">Deadline:</span>
+                  <input
+                    type="datetime-local"
+                    value={bulkDeadline}
+                    onChange={(e) => setBulkDeadline(e.target.value)}
+                    className="bg-white border border-slate-200 rounded-xl px-3 py-2 text-xs font-semibold text-slate-700 focus:outline-none focus:ring-2 focus:ring-indigo-550/20 focus:border-indigo-550 shadow-sm"
+                  />
+                </div>
+
+                <select
+                  value={bulkPriority}
+                  onChange={(e) => setBulkPriority(e.target.value)}
+                  className="bg-white border border-slate-200 rounded-xl px-3 py-2 text-xs font-semibold text-slate-700 focus:outline-none focus:ring-2 focus:ring-indigo-550/20 focus:border-indigo-550 shadow-sm"
+                >
+                  <option value="Low">Low</option>
+                  <option value="Medium">Medium</option>
+                  <option value="High">High</option>
+                  <option value="Urgent">Urgent</option>
+                </select>
+
+                <button
+                  onClick={handleBulkAssign}
+                  disabled={bulkLoading || !bulkAssignee}
+                  className="px-4 py-2 bg-gradient-to-r from-indigo-600 to-purple-600 text-xs font-bold text-white rounded-xl shadow-md shadow-indigo-650/15 hover:shadow-indigo-650/25 active:scale-95 disabled:opacity-50 transition-all"
+                >
+                  {bulkLoading ? 'Assigning...' : 'Assign Tasks'}
+                </button>
+
+                <button
+                  onClick={clearSelection}
+                  className="px-4 py-2 border border-slate-200 bg-white hover:bg-slate-50 text-xs font-bold text-slate-500 rounded-xl transition-all active:scale-95"
+                >
+                  Cancel
+                </button>
+              </div>
+            </div>
+          )}
+
+          {(userRole === 'Admin' || userRole === 'Head') && (
+            <div className="flex items-center space-x-2 px-2 py-1 mb-2">
+              <input
+                type="checkbox"
+                checked={selectAll}
+                onChange={toggleSelectAll}
+                title="Select all emails"
+                style={{ cursor: 'pointer', width: '15px', height: '15px' }}
+              />
+              <span className="text-xs font-bold text-slate-500">Select All</span>
+            </div>
+          )}
+
+          <div className="space-y-3.5">
+            {filteredEmails.map((email) => {
+              const isExpanded = expandedEmailId === email._id;
+              const senderInitial = email.from ? email.from.charAt(0).toUpperCase() : '✉️';
+              
+              return (
+                <div
+                  key={email._id}
+                  className={`bg-white border border-slate-200 rounded-2xl overflow-hidden shadow-sm hover-glow-card transition-all duration-300 ${
+                    email.status === 'unassigned' ? 'border-l-4 border-l-indigo-650' : 'border-l-4 border-l-transparent'
+                  }`}
+                >
+                  {/* Header Summary click section */}
+                  <div
+                    onClick={() => toggleExpand(email._id)}
+                    className="p-5 flex items-center justify-between gap-4 cursor-pointer select-none"
+                  >
+                    <div className="flex items-center space-x-3.5 min-w-0">
+                      {(userRole === 'Admin' || userRole === 'Head') && (
+                        <input
+                          type="checkbox"
+                          checked={selectedEmailIds.has(email._id)}
+                          onChange={() => toggleEmailSelection(email._id)}
+                          onClick={(e) => e.stopPropagation()}
+                          style={{ cursor: 'pointer', width: '15px', height: '15px', marginRight: '4px', flexShrink: 0 }}
+                        />
+                      )}
+                      {/* Avatar circle */}
+                      <div className="h-9 w-9 rounded-full bg-indigo-50 border border-indigo-100 flex items-center justify-center text-indigo-600 font-extrabold text-sm shrink-0">
+                        {senderInitial}
+                      </div>
                     {/* Info */}
                     <div className="min-w-0">
                       <div className="flex items-center gap-1.5 flex-wrap">
@@ -1037,6 +1202,7 @@ const EmailInbox = () => {
             );
           })}
         </div>
+        </>
       )
       )}
     </main>

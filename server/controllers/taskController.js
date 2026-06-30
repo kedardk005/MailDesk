@@ -11,7 +11,7 @@ const { sendEmail } = require('../utils/emailHelper');
 // @access  Private (Admin, Head only)
 exports.createTask = async (req, res) => {
   try {
-    const { title, description, linkedEmail, assignedTo, clientName, deadline, notes, priority } = req.body;
+    const { title, description, linkedEmail, assignedTo, clientName, deadline, notes, priority, isRecurring, recurrence } = req.body;
 
     // Validate required fields
     if (!title || !assignedTo || !clientName || !deadline) {
@@ -29,7 +29,9 @@ exports.createTask = async (req, res) => {
       notes: notes ? notes.trim() : '',
       priority: priority || 'Medium',
       createdBy: req.user._id,
-      status: 'Pending'
+      status: 'Pending',
+      isRecurring: isRecurring === true || isRecurring === 'true',
+      recurrence: isRecurring ? (recurrence || null) : null
     });
 
     // Save task
@@ -56,7 +58,9 @@ exports.createTask = async (req, res) => {
     await createNotification(
       assignedTo,
       `New task assigned: ${populatedTask.title}`,
-      io
+      io,
+      populatedTask._id,
+      'task_assigned'
     );
 
     return res.status(201).json(populatedTask);
@@ -122,6 +126,7 @@ exports.getTaskById = async (req, res) => {
 // @access  Private (All roles)
 exports.updateTask = async (req, res) => {
   try {
+    const io = req.app.get('io');
     const task = await Task.findById(req.params.id);
     if (!task) {
       return res.status(404).json({ message: 'Task not found.' });
@@ -151,7 +156,6 @@ exports.updateTask = async (req, res) => {
         try {
           const creator = await User.findById(task.createdBy);
           if (creator) {
-            const io = req.app.get('io');
             // 1. App Notification
             await createNotification(
               task.createdBy,
@@ -166,10 +170,16 @@ exports.updateTask = async (req, res) => {
         } catch (err) {
           console.error('Failed to send task completion alerts:', err);
         }
+
+        // If this is a recurring task, spawn the next occurrence
+        const { spawnNextRecurrence } = require('../utils/recurrenceHelper');
+        await spawnNextRecurrence(task, io);
       }
     } else {
       // Admin/Head can update all fields
-      const { title, description, assignedTo, clientName, deadline, notes, status, priority } = req.body;
+      const { title, description, assignedTo, clientName, deadline, notes, status, priority, isRecurring, recurrence } = req.body;
+
+      const wasAlreadyCompleted = task.status === 'Completed';
 
       if (title !== undefined) task.title = title.trim();
       if (description !== undefined) task.description = description.trim();
@@ -178,6 +188,8 @@ exports.updateTask = async (req, res) => {
       if (notes !== undefined) task.notes = notes.trim();
       if (status !== undefined) task.status = status;
       if (priority !== undefined) task.priority = priority;
+      if (isRecurring !== undefined) task.isRecurring = isRecurring;
+      if (recurrence !== undefined) task.recurrence = recurrence || null;
 
       // Handle changes to task assignee
       if (assignedTo !== undefined && assignedTo !== task.assignedTo?.toString()) {
@@ -189,6 +201,12 @@ exports.updateTask = async (req, res) => {
             status: assignedTo ? 'assigned' : 'unassigned'
           });
         }
+      }
+
+      // If status changed to Completed and was not already Completed, spawn next recurrence
+      if (status === 'Completed' && !wasAlreadyCompleted) {
+        const { spawnNextRecurrence } = require('../utils/recurrenceHelper');
+        await spawnNextRecurrence(task, io);
       }
     }
 
@@ -250,3 +268,69 @@ exports.getClients = async (req, res) => {
     return res.status(500).json({ message: 'Server error. Failed to retrieve clients.' });
   }
 };
+
+// @desc    Perform bulk actions on multiple tasks
+// @route   POST /api/tasks/bulk
+// @access  Private (Admin, Head only)
+exports.bulkTaskAction = async (req, res) => {
+  try {
+    const { action, taskIds, value } = req.body;
+
+    if (!action || !taskIds || !Array.isArray(taskIds) || taskIds.length === 0) {
+      return res.status(400).json({ message: 'action and taskIds array are required.' });
+    }
+
+    const validActions = ['delete', 'status', 'reassign'];
+    if (!validActions.includes(action)) {
+      return res.status(400).json({ message: `Invalid action. Must be one of: ${validActions.join(', ')}` });
+    }
+
+    let result = {};
+
+    if (action === 'delete') {
+      // Reset linked emails before deleting tasks
+      const tasks = await Task.find({ _id: { $in: taskIds } });
+      const linkedEmailIds = tasks.filter(t => t.linkedEmail).map(t => t.linkedEmail);
+      if (linkedEmailIds.length > 0) {
+        await Email.updateMany(
+          { _id: { $in: linkedEmailIds } },
+          { $set: { status: 'unassigned', assignedTo: null } }
+        );
+      }
+      await Task.deleteMany({ _id: { $in: taskIds } });
+      result = { deleted: taskIds.length };
+      await logActivity(req.user._id, 'Bulk Task Delete', `Bulk deleted ${taskIds.length} tasks`);
+    }
+
+    else if (action === 'status') {
+      const allowedStatuses = ['Pending', 'Completed', 'Late'];
+      if (!value || !allowedStatuses.includes(value)) {
+        return res.status(400).json({ message: `Invalid status. Must be one of: ${allowedStatuses.join(', ')}` });
+      }
+      await Task.updateMany({ _id: { $in: taskIds } }, { $set: { status: value } });
+      result = { updated: taskIds.length, status: value };
+      await logActivity(req.user._id, 'Bulk Task Status', `Bulk set ${taskIds.length} tasks to "${value}"`);
+    }
+
+    else if (action === 'reassign') {
+      if (!value) return res.status(400).json({ message: 'value (userId) is required for reassign action.' });
+      const targetUser = await User.findById(value);
+      if (!targetUser) return res.status(404).json({ message: 'Target user not found.' });
+      await Task.updateMany({ _id: { $in: taskIds } }, { $set: { assignedTo: value } });
+      // Sync linked email assignments too
+      const tasks = await Task.find({ _id: { $in: taskIds }, linkedEmail: { $ne: null } });
+      const linkedEmailIds = tasks.map(t => t.linkedEmail);
+      if (linkedEmailIds.length > 0) {
+        await Email.updateMany({ _id: { $in: linkedEmailIds } }, { $set: { assignedTo: value, status: 'assigned' } });
+      }
+      result = { updated: taskIds.length, assignedTo: targetUser.name };
+      await logActivity(req.user._id, 'Bulk Task Reassign', `Bulk reassigned ${taskIds.length} tasks to ${targetUser.name}`);
+    }
+
+    return res.status(200).json({ message: 'Bulk action completed.', result });
+  } catch (error) {
+    console.error('Error in bulkTaskAction:', error);
+    return res.status(500).json({ message: 'Server error. Failed to perform bulk action.' });
+  }
+};
+

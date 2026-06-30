@@ -10,7 +10,8 @@ const {
   getConnectedStatus,
   disconnectGmail,
   disconnectLinkedAccount,
-  replyToEmail
+  replyToEmail,
+  bulkAssignEmails
 } = require('../controllers/gmailController');
 const { protect, authorizeRoles } = require('../middleware/authMiddleware');
 
@@ -28,6 +29,9 @@ router.get('/emails', protect, authorizeRoles('Admin', 'Head'), getEmails);
 
 // POST /api/gmail/emails/:id/reply - Send a reply to an email
 router.post('/emails/:id/reply', protect, authorizeRoles('Admin', 'Head'), replyToEmail);
+
+// POST /api/gmail/emails/bulk-assign - Bulk assign multiple emails
+router.post('/emails/bulk-assign', protect, authorizeRoles('Admin', 'Head'), bulkAssignEmails);
 
 // DELETE /api/gmail/emails - Clear all emails (protected, Admin only)
 router.delete('/emails', protect, authorizeRoles('Admin'), deleteAllEmails);

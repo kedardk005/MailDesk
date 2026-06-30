@@ -7,11 +7,15 @@ const {
   getTaskById,
   updateTask,
   deleteTask,
-  getClients
+  getClients,
+  bulkTaskAction
 } = require('../controllers/taskController');
 
 // Route for listing all clients - must be registered before the /:id route parameters to prevent collisions
 router.get('/clients', protect, getClients);
+
+// Route for bulk actions
+router.post('/bulk', protect, authorizeRoles('Admin', 'Head'), bulkTaskAction);
 
 router.route('/')
   .get(protect, getAllTasks)

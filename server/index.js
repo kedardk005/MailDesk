@@ -41,6 +41,9 @@ app.use('/api/gmail', gmailRoutes);
 const taskRoutes = require('./routes/taskRoutes');
 app.use('/api/tasks', taskRoutes);
 
+const commentRoutes = require('./routes/commentRoutes');
+app.use('/api/tasks/:id/comments', commentRoutes);
+
 // Notification routes
 const notificationRoutes = require('./routes/notificationRoutes');
 app.use('/api/notifications', notificationRoutes);

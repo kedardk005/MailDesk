@@ -1,8 +1,10 @@
 import React, { useState, useEffect, useRef } from 'react';
+import { useNavigate } from 'react-router-dom';
 import { io } from 'socket.io-client';
 import api from '../api/axios';
 
 const NotificationBell = () => {
+  const navigate = useNavigate();
   const [notifications, setNotifications] = useState([]);
   const [unreadCount, setUnreadCount] = useState(0);
   const [isOpen, setIsOpen] = useState(false);
@@ -83,6 +85,21 @@ const NotificationBell = () => {
     } catch (err) {
       console.error('Failed to fetch notifications:', err);
     }
+  };
+
+  const handleNotificationClick = async (n) => {
+    await handleMarkAsRead(n._id, n.read);
+    
+    if (n.type === 'task_assigned' && n.taskId) {
+      navigate('/tasks');
+    } else if (n.type === 'task_comment' && n.taskId) {
+      navigate(`/tasks?expandTaskId=${n.taskId}`);
+    } else {
+      if (n.taskId) {
+        navigate(`/tasks?expandTaskId=${n.taskId}`);
+      }
+    }
+    setIsOpen(false);
   };
 
   const handleMarkAsRead = async (id, isRead) => {
@@ -171,7 +188,7 @@ const NotificationBell = () => {
               notifications.slice(0, 10).map((n) => (
                 <div
                   key={n._id}
-                  onClick={() => handleMarkAsRead(n._id, n.read)}
+                  onClick={() => handleNotificationClick(n)}
                   className={`px-4 py-3 cursor-pointer transition-colors duration-150 flex flex-col space-y-1 border-l-4 ${
                     !n.read
                       ? 'bg-indigo-50/40 border-l-indigo-600 hover:bg-indigo-50/60'

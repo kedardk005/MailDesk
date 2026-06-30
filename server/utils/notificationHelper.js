@@ -6,7 +6,7 @@ const Notification = require('../models/Notification');
  * @param {String} message - The notification message
  * @param {Object} io - The socket.io server instance
  */
-const createNotification = async (userId, message, io) => {
+const createNotification = async (userId, message, io, taskId = null, type = null) => {
   try {
     if (!userId) {
       console.warn('createNotification: userId is missing.');
@@ -16,7 +16,9 @@ const createNotification = async (userId, message, io) => {
     const notification = new Notification({
       userId,
       message,
-      read: false
+      read: false,
+      taskId,
+      type
     });
 
     const savedNotification = await notification.save();
@@ -24,7 +26,7 @@ const createNotification = async (userId, message, io) => {
     if (io) {
       const room = userId.toString();
       io.to(room).emit('newNotification', savedNotification);
-      console.log(`[SOCKET EMITTED] newNotification to user room ${room}: "${message}"`);
+      console.log(`[SOCKET EMITTED] newNotification to user room ${room}: "${message}" (taskId: ${taskId}, type: ${type})`);
     }
 
     return savedNotification;

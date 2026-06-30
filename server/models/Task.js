@@ -47,6 +47,20 @@ const TaskSchema = new mongoose.Schema({
     enum: ['Low', 'Medium', 'High', 'Urgent'],
     default: 'Medium'
   },
+  isRecurring: {
+    type: Boolean,
+    default: false
+  },
+  recurrence: {
+    type: String,
+    enum: ['Daily', 'Weekly', 'Monthly', null],
+    default: null
+  },
+  parentTaskId: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'Task',
+    default: null
+  },
   createdAt: {
     type: Date,
     default: Date.now
