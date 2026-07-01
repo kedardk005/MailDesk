@@ -87,13 +87,21 @@ exports.getEmployeeReport = async (req, res) => {
 // @access  Private (Admin, Head only)
 exports.getOverallStats = async (req, res) => {
   try {
+    let emailQuery = {};
+    let taskQuery = {};
+
+    if (req.user.role === 'Head') {
+      emailQuery.fetchedBy = req.user._id;
+      taskQuery = { createdBy: req.user._id };
+    }
+
     const totalUsers = await User.countDocuments({});
-    const totalEmails = await Email.countDocuments({});
-    const totalTasks = await Task.countDocuments({});
-    const totalPending = await Task.countDocuments({ status: 'Pending' });
-    const totalCompleted = await Task.countDocuments({ status: 'Completed' });
-    const totalLate = await Task.countDocuments({ status: 'Late' });
-    const totalUnassignedEmails = await Email.countDocuments({ status: 'unassigned' });
+    const totalEmails = await Email.countDocuments(emailQuery);
+    const totalTasks = await Task.countDocuments(taskQuery);
+    const totalPending = await Task.countDocuments({ ...taskQuery, status: 'Pending' });
+    const totalCompleted = await Task.countDocuments({ ...taskQuery, status: 'Completed' });
+    const totalLate = await Task.countDocuments({ ...taskQuery, status: 'Late' });
+    const totalUnassignedEmails = await Email.countDocuments({ ...emailQuery, status: 'unassigned' });
     const totalClients = await Client.countDocuments({});
 
     return res.status(200).json({
@@ -136,10 +144,13 @@ exports.getTaskTimeline = async (req, res) => {
     const startDate = new Date(now.getFullYear(), now.getMonth(), now.getDate() - 29);
     startDate.setHours(0, 0, 0, 0);
 
+    let taskQuery = { createdAt: { $gte: startDate } };
+    if (req.user.role === 'Head') {
+      taskQuery.createdBy = req.user._id;
+    }
+
     // Fetch tasks created in the timeline range
-    const tasks = await Task.find({
-      createdAt: { $gte: startDate }
-    });
+    const tasks = await Task.find(taskQuery);
 
     tasks.forEach((task) => {
       const d = new Date(task.createdAt);

@@ -48,7 +48,7 @@ exports.createTask = async (req, res) => {
     // Populate task details before returning
     const populatedTask = await Task.findById(savedTask._id)
       .populate('assignedTo', 'name email')
-      .populate('linkedEmail', 'subject')
+      .populate('linkedEmail', 'subject from body attachments')
       .populate('createdBy', 'name');
 
     await logActivity(req.user._id, 'Task Creation', `Created task "${populatedTask.title}" (Assigned to: ${populatedTask.assignedTo?.name || 'N/A'}, Client: ${populatedTask.clientName})`);
@@ -77,14 +77,16 @@ exports.getAllTasks = async (req, res) => {
   try {
     let query = {};
 
-    // Filter by role: Employees can only see tasks assigned to them
+    // Filter by role: Employees can only see tasks assigned to them, Heads can only see tasks created by them
     if (req.user.role === 'Employee') {
       query = { assignedTo: req.user._id };
+    } else if (req.user.role === 'Head') {
+      query = { createdBy: req.user._id };
     }
 
     const tasks = await Task.find(query)
       .populate('assignedTo', 'name email')
-      .populate('linkedEmail', 'subject from body')
+      .populate('linkedEmail', 'subject from body attachments')
       .populate('createdBy', 'name')
       .sort({ createdAt: -1 });
 
@@ -102,7 +104,7 @@ exports.getTaskById = async (req, res) => {
   try {
     const task = await Task.findById(req.params.id)
       .populate('assignedTo', 'name email')
-      .populate('linkedEmail', 'subject from body')
+      .populate('linkedEmail', 'subject from body attachments')
       .populate('createdBy', 'name');
 
     if (!task) {
@@ -112,6 +114,11 @@ exports.getTaskById = async (req, res) => {
     // Employees can only access their own tasks
     if (req.user.role === 'Employee' && task.assignedTo && task.assignedTo._id.toString() !== req.user._id.toString()) {
       return res.status(403).json({ message: 'Access denied. You can only access tasks assigned to you.' });
+    }
+
+    // Heads can only access tasks created by them
+    if (req.user.role === 'Head' && task.createdBy && task.createdBy._id.toString() !== req.user._id.toString()) {
+      return res.status(403).json({ message: 'Access denied. You can only access tasks created by you.' });
     }
 
     return res.status(200).json(task);
@@ -176,6 +183,11 @@ exports.updateTask = async (req, res) => {
         await spawnNextRecurrence(task, io);
       }
     } else {
+      // For Head, check if they created the task
+      if (req.user.role === 'Head' && task.createdBy && task.createdBy.toString() !== req.user._id.toString()) {
+        return res.status(403).json({ message: 'Access denied. You can only update tasks created by you.' });
+      }
+
       // Admin/Head can update all fields
       const { title, description, assignedTo, clientName, deadline, notes, status, priority, isRecurring, recurrence } = req.body;
 
@@ -215,7 +227,7 @@ exports.updateTask = async (req, res) => {
     // Populate and return updated task details
     const populatedTask = await Task.findById(updatedTask._id)
       .populate('assignedTo', 'name email')
-      .populate('linkedEmail', 'subject from')
+      .populate('linkedEmail', 'subject from body attachments')
       .populate('createdBy', 'name');
 
     await logActivity(req.user._id, 'Task Update', `Updated task "${populatedTask.title}" (Status: ${populatedTask.status}, Assigned to: ${populatedTask.assignedTo?.name || 'N/A'})`);
@@ -235,6 +247,11 @@ exports.deleteTask = async (req, res) => {
     const task = await Task.findById(req.params.id);
     if (!task) {
       return res.status(404).json({ message: 'Task not found.' });
+    }
+
+    // For Head, check if they created the task
+    if (req.user.role === 'Head' && task.createdBy && task.createdBy.toString() !== req.user._id.toString()) {
+      return res.status(403).json({ message: 'Access denied. You can only delete tasks created by you.' });
     }
 
     // If task has a linked email, reset its status to unassigned and clear assignee
@@ -283,6 +300,15 @@ exports.bulkTaskAction = async (req, res) => {
     const validActions = ['delete', 'status', 'reassign'];
     if (!validActions.includes(action)) {
       return res.status(400).json({ message: `Invalid action. Must be one of: ${validActions.join(', ')}` });
+    }
+
+    // For Head role, make sure they created all tasks they are trying to perform bulk action on
+    if (req.user.role === 'Head') {
+      const tasks = await Task.find({ _id: { $in: taskIds } });
+      const ownedTasksCount = tasks.filter(t => t.createdBy && t.createdBy.toString() === req.user._id.toString()).length;
+      if (ownedTasksCount !== tasks.length) {
+        return res.status(403).json({ message: 'Access denied. You can only perform bulk actions on tasks created by you.' });
+      }
     }
 
     let result = {};

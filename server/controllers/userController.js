@@ -106,6 +106,17 @@ exports.updateUser = async (req, res) => {
       if (!allowedRoles.includes(role)) {
         return res.status(400).json({ message: 'Invalid role selection.' });
       }
+      // Enforce single Admin constraint
+      if (role === 'Admin') {
+        const approvedAdminExists = await User.findOne({
+          role: 'Admin',
+          status: 'Approved',
+          _id: { $ne: user._id }
+        });
+        if (approvedAdminExists) {
+          return res.status(400).json({ message: 'There can only be one Admin in the system.' });
+        }
+      }
       user.role = role;
     }
 
@@ -116,6 +127,18 @@ exports.updateUser = async (req, res) => {
         return res.status(400).json({ message: 'Invalid status selection.' });
       }
       
+      // Enforce single Admin constraint on status approval
+      if (status === 'Approved' && user.role === 'Admin') {
+        const approvedAdminExists = await User.findOne({
+          role: 'Admin',
+          status: 'Approved',
+          _id: { $ne: user._id }
+        });
+        if (approvedAdminExists) {
+          return res.status(400).json({ message: 'There can only be one Admin in the system.' });
+        }
+      }
+
       const wasPending = user.status === 'Pending';
       user.status = status;
       

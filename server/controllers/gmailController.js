@@ -81,6 +81,37 @@ const getInlineImages = (payload) => {
   return images;
 };
 
+// Recursive helper to find all attachment parts (excluding inline images)
+const getAttachmentsList = (payload) => {
+  const attachments = [];
+
+  const traverse = (part) => {
+    // Regular attachments have a filename and an attachmentId
+    if (part.filename && part.body && part.body.attachmentId) {
+      const hasContentId = part.headers && part.headers.some(h => h.name.toLowerCase() === 'content-id');
+      const isInlineImage = hasContentId && part.mimeType && part.mimeType.startsWith('image/');
+      
+      if (!isInlineImage) {
+        attachments.push({
+          attachmentId: part.body.attachmentId,
+          filename: part.filename,
+          mimeType: part.mimeType || '',
+          size: part.body.size || 0
+        });
+      }
+    }
+
+    if (part.parts) {
+      for (const p of part.parts) {
+        traverse(p);
+      }
+    }
+  };
+
+  traverse(payload);
+  return attachments;
+};
+
 // Helper to search for header names in a case-insensitive manner
 const getHeader = (headers, name) => {
   if (!headers) return '';
@@ -102,7 +133,10 @@ exports.getAuthUrl = async (req, res) => {
     ];
 
     // Encode userId + mode into state so callback knows where to save tokens
-    const mode = req.query.mode === 'extra' ? 'extra' : 'primary';
+    let mode = req.query.mode === 'extra' ? 'extra' : 'primary';
+    if (req.user.role === 'Head') {
+      mode = 'primary';
+    }
     const statePayload = `${req.user._id.toString()}:${mode}`;
 
     const authUrl = oauth2Client.generateAuthUrl({
@@ -132,7 +166,7 @@ exports.handleOAuthCallback = async (req, res) => {
 
     // Decode state: "userId:mode" (mode = 'primary' | 'extra')
     const [userId, mode] = state.split(':');
-    const isExtra = mode === 'extra';
+    let isExtra = mode === 'extra';
 
     const oauth2Client = getOAuth2Client();
 
@@ -146,9 +180,14 @@ exports.handleOAuthCallback = async (req, res) => {
       return res.status(404).send('User associated with OAuth session not found.');
     }
 
-    // Only Admins can connect Gmail accounts
-    if (user.role !== 'Admin') {
-      return res.status(403).send('Access denied. Only Admin users are authorized to connect Gmail accounts.');
+    // Admins and Heads can connect Gmail accounts
+    if (user.role !== 'Admin' && user.role !== 'Head') {
+      return res.status(403).send('Access denied. Only Admin and Head users are authorized to connect Gmail accounts.');
+    }
+
+    // Force primary mode for Head role
+    if (user.role === 'Head') {
+      isExtra = false;
     }
 
     // Call Gmail API to fetch the user's profile and actual Gmail email address
@@ -295,6 +334,8 @@ const syncAccountEmails = async (user, accessToken, refreshToken, inboxEmail, is
       }
     }
 
+    const attachments = getAttachmentsList(payload);
+
     const emailRecord = new Email({
       messageId: message.id,
       subject,
@@ -305,7 +346,8 @@ const syncAccountEmails = async (user, accessToken, refreshToken, inboxEmail, is
       assignedTo: null,
       fetchedBy: user._id,
       labelIds,
-      toEmail: inboxEmail
+      toEmail: inboxEmail,
+      attachments
     });
 
     await emailRecord.save();
@@ -367,7 +409,7 @@ exports.fetchEmails = async (req, res) => {
   try {
     let totalCount = 0;
 
-    if (req.user.role === 'Admin' || req.user.role === 'Head') {
+    if (req.user.role === 'Admin') {
       // Find all users who have a connected Gmail account
       const users = await User.find({
         gmailAccessToken: { $ne: null, $ne: "" }
@@ -384,6 +426,13 @@ exports.fetchEmails = async (req, res) => {
           }
         }
       }
+    } else if (req.user.role === 'Head') {
+      // Sync only the current Head's own emails
+      const user = await User.findById(req.user._id);
+      if (!user || !user.gmailAccessToken) {
+        return res.status(400).json({ message: 'Gmail account not connected. Please authenticate first.' });
+      }
+      totalCount = await syncUserEmails(user, true);
     } else {
       const user = await User.findById(req.user._id);
       if (!user || !user.gmailAccessToken) {
@@ -410,6 +459,8 @@ exports.getEmails = async (req, res) => {
 
     if (req.user.role === 'Employee') {
       query.assignedTo = req.user._id;
+    } else if (req.user.role === 'Head') {
+      query.fetchedBy = req.user._id;
     }
 
     // If search query provided, add text search across subject and from fields
@@ -422,6 +473,8 @@ exports.getEmails = async (req, res) => {
       // Merge with existing role filter
       if (query.assignedTo) {
         query = { assignedTo: query.assignedTo, $or: searchConditions };
+      } else if (query.fetchedBy) {
+        query = { fetchedBy: query.fetchedBy, $or: searchConditions };
       } else {
         query.$or = searchConditions;
       }
@@ -496,16 +549,18 @@ exports.getConnectedStatus = async (req, res) => {
     }
     const isConnected = !!currentUser.gmailAccessToken && currentUser.gmailAccessToken !== "";
     
-    // Admin and Head can see all connected accounts in the workspace
-    let linkedAccounts = (currentUser.linkedGmailAccounts || []).map(a => ({
-      gmailEmail: a.gmailEmail,
-      connected: !!a.gmailAccessToken,
-      ownerName: 'Me',
-      isOtherUser: false,
-      userId: currentUser._id.toString()
-    }));
+    // Non-Admin users only see their own primary account status (if connected) and no linked accounts
+    let linkedAccounts = [];
 
-    if (currentUser.role === 'Admin' || currentUser.role === 'Head') {
+    if (currentUser.role === 'Admin') {
+      linkedAccounts = (currentUser.linkedGmailAccounts || []).map(a => ({
+        gmailEmail: a.gmailEmail,
+        connected: !!a.gmailAccessToken,
+        ownerName: 'Me',
+        isOtherUser: false,
+        userId: currentUser._id.toString()
+      }));
+
       // Find other users with connected accounts
       const otherUsers = await User.find({
         _id: { $ne: currentUser._id },
@@ -906,6 +961,107 @@ exports.bulkAssignEmails = async (req, res) => {
   } catch (error) {
     console.error('Error in bulkAssignEmails:', error);
     return res.status(500).json({ message: 'Server error. Failed to bulk assign emails.' });
+  }
+};
+
+// @desc    Download email attachment
+// @route   GET /api/gmail/emails/:id/attachments/:attachmentId
+// @access  Private (All roles with access)
+exports.downloadAttachment = async (req, res) => {
+  try {
+    const { id, attachmentId } = req.params;
+    
+    // Find the email
+    const email = await Email.findById(id);
+    if (!email) {
+      return res.status(404).json({ message: 'Email not found.' });
+    }
+
+    // Access control:
+    // Employee can only download attachments of emails assigned to them
+    if (req.user.role === 'Employee' && email.assignedTo?.toString() !== req.user._id.toString()) {
+      return res.status(403).json({ message: 'Access denied. Email is not assigned to you.' });
+    }
+    // Head can only download attachments of emails fetched by them
+    if (req.user.role === 'Head' && email.fetchedBy?.toString() !== req.user._id.toString()) {
+      return res.status(403).json({ message: 'Access denied. Email is not fetched by you.' });
+    }
+
+    // Find attachment info
+    const attachmentInfo = email.attachments.find(a => a.attachmentId === attachmentId);
+    if (!attachmentInfo) {
+      return res.status(404).json({ message: 'Attachment metadata not found on email.' });
+    }
+
+    // Find user context to get Gmail oauth credentials
+    const fetcher = await User.findById(email.fetchedBy);
+    if (!fetcher) {
+      return res.status(404).json({ message: 'Email fetcher user context not found.' });
+    }
+
+    let accessToken = null;
+    let refreshToken = null;
+    const targetInbox = email.toEmail;
+
+    if (fetcher.gmailEmail === targetInbox) {
+      accessToken = fetcher.gmailAccessToken;
+      refreshToken = fetcher.gmailRefreshToken;
+    } else {
+      const linked = (fetcher.linkedGmailAccounts || []).find(a => a.gmailEmail === targetInbox);
+      if (linked) {
+        accessToken = linked.gmailAccessToken;
+        refreshToken = linked.gmailRefreshToken;
+      }
+    }
+
+    // Fallback to Admin credentials
+    if (!accessToken) {
+      const allAdmins = await User.find({ role: 'Admin' });
+      for (const admin of allAdmins) {
+        if (admin.gmailEmail === targetInbox) {
+          accessToken = admin.gmailAccessToken;
+          refreshToken = admin.gmailRefreshToken;
+          break;
+        }
+        const linked = (admin.linkedGmailAccounts || []).find(a => a.gmailEmail === targetInbox);
+        if (linked) {
+          accessToken = linked.gmailAccessToken;
+          refreshToken = linked.gmailRefreshToken;
+          break;
+        }
+      }
+    }
+
+    if (!accessToken) {
+      return res.status(400).json({ message: 'No authenticated Gmail credentials found for this inbox.' });
+    }
+
+    const oauth2Client = getOAuth2Client();
+    oauth2Client.setCredentials({ access_token: accessToken, refresh_token: refreshToken });
+
+    const gmail = google.gmail({ version: 'v1', auth: oauth2Client });
+    const attachRes = await gmail.users.messages.attachments.get({
+      userId: 'me',
+      messageId: email.messageId,
+      id: attachmentId
+    });
+
+    const base64Data = attachRes.data.data;
+    if (!base64Data) {
+      return res.status(404).json({ message: 'Attachment content empty.' });
+    }
+
+    const standardBase64 = base64Data.replace(/-/g, '+').replace(/_/g, '/');
+    const fileBuffer = Buffer.from(standardBase64, 'base64');
+
+    res.setHeader('Content-Type', attachmentInfo.mimeType || 'application/octet-stream');
+    res.setHeader('Content-Disposition', `attachment; filename="${encodeURIComponent(attachmentInfo.filename)}"`);
+    res.setHeader('Content-Length', fileBuffer.length);
+    return res.send(fileBuffer);
+
+  } catch (error) {
+    console.error('Error in downloadAttachment:', error);
+    return res.status(500).json({ message: 'Server error. Failed to download attachment.' });
   }
 };
 

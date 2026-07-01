@@ -16,6 +16,11 @@ exports.getComments = async (req, res) => {
       return res.status(403).json({ message: 'Access denied.' });
     }
 
+    // Heads can only see comments on tasks created by them
+    if (req.user.role === 'Head' && task.createdBy?.toString() !== req.user._id.toString()) {
+      return res.status(403).json({ message: 'Access denied.' });
+    }
+
     const comments = await TaskComment.find({ taskId: req.params.id })
       .populate('author', 'name role')
       .sort({ createdAt: 1 });
@@ -45,6 +50,11 @@ exports.addComment = async (req, res) => {
 
     // Employees can only comment on their own tasks
     if (req.user.role === 'Employee' && task.assignedTo?._id.toString() !== req.user._id.toString()) {
+      return res.status(403).json({ message: 'Access denied.' });
+    }
+
+    // Heads can only comment on tasks created by them
+    if (req.user.role === 'Head' && task.createdBy?._id.toString() !== req.user._id.toString()) {
       return res.status(403).json({ message: 'Access denied.' });
     }
 
@@ -102,10 +112,22 @@ exports.deleteComment = async (req, res) => {
     if (!comment) return res.status(404).json({ message: 'Comment not found.' });
 
     const isOwner = comment.author.toString() === req.user._id.toString();
-    const isAdminOrHead = req.user.role === 'Admin' || req.user.role === 'Head';
+    
+    let isAuthorized = false;
+    if (isOwner) {
+      isAuthorized = true;
+    } else if (req.user.role === 'Admin') {
+      isAuthorized = true;
+    } else if (req.user.role === 'Head') {
+      // Heads can only delete comments on tasks created by them
+      const task = await Task.findById(req.params.taskId);
+      if (task && task.createdBy && task.createdBy.toString() === req.user._id.toString()) {
+        isAuthorized = true;
+      }
+    }
 
-    if (!isOwner && !isAdminOrHead) {
-      return res.status(403).json({ message: 'Access denied. You can only delete your own comments.' });
+    if (!isAuthorized) {
+      return res.status(403).json({ message: 'Access denied.' });
     }
 
     await TaskComment.findByIdAndDelete(req.params.commentId);

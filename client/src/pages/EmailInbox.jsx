@@ -65,23 +65,27 @@ const EmailInbox = () => {
       // 2. Label/Category tab filter
       const labelIds = email.labelIds || [];
       const isSpam = labelIds.includes('SPAM');
+      const isSent = labelIds.includes('SENT');
       const isPromo = labelIds.includes('CATEGORY_PROMOTIONS');
       const isSocial = labelIds.includes('CATEGORY_SOCIAL');
       const isUpdates = labelIds.includes('CATEGORY_UPDATES');
 
+      if (activeTab === 'sent') {
+        return isSent;
+      }
       if (activeTab === 'spam') {
-        return isSpam;
+        return isSpam && !isSent;
       }
       if (activeTab === 'promotions') {
-        return isPromo;
+        return isPromo && !isSent;
       }
       if (activeTab === 'social') {
-        return isSocial;
+        return isSocial && !isSent;
       }
       if (activeTab === 'updates') {
-        return isUpdates;
+        return isUpdates && !isSent;
       }
-      return !isSpam && !isPromo && !isSocial && !isUpdates;
+      return !isSpam && !isPromo && !isSocial && !isUpdates && !isSent;
     });
   };
 
@@ -96,23 +100,27 @@ const EmailInbox = () => {
 
       const labelIds = email.labelIds || [];
       const isSpam = labelIds.includes('SPAM');
+      const isSent = labelIds.includes('SENT');
       const isPromo = labelIds.includes('CATEGORY_PROMOTIONS');
       const isSocial = labelIds.includes('CATEGORY_SOCIAL');
       const isUpdates = labelIds.includes('CATEGORY_UPDATES');
 
+      if (tabName === 'sent') {
+        return isSent;
+      }
       if (tabName === 'spam') {
-        return isSpam;
+        return isSpam && !isSent;
       }
       if (tabName === 'promotions') {
-        return isPromo;
+        return isPromo && !isSent;
       }
       if (tabName === 'social') {
-        return isSocial;
+        return isSocial && !isSent;
       }
       if (tabName === 'updates') {
-        return isUpdates;
+        return isUpdates && !isSent;
       }
-      return !isSpam && !isPromo && !isSocial && !isUpdates;
+      return !isSpam && !isPromo && !isSocial && !isUpdates && !isSent;
     }).length;
   };
 
@@ -414,6 +422,24 @@ const EmailInbox = () => {
     }
   };
 
+  const handleDownloadAttachment = async (emailId, attachmentId, filename) => {
+    try {
+      const response = await api.get(`/gmail/emails/${emailId}/attachments/${attachmentId}`, {
+        responseType: 'blob'
+      });
+      const url = window.URL.createObjectURL(new Blob([response.data]));
+      const link = document.createElement('a');
+      link.href = url;
+      link.setAttribute('download', filename);
+      document.body.appendChild(link);
+      link.click();
+      link.parentNode.removeChild(link);
+    } catch (err) {
+      console.error('Failed to download attachment:', err);
+      triggerAlert('error', 'Failed to download attachment.');
+    }
+  };
+
   const handleSummarize = async (email) => {
     const id = email._id;
     setSummaryMap(prev => ({ ...prev, [id]: { loading: true, text: '', error: '' } }));
@@ -633,6 +659,22 @@ const EmailInbox = () => {
                 activeTab === 'inbox' ? 'bg-indigo-50 text-indigo-650' : 'bg-slate-200 text-slate-600'
               }`}>
                 {getTabCount('inbox')}
+              </span>
+            </button>
+
+            <button
+              onClick={() => { setActiveTab('sent'); setExpandedEmailId(null); }}
+              className={`px-4 py-2 text-xs font-bold rounded-lg transition-all flex items-center gap-2 ${
+                activeTab === 'sent'
+                  ? 'bg-white text-indigo-650 shadow-sm border border-slate-200/40'
+                  : 'text-slate-500 hover:text-slate-700'
+              }`}
+            >
+              <span>Sent</span>
+              <span className={`px-1.5 py-0.5 text-[10px] rounded-md font-extrabold ${
+                activeTab === 'sent' ? 'bg-indigo-50 text-indigo-650' : 'bg-slate-200 text-slate-600'
+              }`}>
+                {getTabCount('sent')}
               </span>
             </button>
             
@@ -1113,6 +1155,28 @@ const EmailInbox = () => {
                     ) : (
                       <div className="bg-white border border-slate-200/85 rounded-xl p-4 text-xs text-slate-700 leading-relaxed whitespace-pre-wrap break-words overflow-hidden max-w-full select-text">
                         <span className="italic text-slate-400">This email has no text content.</span>
+                      </div>
+                    )}
+
+                    {/* Email Attachments section */}
+                    {email.attachments && email.attachments.length > 0 && (
+                      <div className="bg-white p-4 border border-slate-200 rounded-xl space-y-2">
+                        <h5 className="text-[10px] font-bold text-indigo-650 uppercase tracking-wider">📎 Attachments ({email.attachments.length})</h5>
+                        <div className="flex flex-wrap gap-2">
+                          {email.attachments.map((att) => (
+                            <button
+                              key={att.attachmentId}
+                              onClick={() => handleDownloadAttachment(email._id, att.attachmentId, att.filename)}
+                              className="flex items-center gap-2 px-3 py-2 bg-slate-50 hover:bg-indigo-50 border border-slate-200 hover:border-indigo-200 rounded-xl text-xs font-bold text-slate-700 hover:text-indigo-700 transition-colors"
+                            >
+                              <svg className="w-4 h-4 text-slate-450" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" />
+                              </svg>
+                              <span className="truncate max-w-[200px]">{att.filename}</span>
+                              <span className="text-[10px] text-slate-450 font-medium">({Math.round(att.size / 1024)} KB)</span>
+                            </button>
+                          ))}
+                        </div>
                       </div>
                     )}
 

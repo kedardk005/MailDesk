@@ -47,7 +47,15 @@ const EmailSchema = new mongoose.Schema({
   toEmail: {
     type: String,
     default: ''
-  }
+  },
+  attachments: [
+    {
+      attachmentId: { type: String, required: true },
+      filename: { type: String, required: true },
+      mimeType: { type: String, default: '' },
+      size: { type: Number, default: 0 }
+    }
+  ]
 });
 
 module.exports = mongoose.model('Email', EmailSchema);

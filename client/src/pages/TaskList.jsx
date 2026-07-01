@@ -388,6 +388,24 @@ const TaskList = () => {
     }
   };
 
+  const handleDownloadAttachment = async (emailId, attachmentId, filename) => {
+    try {
+      const response = await api.get(`/gmail/emails/${emailId}/attachments/${attachmentId}`, {
+        responseType: 'blob'
+      });
+      const url = window.URL.createObjectURL(new Blob([response.data]));
+      const link = document.createElement('a');
+      link.href = url;
+      link.setAttribute('download', filename);
+      document.body.appendChild(link);
+      link.click();
+      link.parentNode.removeChild(link);
+    } catch (err) {
+      console.error('Failed to download attachment:', err);
+      triggerAlert('error', 'Failed to download attachment.');
+    }
+  };
+
   const openEditModal = (task) => {
     setSelectedTask(task);
     setEditForm({
@@ -1129,6 +1147,28 @@ const TaskList = () => {
                                   }
                                 }}
                               />
+                            </div>
+                          )}
+
+                          {/* Attachments rendering inside Task list details */}
+                          {task.linkedEmail.attachments && task.linkedEmail.attachments.length > 0 && (
+                            <div className="pt-2 border-t border-slate-100 mt-2">
+                              <span className="font-semibold text-slate-400 uppercase tracking-wider text-[10px] block mb-1">Attachments ({task.linkedEmail.attachments.length})</span>
+                              <div className="flex flex-wrap gap-1.5">
+                                {task.linkedEmail.attachments.map((att) => (
+                                  <button
+                                    key={att.attachmentId}
+                                    onClick={() => handleDownloadAttachment(task.linkedEmail._id, att.attachmentId, att.filename)}
+                                    className="flex items-center gap-1.5 px-2.5 py-1.5 bg-slate-50 hover:bg-indigo-50 border border-slate-200 hover:border-indigo-200 rounded-lg text-[11px] font-bold text-slate-700 hover:text-indigo-700 transition-colors"
+                                  >
+                                    <svg className="w-3.5 h-3.5 text-slate-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" />
+                                    </svg>
+                                    <span>{att.filename}</span>
+                                    <span className="text-[9px] text-slate-400 font-semibold">({Math.round(att.size / 1024)} KB)</span>
+                                  </button>
+                                ))}
+                              </div>
                             </div>
                           )}
                         </div>
