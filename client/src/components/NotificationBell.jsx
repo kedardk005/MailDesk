@@ -29,16 +29,16 @@ const NotificationBell = () => {
       fetchNotifications();
     }
 
-    // 2. Connect to Socket.io server (running on port 5015)
-    const socket = io('http://localhost:5015');
+    // 2. Connect to Socket.io server (running on port 5015) with JWT token
+    const socket = io('http://localhost:5015', {
+      auth: {
+        token: localStorage.getItem('token')
+      }
+    });
     socketRef.current = socket;
 
     socket.on('connect', () => {
       console.log('Connected to Socket.io server. ID:', socket.id);
-      if (user?._id) {
-        // Join user's individual room
-        socket.emit('join', user._id);
-      }
     });
 
     // Listen for new notifications in real-time

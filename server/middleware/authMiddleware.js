@@ -26,6 +26,11 @@ const protect = async (req, res, next) => {
         return res.status(401).json({ message: 'Not authorized. User not found.' });
       }
 
+      // Check token version for password change revocation
+      if (req.user.tokenVersion !== undefined && decoded.tokenVersion !== req.user.tokenVersion) {
+        return res.status(401).json({ message: 'Not authorized. Token has been revoked.' });
+      }
+
       next();
     } catch (error) {
       console.error('JWT verification failed:', error);

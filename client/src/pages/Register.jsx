@@ -154,22 +154,7 @@ const Register = () => {
               />
             </div>
 
-            <div>
-              <label htmlFor="role" className="block text-[10px] font-bold text-slate-400 uppercase tracking-wider mb-1">
-                Workspace Role
-              </label>
-              <select
-                id="role"
-                name="role"
-                className="mt-1 block w-full px-4 py-2.5 bg-slate-50/50 hover:bg-slate-50/80 border border-slate-200/80 rounded-xl text-slate-900 focus:outline-none focus:ring-2 focus:ring-indigo-100 focus:border-indigo-500 transition-all duration-150 text-xs font-semibold focus:bg-white"
-                value={role}
-                onChange={(e) => setRole(e.target.value)}
-              >
-                <option value="Employee">Employee</option>
-                <option value="Head">Head</option>
-                <option value="Admin">Admin</option>
-              </select>
-            </div>
+
 
             <div className="pt-2">
               <button

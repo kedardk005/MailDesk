@@ -10,7 +10,7 @@ const { logActivity } = require('../utils/activityLogger');
  */
 const generateToken = (user) => {
   return jwt.sign(
-    { id: user._id, role: user.role },
+    { id: user._id, role: user.role, tokenVersion: user.tokenVersion || 0 },
     process.env.JWT_SECRET,
     { expiresIn: '7d' }
   );
@@ -23,15 +23,9 @@ exports.registerUser = async (req, res) => {
   try {
     const { name, email, password, role } = req.body;
 
-    // Validate: all fields required
-    if (!name || !email || !password || !role) {
-      return res.status(400).json({ message: 'All fields (name, email, password, role) are required.' });
-    }
-
-    // Validate: role must be Admin, Head, or Employee
-    const allowedRoles = ['Admin', 'Head', 'Employee'];
-    if (!allowedRoles.includes(role)) {
-      return res.status(400).json({ message: 'Invalid role. Role must be Admin, Head, or Employee.' });
+    // Validate: name, email, password are required
+    if (!name || !email || !password) {
+      return res.status(400).json({ message: 'All fields (name, email, password) are required.' });
     }
 
     // Check if email already exists
@@ -45,12 +39,16 @@ exports.registerUser = async (req, res) => {
     const salt = await bcrypt.genSalt(10);
     const hashedPassword = await bcrypt.hash(password, salt);
 
-    // Determine user status: New admins require approval if an approved admin already exists
+    // Lock down registration and role assignment
+    const totalUsers = await User.countDocuments({});
+    let finalRole = 'Employee';
     let status = 'Approved';
+
     if (role === 'Admin') {
-      const approvedAdminExists = await User.findOne({ role: 'Admin', status: 'Approved' });
-      if (approvedAdminExists) {
-        status = 'Pending';
+      if (totalUsers === 0) {
+        finalRole = 'Admin';
+      } else {
+        return res.status(400).json({ message: 'Registration as Admin is only allowed for the first user.' });
       }
     }
 
@@ -59,7 +57,7 @@ exports.registerUser = async (req, res) => {
       name: name.trim(),
       email: emailNormalized,
       password: hashedPassword,
-      role,
+      role: finalRole,
       status
     });
 
@@ -180,21 +178,14 @@ exports.forgotPassword = async (req, res) => {
     };
     const tempPassword = generateTempPassword();
 
-    // Debug: write password to file for local testing
-    try {
-      const fs = require('fs');
-      const path = require('path');
-      fs.writeFileSync(path.join(__dirname, '../temp_password.txt'), tempPassword, 'utf8');
-      console.log(`[DEBUG] Saved temporary password for ${user.email} to temp_password.txt: ${tempPassword}`);
-    } catch (fsErr) {
-      console.error('[DEBUG ERROR] Failed to write temp_password.txt:', fsErr);
-    }
+
 
     // Hash temporary password
     const salt = await bcrypt.genSalt(10);
     const hashedPassword = await bcrypt.hash(tempPassword, salt);
 
     user.password = hashedPassword;
+    user.tokenVersion = (user.tokenVersion || 0) + 1;
     await user.save();
 
     // Send email helper

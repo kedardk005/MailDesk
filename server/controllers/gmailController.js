@@ -3,6 +3,7 @@ const User = require('../models/User');
 const Email = require('../models/Email');
 const Task = require('../models/Task');
 const { logActivity } = require('../utils/activityLogger');
+const { encrypt, decrypt } = require('../utils/tokenCrypto');
 
 // Helper to get OAuth2 Client
 const getOAuth2Client = () => {
@@ -137,7 +138,13 @@ exports.getAuthUrl = async (req, res) => {
     if (req.user.role === 'Head') {
       mode = 'primary';
     }
-    const statePayload = `${req.user._id.toString()}:${mode}`;
+    
+    const jwt = require('jsonwebtoken');
+    const statePayload = jwt.sign(
+      { userId: req.user._id.toString(), mode },
+      process.env.OAUTH_STATE_SECRET || process.env.JWT_SECRET,
+      { expiresIn: '10m' }
+    );
 
     const authUrl = oauth2Client.generateAuthUrl({
       access_type: 'offline',
@@ -164,8 +171,19 @@ exports.handleOAuthCallback = async (req, res) => {
       return res.status(400).send('Authorization code or state parameter is missing.');
     }
 
-    // Decode state: "userId:mode" (mode = 'primary' | 'extra')
-    const [userId, mode] = state.split(':');
+    // Decode and verify state JWT
+    let userId;
+    let mode;
+    try {
+      const jwt = require('jsonwebtoken');
+      const decoded = jwt.verify(state, process.env.OAUTH_STATE_SECRET || process.env.JWT_SECRET);
+      userId = decoded.userId;
+      mode = decoded.mode;
+    } catch (err) {
+      console.error('OAuth callback state validation failed:', err.message);
+      return res.status(400).send('Authorization failed. Invalid or expired state parameter.');
+    }
+
     let isExtra = mode === 'extra';
 
     const oauth2Client = getOAuth2Client();
@@ -210,9 +228,10 @@ exports.handleOAuthCallback = async (req, res) => {
       if (!alreadyLinked) {
         user.linkedGmailAccounts.push({
           gmailEmail: gmailAddress,
-          gmailAccessToken: tokens.access_token,
-          gmailRefreshToken: tokens.refresh_token || null
+          gmailAccessToken: encrypt(tokens.access_token),
+          gmailRefreshToken: tokens.refresh_token ? encrypt(tokens.refresh_token) : null
         });
+        user.markModified('linkedGmailAccounts');
         await user.save();
         console.log(`[GMAIL] Linked extra account ${gmailAddress} to user ${user.email}`);
         await logActivity(user._id, 'Gmail Link Extra', `Linked extra Gmail account: ${gmailAddress}`);
@@ -220,17 +239,18 @@ exports.handleOAuthCallback = async (req, res) => {
         // Update tokens if account already exists
         const acct = user.linkedGmailAccounts.find(a => a.gmailEmail === gmailAddress);
         if (acct) {
-          acct.gmailAccessToken = tokens.access_token;
-          if (tokens.refresh_token) acct.gmailRefreshToken = tokens.refresh_token;
+          acct.gmailAccessToken = encrypt(tokens.access_token);
+          if (tokens.refresh_token) acct.gmailRefreshToken = encrypt(tokens.refresh_token);
         }
+        user.markModified('linkedGmailAccounts');
         await user.save();
         console.log(`[GMAIL] Refreshed tokens for linked account ${gmailAddress}`);
       }
     } else {
       // Save as primary Gmail account
-      user.gmailAccessToken = tokens.access_token;
+      user.gmailAccessToken = encrypt(tokens.access_token);
       if (tokens.refresh_token) {
-        user.gmailRefreshToken = tokens.refresh_token;
+        user.gmailRefreshToken = encrypt(tokens.refresh_token);
       }
       user.gmailEmail = gmailAddress;
       await user.save();
@@ -259,15 +279,16 @@ const syncAccountEmails = async (user, accessToken, refreshToken, inboxEmail, is
   oauth2Client.on('tokens', async (newTokens) => {
     if (inboxEmail === user.gmailEmail) {
       // Primary account
-      if (newTokens.access_token) user.gmailAccessToken = newTokens.access_token;
-      if (newTokens.refresh_token) user.gmailRefreshToken = newTokens.refresh_token;
+      if (newTokens.access_token) user.gmailAccessToken = encrypt(newTokens.access_token);
+      if (newTokens.refresh_token) user.gmailRefreshToken = encrypt(newTokens.refresh_token);
     } else {
       // Linked account
       const acct = user.linkedGmailAccounts.find(a => a.gmailEmail === inboxEmail);
       if (acct) {
-        if (newTokens.access_token) acct.gmailAccessToken = newTokens.access_token;
-        if (newTokens.refresh_token) acct.gmailRefreshToken = newTokens.refresh_token;
+        if (newTokens.access_token) acct.gmailAccessToken = encrypt(newTokens.access_token);
+        if (newTokens.refresh_token) acct.gmailRefreshToken = encrypt(newTokens.refresh_token);
       }
+      user.markModified('linkedGmailAccounts');
     }
     await user.save();
   });
@@ -367,8 +388,10 @@ const syncUserEmails = async (user, isManual = false) => {
   // 1. Sync primary account (if connected)
   if (user.gmailAccessToken) {
     console.log(`[GMAIL SYNC] Syncing primary account: ${user.gmailEmail}`);
+    const decryptedAccessToken = decrypt(user.gmailAccessToken);
+    const decryptedRefreshToken = decrypt(user.gmailRefreshToken);
     const count = await syncAccountEmails(
-      user, user.gmailAccessToken, user.gmailRefreshToken, user.gmailEmail, isManual
+      user, decryptedAccessToken, decryptedRefreshToken, user.gmailEmail, isManual
     );
     totalNew += count;
   }
@@ -378,8 +401,10 @@ const syncUserEmails = async (user, isManual = false) => {
     if (acct.gmailAccessToken) {
       console.log(`[GMAIL SYNC] Syncing linked account: ${acct.gmailEmail}`);
       try {
+        const decryptedAccessToken = decrypt(acct.gmailAccessToken);
+        const decryptedRefreshToken = decrypt(acct.gmailRefreshToken);
         const count = await syncAccountEmails(
-          user, acct.gmailAccessToken, acct.gmailRefreshToken, acct.gmailEmail, isManual
+          user, decryptedAccessToken, decryptedRefreshToken, acct.gmailEmail, isManual
         );
         totalNew += count;
       } catch (err) {
@@ -831,7 +856,7 @@ exports.replyToEmail = async (req, res) => {
     }
 
     const oauth2Client = getOAuth2Client();
-    oauth2Client.setCredentials({ access_token: accessToken, refresh_token: refreshToken });
+    oauth2Client.setCredentials({ access_token: decrypt(accessToken), refresh_token: decrypt(refreshToken) });
 
     const gmail = google.gmail({ version: 'v1', auth: oauth2Client });
 
@@ -1037,7 +1062,7 @@ exports.downloadAttachment = async (req, res) => {
     }
 
     const oauth2Client = getOAuth2Client();
-    oauth2Client.setCredentials({ access_token: accessToken, refresh_token: refreshToken });
+    oauth2Client.setCredentials({ access_token: decrypt(accessToken), refresh_token: decrypt(refreshToken) });
 
     const gmail = google.gmail({ version: 'v1', auth: oauth2Client });
     const attachRes = await gmail.users.messages.attachments.get({

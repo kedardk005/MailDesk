@@ -335,6 +335,7 @@ exports.changePassword = async (req, res) => {
     const hashedPassword = await bcrypt.hash(newPassword, salt);
 
     user.password = hashedPassword;
+    user.tokenVersion = (user.tokenVersion || 0) + 1;
     await user.save();
 
     await logActivity(user._id, 'Password Change', `Successfully changed account password`);

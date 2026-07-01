@@ -15,6 +15,12 @@ const {
   downloadAttachment
 } = require('../controllers/gmailController');
 const { protect, authorizeRoles } = require('../middleware/authMiddleware');
+const validate = require('../middleware/validate');
+const {
+  replyToEmailSchema,
+  bulkAssignEmailsSchema,
+  disconnectLinkedAccountSchema
+} = require('../middleware/schemas');
 
 // GET /api/gmail/auth-url - Generate Google OAuth URL (protected, Admin/Head only)
 router.get('/auth-url', protect, authorizeRoles('Admin', 'Head'), getAuthUrl);
@@ -29,10 +35,10 @@ router.post('/fetch', protect, authorizeRoles('Admin', 'Head'), fetchEmails);
 router.get('/emails', protect, authorizeRoles('Admin', 'Head'), getEmails);
 
 // POST /api/gmail/emails/:id/reply - Send a reply to an email
-router.post('/emails/:id/reply', protect, authorizeRoles('Admin', 'Head'), replyToEmail);
+router.post('/emails/:id/reply', protect, authorizeRoles('Admin', 'Head'), validate(replyToEmailSchema), replyToEmail);
 
 // POST /api/gmail/emails/bulk-assign - Bulk assign multiple emails
-router.post('/emails/bulk-assign', protect, authorizeRoles('Admin', 'Head'), bulkAssignEmails);
+router.post('/emails/bulk-assign', protect, authorizeRoles('Admin', 'Head'), validate(bulkAssignEmailsSchema), bulkAssignEmails);
 
 // DELETE /api/gmail/emails - Clear all emails (protected, Admin only)
 router.delete('/emails', protect, authorizeRoles('Admin'), deleteAllEmails);
@@ -50,6 +56,6 @@ router.get('/status', protect, getConnectedStatus);
 router.delete('/disconnect', protect, disconnectGmail);
 
 // DELETE /api/gmail/linked-account - Disconnect a specific extra linked Gmail account (Admin only)
-router.delete('/linked-account', protect, authorizeRoles('Admin'), disconnectLinkedAccount);
+router.delete('/linked-account', protect, authorizeRoles('Admin'), validate(disconnectLinkedAccountSchema), disconnectLinkedAccount);
 
 module.exports = router;
