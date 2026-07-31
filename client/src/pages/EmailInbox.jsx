@@ -840,7 +840,7 @@ const EmailInbox = () => {
                 onChange={(e) => { setSelectedAccount(e.target.value); setExpandedEmailId(null); }}
                 className="bg-white border border-slate-200 rounded-xl px-3 py-1.5 text-xs font-bold text-slate-700 focus:outline-none focus:ring-2 focus:ring-indigo-550/20 focus:border-indigo-550 cursor-pointer shadow-sm min-w-[180px]"
               >
-                <option value="all">All Accounts ({emails.length})</option>
+                <option value="all">All Accounts</option>
                 {uniqueAccounts.map((account) => (
                   <option key={account} value={account}>
                     {account}
