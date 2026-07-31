@@ -41,7 +41,7 @@ const ForgotPassword = () => {
               <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2.5" d="M15 7a2 2 0 012 2m-2-2a2 2 0 00-2 2m2-2a2 2 0 002-2m0 0a2 2 0 00-2-2m2 12a2 2 0 012-2m-2 2a2 2 0 00-2-2m2 2a2 2 0 002 2m0 0a2 2 0 00-2 2M5 18v-1a5 5 0 0110 0v1H5z" />
             </svg>
           </div>
-          <h1 className="text-5xl font-black tracking-tight leading-none">MailDesk</h1>
+          <h1 className="text-4xl font-black tracking-tight leading-none">K M KOTHARI</h1>
           <p className="text-white/80 leading-relaxed text-base font-semibold">
             Retrieve credentials securely.
           </p>

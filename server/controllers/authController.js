@@ -192,18 +192,18 @@ exports.forgotPassword = async (req, res) => {
 
     // Send email helper
     const { sendEmail } = require('../utils/emailHelper');
-    const emailSubject = 'MailDesk - Temporary Password Request';
+    const emailSubject = 'K M KOTHARI - Temporary Password Request';
     
-    const emailBody = `Hello ${user.name},\n\nYou requested a password reset for MailDesk. Use the following temporary password to log in:\n\nTemporary Password: ${tempPassword}\n\nOnce logged in, please go to your Profile to set a new password.\n\nBest regards,\nThe MailDesk Team`;
+    const emailBody = `Hello ${user.name},\n\nYou requested a password reset for K M KOTHARI. Use the following temporary password to log in:\n\nTemporary Password: ${tempPassword}\n\nOnce logged in, please go to your Profile to set a new password.\n\nBest regards,\nThe K M KOTHARI Team`;
     
     const emailHtml = `
       <div style="font-family: 'Helvetica Neue', Helvetica, Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px; border: 1px solid #e2e8f0; border-radius: 12px; background-color: #ffffff;">
         <div style="text-align: center; padding-bottom: 20px; border-bottom: 1px solid #f1f5f9;">
-          <h1 style="color: #4f46e5; margin: 0; font-size: 24px; font-weight: 800;">MailDesk</h1>
+          <h1 style="color: #4f46e5; margin: 0; font-size: 24px; font-weight: 800;">K M KOTHARI</h1>
         </div>
         <div style="padding: 20px 0;">
           <p style="font-size: 16px; line-height: 1.6; color: #334155;">Hello <strong>${user.name}</strong>,</p>
-          <p style="font-size: 16px; line-height: 1.6; color: #334155;">You requested a temporary password for your MailDesk account. Use the unique password credentials below to log in:</p>
+          <p style="font-size: 16px; line-height: 1.6; color: #334155;">You requested a temporary password for your K M KOTHARI account. Use the unique password credentials below to log in:</p>
           <div style="margin: 24px 0; padding: 16px; background-color: #f8fafc; border: 1px solid #e2e8f0; border-radius: 8px; text-align: center; font-family: monospace; font-size: 18px; font-weight: 700; color: #4f46e5; letter-spacing: 1.5px;">
             ${tempPassword}
           </div>

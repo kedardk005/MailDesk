@@ -69,7 +69,7 @@ const Navbar = ({ onToggleSidebar }) => {
               </svg>
             </div>
             <span className="font-extrabold text-sm text-slate-900 tracking-tight leading-none">
-              MailDesk
+              K M KOTHARI
             </span>
           </div>
         </div>

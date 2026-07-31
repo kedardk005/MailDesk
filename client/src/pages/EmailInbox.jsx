@@ -431,7 +431,7 @@ const EmailInbox = () => {
           </style>
         </head>
         <body>
-          <div class="title-header">MailDesk &mdash; Workspace Email Backup Report</div>
+          <div class="title-header">K M KOTHARI &mdash; Workspace Email Backup Report</div>
           <div class="subtitle">Exported on ${nowStr}</div>
 
           <table class="summary-table">
@@ -504,7 +504,7 @@ const EmailInbox = () => {
       const url = URL.createObjectURL(blob);
       const link = document.createElement('a');
       link.setAttribute('href', url);
-      link.setAttribute('download', `MailDesk_Inbox_Backup_${exportDateStr}.xls`);
+      link.setAttribute('download', `KM_KOTHARI_Inbox_Backup_${exportDateStr}.xls`);
       link.style.visibility = 'hidden';
       document.body.appendChild(link);
       link.click();

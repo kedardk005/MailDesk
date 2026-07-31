@@ -121,7 +121,7 @@ const Landing = () => {
             </svg>
           </div>
           <span className="font-extrabold text-lg text-slate-900 tracking-tight leading-none">
-            MailDesk
+            K M KOTHARI
           </span>
         </div>
         
@@ -165,7 +165,7 @@ const Landing = () => {
 
           {/* Subheading */}
           <p className="opacity-0 animate-[fadeInUp_0.8s_cubic-bezier(0.23,1,0.32,1)_forwards] [animation-delay:400ms] text-lg sm:text-xl text-slate-500 max-w-2xl mx-auto leading-relaxed mt-6">
-            MailDesk centralizes your company Gmail accounts, lets managers assign tasks directly from emails, and keeps your entire team in sync — in real time.
+            K M KOTHARI centralizes your company Gmail accounts, lets managers assign tasks directly from emails, and keeps your entire team in sync — in real time.
           </p>
 
           {/* CTA Row */}
@@ -214,7 +214,7 @@ const Landing = () => {
                       <path d="M5.45 5.11L2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.45-6.89A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11z" />
                     </svg>
                   </div>
-                  <span className="font-extrabold text-xs text-slate-900 tracking-tight">MailDesk</span>
+                  <span className="font-extrabold text-xs text-slate-900 tracking-tight">K M KOTHARI</span>
                   <div className="hidden sm:flex items-center gap-4 ml-8 text-[11px] font-bold text-slate-500">
                     <span className="text-indigo-600">Dashboard</span>
                     <span>Inbox</span>
@@ -538,7 +538,7 @@ const Landing = () => {
         <div className="max-w-3xl mx-auto px-6 relative z-10">
           <h2 className="text-4xl sm:text-5xl font-black mb-4">Your inbox is waiting.</h2>
           <p className="text-white/70 text-lg mb-10 max-w-xl mx-auto">
-            Join teams already using MailDesk to stay organized, delegate client communications, and complete workflows on time.
+            Join teams already using K M KOTHARI to stay organized, delegate client communications, and complete workflows on time.
           </p>
           <Link
             to="/register"
@@ -553,7 +553,7 @@ const Landing = () => {
       <footer className="border-t border-slate-100 py-12 px-6 sm:px-12 mt-10">
         <div className="max-w-6xl mx-auto flex flex-col md:flex-row justify-between items-center gap-6">
           <div className="flex flex-col items-center md:items-start gap-1">
-            <span className="font-extrabold text-slate-900 text-base">MailDesk</span>
+            <span className="font-extrabold text-slate-900 text-base">K M KOTHARI</span>
             <span className="text-xs text-slate-400">Where Emails Meet Action.</span>
           </div>
         </div>

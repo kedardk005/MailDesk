@@ -147,7 +147,7 @@ const Sidebar = ({ isOpen, onClose }) => {
                   <path d="M5.45 5.11L2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.45-6.89A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11z" />
                 </svg>
               </div>
-              <span className="font-bold text-slate-800 text-sm leading-none">MailDesk</span>
+              <span className="font-bold text-slate-800 text-sm leading-none">K M KOTHARI</span>
             </div>
             <button onClick={onClose} className="p-1.5 text-slate-400 hover:text-slate-605 rounded-lg">
               <svg className="h-5 w-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">

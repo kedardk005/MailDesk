@@ -1,4 +1,4 @@
-# MailDesk 📧
+# K M KOTHARI 📧
 
 ### *Where Emails Meet Action.*
 
@@ -8,7 +8,7 @@ A full-stack web application for centralized company email and task management �
 
 ## 🚀 Overview
 
-MailDesk connects your company Gmail accounts, centralizes all incoming emails, and lets managers assign tasks directly from those emails — with real-time notifications, deadline tracking, and performance reports.
+K M KOTHARI connects your company Gmail accounts, centralizes all incoming emails, and lets managers assign tasks directly from those emails — with real-time notifications, deadline tracking, and performance reports.
 
 Built with a role-based system (Admin, Head, Employee) so every team member sees exactly what they need.
 
@@ -301,7 +301,7 @@ npm run dev
 
 > ⚠️ For Nodemailer, use a Gmail **App Password** — not your regular Gmail password. Go to Google Account → Security → 2-Step Verification → App Passwords to generate one.
 
-> ⚠️ Gmail OAuth connections are Admin-only. Only Admin accounts can link Gmail inboxes to MailDesk.
+> ⚠️ Gmail OAuth connections are Admin-only. Only Admin accounts can link Gmail inboxes to K M KOTHARI.
 
 ---
 
