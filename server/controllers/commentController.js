@@ -16,9 +16,13 @@ exports.getComments = async (req, res) => {
       return res.status(403).json({ message: 'Access denied.' });
     }
 
-    // Heads can only see comments on tasks created by them
-    if (req.user.role === 'Head' && task.createdBy?.toString() !== req.user._id.toString()) {
-      return res.status(403).json({ message: 'Access denied.' });
+    // Heads can see comments on tasks created by or assigned to them
+    if (req.user.role === 'Head') {
+      const isCreator = task.createdBy && task.createdBy.toString() === req.user._id.toString();
+      const isAssignee = task.assignedTo && task.assignedTo.toString() === req.user._id.toString();
+      if (!isCreator && !isAssignee) {
+        return res.status(403).json({ message: 'Access denied.' });
+      }
     }
 
     const comments = await TaskComment.find({ taskId: req.params.id })
@@ -53,9 +57,13 @@ exports.addComment = async (req, res) => {
       return res.status(403).json({ message: 'Access denied.' });
     }
 
-    // Heads can only comment on tasks created by them
-    if (req.user.role === 'Head' && task.createdBy?._id.toString() !== req.user._id.toString()) {
-      return res.status(403).json({ message: 'Access denied.' });
+    // Heads can comment on tasks created by or assigned to them
+    if (req.user.role === 'Head') {
+      const isCreator = task.createdBy && task.createdBy._id.toString() === req.user._id.toString();
+      const isAssignee = task.assignedTo && task.assignedTo._id.toString() === req.user._id.toString();
+      if (!isCreator && !isAssignee) {
+        return res.status(403).json({ message: 'Access denied.' });
+      }
     }
 
     const comment = new TaskComment({
@@ -91,9 +99,15 @@ exports.addComment = async (req, res) => {
 
     await logActivity(req.user._id, 'Task Comment', `Commented on task "${task.title}"`);
 
-    // Emit real-time comment event to all users viewing this task
+    // Emit real-time comment event scoped to task assignee and creator rooms
     if (io) {
-      io.emit(`task:${req.params.id}:comment`, populated);
+      const eventName = `task:${req.params.id}:comment`;
+      if (task.assignedTo) {
+        io.to(task.assignedTo._id.toString()).emit(eventName, populated);
+      }
+      if (task.createdBy && (!task.assignedTo || task.createdBy._id.toString() !== task.assignedTo._id.toString())) {
+        io.to(task.createdBy._id.toString()).emit(eventName, populated);
+      }
     }
 
     return res.status(201).json(populated);
@@ -120,7 +134,7 @@ exports.deleteComment = async (req, res) => {
       isAuthorized = true;
     } else if (req.user.role === 'Head') {
       // Heads can only delete comments on tasks created by them
-      const task = await Task.findById(req.params.taskId);
+      const task = await Task.findById(req.params.id);
       if (task && task.createdBy && task.createdBy.toString() === req.user._id.toString()) {
         isAuthorized = true;
       }
@@ -134,7 +148,16 @@ exports.deleteComment = async (req, res) => {
 
     const io = req.app.get('io');
     if (io) {
-      io.emit(`task:${req.params.taskId}:commentDeleted`, { commentId: req.params.commentId });
+      // Scope event to relevant user rooms
+      const task = await Task.findById(req.params.id);
+      const eventName = `task:${req.params.id}:commentDeleted`;
+      const eventData = { commentId: req.params.commentId };
+      if (task?.assignedTo) {
+        io.to(task.assignedTo.toString()).emit(eventName, eventData);
+      }
+      if (task?.createdBy) {
+        io.to(task.createdBy.toString()).emit(eventName, eventData);
+      }
     }
 
     return res.status(200).json({ message: 'Comment deleted.' });

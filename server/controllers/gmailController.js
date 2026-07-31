@@ -4,6 +4,12 @@ const Email = require('../models/Email');
 const Task = require('../models/Task');
 const { logActivity } = require('../utils/activityLogger');
 const { encrypt, decrypt } = require('../utils/tokenCrypto');
+const { escapeRegex } = require('../utils/regexHelper');
+const KeywordRule = require('../models/KeywordRule');
+const { ensureTaskForEmail } = require('../utils/taskHelper');
+
+
+
 
 // Helper to get OAuth2 Client
 const getOAuth2Client = () => {
@@ -193,7 +199,7 @@ exports.handleOAuthCallback = async (req, res) => {
     oauth2Client.setCredentials(tokens);
     
     // Find user using Mongoose ID passed via OAuth 'state'
-    const user = await User.findById(userId);
+    const user = await User.findById(userId).select('+gmailAccessToken +gmailRefreshToken +linkedGmailAccounts');
     if (!user) {
       return res.status(404).send('User associated with OAuth session not found.');
     }
@@ -220,6 +226,22 @@ exports.handleOAuthCallback = async (req, res) => {
 
     if (!gmailAddress) {
       return res.status(400).send('Failed to fetch Gmail profile email address. Please make sure Gmail access is enabled.');
+    }
+
+    // Check Head role access restrictions
+    if (user.role === 'Head') {
+      const allowedList = (user.allowedGmailAccounts || []).map(e => e.toLowerCase().trim()).filter(Boolean);
+      if (allowedList.length > 0 && !allowedList.includes(gmailAddress.toLowerCase().trim())) {
+        return res.status(403).send(`Access denied. Admin has not authorized the Gmail account (${gmailAddress}) for your Head user profile.`);
+      }
+
+      const isExistingAccount = user.gmailEmail === gmailAddress || (user.linkedGmailAccounts || []).some(a => a.gmailEmail === gmailAddress);
+      const currentAccountCount = (user.gmailEmail ? 1 : 0) + (user.linkedGmailAccounts ? user.linkedGmailAccounts.length : 0);
+      const maxLimit = user.maxConnectedAccounts !== undefined ? user.maxConnectedAccounts : 5;
+
+      if (!isExistingAccount && currentAccountCount >= maxLimit) {
+        return res.status(403).send(`Account limit reached. Admin has restricted your Head account to a maximum of ${maxLimit} connected Gmail account(s).`);
+      }
     }
 
     if (isExtra) {
@@ -297,18 +319,22 @@ const syncAccountEmails = async (user, accessToken, refreshToken, inboxEmail, is
 
   const listRes = await gmail.users.messages.list({
     userId: 'me',
-    maxResults: 50,
+    maxResults: 150,
     includeSpamTrash: true
   });
 
   const messages = listRes.data.messages || [];
   console.log(`[GMAIL SYNC] ${inboxEmail}: ${messages.length} messages found.`);
 
+  // Batch check which messages already exist in our DB (avoids N+1)
+  const messageIds = messages.map(m => m.id);
+  const existingEmails = await Email.find({ messageId: { $in: messageIds } }, 'messageId');
+  const existingIds = new Set(existingEmails.map(e => e.messageId));
+
   let newCount = 0;
 
   for (const message of messages) {
-    const exists = await Email.findOne({ messageId: message.id });
-    if (exists) continue;
+    if (existingIds.has(message.id)) continue;
 
     const msgDetails = await gmail.users.messages.get({ userId: 'me', id: message.id });
     const payload = msgDetails.data.payload;
@@ -357,21 +383,59 @@ const syncAccountEmails = async (user, accessToken, refreshToken, inboxEmail, is
 
     const attachments = getAttachmentsList(payload);
 
+    // Evaluate active keyword rules against email subject and body
+    let matchedKeyword = null;
+    let suggestedAssignedTo = null;
+    let approvalStatus = 'none';
+    let assignedTo = null;
+    let status = 'unassigned';
+
+    try {
+      const activeRules = await KeywordRule.find({ isActive: true });
+      if (activeRules.length > 0) {
+        const textToSearch = `${subject} ${decodedBody}`;
+        for (const rule of activeRules) {
+          const regex = new RegExp(`\\b${escapeRegex(rule.keyword)}\\b`, 'i');
+          if (regex.test(textToSearch)) {
+            matchedKeyword = rule.keyword;
+            suggestedAssignedTo = rule.assignedTo;
+            if (rule.autoApprove) {
+              assignedTo = rule.assignedTo;
+              status = 'assigned';
+              approvalStatus = 'approved';
+            } else {
+              approvalStatus = 'pending';
+            }
+            console.log(`[KEYWORD MATCH] Email "${subject}" matched keyword "${rule.keyword}"`);
+            break;
+          }
+        }
+      }
+    } catch (ruleErr) {
+      console.error('[KEYWORD EVAL ERROR]', ruleErr);
+    }
+
     const emailRecord = new Email({
       messageId: message.id,
       subject,
       from,
       date,
       body: decodedBody,
-      status: 'unassigned',
-      assignedTo: null,
+      status,
+      assignedTo,
       fetchedBy: user._id,
       labelIds,
       toEmail: inboxEmail,
-      attachments
+      attachments,
+      matchedKeyword,
+      suggestedAssignedTo,
+      approvalStatus
     });
 
     await emailRecord.save();
+    if (emailRecord.status === 'assigned' && emailRecord.assignedTo) {
+      await ensureTaskForEmail(emailRecord, emailRecord.assignedTo, user._id);
+    }
     console.log(`[GMAIL SYNC] Saved: "${subject}" to ${inboxEmail}`);
     newCount++;
   }
@@ -438,7 +502,7 @@ exports.fetchEmails = async (req, res) => {
       // Find all users who have a connected Gmail account
       const users = await User.find({
         gmailAccessToken: { $ne: null, $ne: "" }
-      });
+      }).select('+gmailAccessToken +gmailRefreshToken +linkedGmailAccounts');
 
       if (users.length > 0) {
         for (const u of users) {
@@ -453,13 +517,13 @@ exports.fetchEmails = async (req, res) => {
       }
     } else if (req.user.role === 'Head') {
       // Sync only the current Head's own emails
-      const user = await User.findById(req.user._id);
+      const user = await User.findById(req.user._id).select('+gmailAccessToken +gmailRefreshToken +linkedGmailAccounts');
       if (!user || !user.gmailAccessToken) {
         return res.status(400).json({ message: 'Gmail account not connected. Please authenticate first.' });
       }
       totalCount = await syncUserEmails(user, true);
     } else {
-      const user = await User.findById(req.user._id);
+      const user = await User.findById(req.user._id).select('+gmailAccessToken +gmailRefreshToken +linkedGmailAccounts');
       if (!user || !user.gmailAccessToken) {
         console.log('Fetch abort: user or gmailAccessToken missing in DB.');
         return res.status(400).json({ message: 'Gmail account not connected. Please authenticate first.' });
@@ -490,7 +554,7 @@ exports.getEmails = async (req, res) => {
 
     // If search query provided, add text search across subject and from fields
     if (q && q.trim()) {
-      const searchRegex = new RegExp(q.trim(), 'i');
+      const searchRegex = new RegExp(escapeRegex(q.trim()), 'i');
       const searchConditions = [
         { subject: searchRegex },
         { from: searchRegex }
@@ -568,7 +632,7 @@ exports.getConnectedStatus = async (req, res) => {
     // Clean up duplicates and blanks first
     await deduplicateConnections();
 
-    const currentUser = await User.findById(req.user._id);
+    const currentUser = await User.findById(req.user._id).select('+gmailAccessToken +linkedGmailAccounts');
     if (!currentUser) {
       return res.status(404).json({ message: "User not found" });
     }
@@ -577,7 +641,7 @@ exports.getConnectedStatus = async (req, res) => {
     // Non-Admin users only see their own primary account status (if connected) and no linked accounts
     let linkedAccounts = [];
 
-    if (currentUser.role === 'Admin') {
+    if (currentUser.role === 'Admin' || currentUser.role === 'Head') {
       linkedAccounts = (currentUser.linkedGmailAccounts || []).map(a => ({
         gmailEmail: a.gmailEmail,
         connected: !!a.gmailAccessToken,
@@ -585,12 +649,15 @@ exports.getConnectedStatus = async (req, res) => {
         isOtherUser: false,
         userId: currentUser._id.toString()
       }));
+    }
+
+    if (currentUser.role === 'Admin') {
 
       // Find other users with connected accounts
       const otherUsers = await User.find({
         _id: { $ne: currentUser._id },
         gmailAccessToken: { $ne: null, $ne: "" }
-      });
+      }).select('+gmailAccessToken +linkedGmailAccounts');
 
       for (const u of otherUsers) {
         // Add their primary account
@@ -642,7 +709,7 @@ exports.disconnectLinkedAccount = async (req, res) => {
       targetUserId = userId;
     }
 
-    const user = await User.findById(targetUserId);
+    const user = await User.findById(targetUserId).select('+gmailAccessToken +gmailRefreshToken +linkedGmailAccounts');
     if (!user) {
       return res.status(404).json({ message: 'User not found.' });
     }
@@ -710,7 +777,7 @@ exports.disconnectGmail = async (req, res) => {
     const userId = req.user._id;
 
     // 1. Clear user tokens in DB
-    const user = await User.findById(userId);
+    const user = await User.findById(userId).select('+gmailAccessToken +gmailRefreshToken +linkedGmailAccounts');
     if (!user) {
       return res.status(404).json({ message: "User not found" });
     }
@@ -746,7 +813,7 @@ exports.disconnectGmail = async (req, res) => {
 // Workspace-wide deduplication and cleanup helper
 const deduplicateConnections = async () => {
   try {
-    const users = await User.find({});
+    const users = await User.find({}).select('+gmailAccessToken +gmailRefreshToken +linkedGmailAccounts');
     const seenEmails = new Set();
 
     for (const u of users) {
@@ -815,7 +882,7 @@ exports.replyToEmail = async (req, res) => {
 
     // Find the user who owns the account this email arrived on (toEmail)
     // It could be their primary or a linked account
-    const user = await User.findById(req.user._id);
+    const user = await User.findById(req.user._id).select('+gmailAccessToken +gmailRefreshToken +linkedGmailAccounts');
     if (!user) return res.status(404).json({ message: 'User not found.' });
 
     let accessToken = null;
@@ -835,7 +902,7 @@ exports.replyToEmail = async (req, res) => {
 
     // If this user doesn't own the inbox, find the Admin who does
     if (!accessToken) {
-      const allAdmins = await User.find({ role: 'Admin' });
+      const allAdmins = await User.find({ role: 'Admin' }).select('+gmailAccessToken +gmailRefreshToken +linkedGmailAccounts');
       for (const admin of allAdmins) {
         if (admin.gmailEmail === targetInbox) {
           accessToken = admin.gmailAccessToken;
@@ -1019,7 +1086,7 @@ exports.downloadAttachment = async (req, res) => {
     }
 
     // Find user context to get Gmail oauth credentials
-    const fetcher = await User.findById(email.fetchedBy);
+    const fetcher = await User.findById(email.fetchedBy).select('+gmailAccessToken +gmailRefreshToken +linkedGmailAccounts');
     if (!fetcher) {
       return res.status(404).json({ message: 'Email fetcher user context not found.' });
     }
@@ -1041,7 +1108,7 @@ exports.downloadAttachment = async (req, res) => {
 
     // Fallback to Admin credentials
     if (!accessToken) {
-      const allAdmins = await User.find({ role: 'Admin' });
+      const allAdmins = await User.find({ role: 'Admin' }).select('+gmailAccessToken +gmailRefreshToken +linkedGmailAccounts');
       for (const admin of allAdmins) {
         if (admin.gmailEmail === targetInbox) {
           accessToken = admin.gmailAccessToken;

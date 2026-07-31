@@ -1,6 +1,7 @@
 const User = require('../models/User');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
+const crypto = require('crypto');
 const { logActivity } = require('../utils/activityLogger');
 
 /**
@@ -42,14 +43,14 @@ exports.registerUser = async (req, res) => {
     // Lock down registration and role assignment
     const totalUsers = await User.countDocuments({});
     let finalRole = 'Employee';
-    let status = 'Approved';
+    let status = 'Pending'; // Self-registered users require Admin approval
 
-    if (role === 'Admin') {
-      if (totalUsers === 0) {
-        finalRole = 'Admin';
-      } else {
-        return res.status(400).json({ message: 'Registration as Admin is only allowed for the first user.' });
-      }
+    if (totalUsers === 0) {
+      // First user in the system becomes Admin with auto-approval
+      finalRole = 'Admin';
+      status = 'Approved';
+    } else if (role === 'Admin') {
+      return res.status(400).json({ message: 'Registration as Admin is only allowed for the first user.' });
     }
 
     // Save new user to MongoDB
@@ -102,7 +103,7 @@ exports.loginUser = async (req, res) => {
 
     // Find user by email
     const emailNormalized = email.toLowerCase().trim();
-    const user = await User.findOne({ email: emailNormalized });
+    const user = await User.findOne({ email: emailNormalized }).select('+password');
     if (!user) {
       return res.status(400).json({ message: 'Invalid credentials. User not found.' });
     }
@@ -160,19 +161,20 @@ exports.forgotPassword = async (req, res) => {
     }
 
     const emailNormalized = email.toLowerCase().trim();
-    const user = await User.findOne({ email: emailNormalized });
+    const user = await User.findOne({ email: emailNormalized }).select('+password');
     
     // For security reasons, do not explicitly confirm if user does not exist
     if (!user) {
       return res.status(200).json({ message: 'If a user with this email exists, a temporary password has been sent to it.' });
     }
 
-    // Generate unique random password of 10 characters
+    // Generate cryptographically secure random password of 12 characters
     const generateTempPassword = () => {
       const chars = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#$';
+      const bytes = crypto.randomBytes(12);
       let pass = '';
-      for (let i = 0; i < 10; i++) {
-        pass += chars.charAt(Math.floor(Math.random() * chars.length));
+      for (let i = 0; i < 12; i++) {
+        pass += chars.charAt(bytes[i] % chars.length);
       }
       return pass;
     };

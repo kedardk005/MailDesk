@@ -1,6 +1,11 @@
 const User = require('../models/User');
 const bcrypt = require('bcryptjs');
 const ActivityLog = require('../models/ActivityLog');
+const Task = require('../models/Task');
+const Email = require('../models/Email');
+const Notification = require('../models/Notification');
+const TaskComment = require('../models/TaskComment');
+const KeywordRule = require('../models/KeywordRule');
 const { logActivity } = require('../utils/activityLogger');
 
 // @desc    Get all users
@@ -92,12 +97,24 @@ exports.createUser = async (req, res) => {
 // @access  Private/Admin
 exports.updateUser = async (req, res) => {
   try {
-    const { name, email, role, status } = req.body;
+    const { name, email, role, status, maxConnectedAccounts, allowedGmailAccounts } = req.body;
 
     // Find user
     const user = await User.findById(req.params.id);
     if (!user) {
       return res.status(404).json({ message: 'User not found.' });
+    }
+
+    if (maxConnectedAccounts !== undefined) {
+      user.maxConnectedAccounts = Number(maxConnectedAccounts) >= 0 ? Number(maxConnectedAccounts) : 5;
+    }
+
+    if (allowedGmailAccounts !== undefined) {
+      user.allowedGmailAccounts = Array.isArray(allowedGmailAccounts)
+        ? allowedGmailAccounts.map((e) => e.trim()).filter(Boolean)
+        : typeof allowedGmailAccounts === 'string'
+        ? allowedGmailAccounts.split(',').map((e) => e.trim()).filter(Boolean)
+        : [];
     }
 
     // Validate role if updated (must be Admin, Head, or Employee)
@@ -227,6 +244,24 @@ exports.deleteUser = async (req, res) => {
       return res.status(404).json({ message: 'User not found.' });
     }
 
+    const userId = user._id;
+
+    // Cascade cleanup: reassign or remove related data
+    // 1. Unassign tasks assigned to this user (don't delete — keep history)
+    await Task.updateMany({ assignedTo: userId }, { $set: { assignedTo: null } });
+    // 2. Unlink emails assigned to this user
+    await Email.updateMany({ assignedTo: userId }, { $set: { assignedTo: null, status: 'unassigned' } });
+    // 3. Delete notifications for this user
+    await Notification.deleteMany({ userId });
+    // 4. Delete activity logs for this user
+    await ActivityLog.deleteMany({ userId });
+    // 5. Delete task comments authored by this user
+    await TaskComment.deleteMany({ author: userId });
+    // 6. Delete keyword rules created by this user
+    await KeywordRule.deleteMany({ createdBy: userId });
+    // 7. Unassign keyword rules targeting this user
+    await KeywordRule.updateMany({ assignedTo: userId }, { $set: { assignedTo: null, isActive: false } });
+
     await User.findByIdAndDelete(req.params.id);
 
     return res.status(200).json({ message: 'User deleted successfully.' });
@@ -319,7 +354,7 @@ exports.changePassword = async (req, res) => {
       return res.status(400).json({ message: 'Current password and new password are required.' });
     }
 
-    const user = await User.findById(req.user._id);
+    const user = await User.findById(req.user._id).select('+password');
     if (!user) {
       return res.status(404).json({ message: 'User not found.' });
     }

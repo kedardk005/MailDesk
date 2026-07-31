@@ -37,7 +37,13 @@ const generalLimiter = rateLimit({
 app.use(helmet());
 app.use(cors({ origin: process.env.FRONTEND_URL || 'http://localhost:5173' }));
 app.use(express.json());
-app.use(mongoSanitize());
+app.use((req, res, next) => {
+  if (req.body) mongoSanitize.sanitize(req.body);
+  if (req.params) mongoSanitize.sanitize(req.params);
+  if (req.headers) mongoSanitize.sanitize(req.headers);
+  if (req.query) mongoSanitize.sanitize(req.query);
+  next();
+});
 
 // Apply Limiters to routes
 app.use('/api', generalLimiter);
@@ -84,9 +90,35 @@ app.use('/api/reports', reportsRoutes);
 const aiRoutes = require('./routes/aiRoutes');
 app.use('/api/ai', aiRoutes);
 
+// Client routes
+const clientRoutes = require('./routes/clientRoutes');
+app.use('/api/clients', clientRoutes);
+
+// Keyword rule routes
+const keywordRuleRoutes = require('./routes/keywordRuleRoutes');
+app.use('/api/keyword-rules', keywordRuleRoutes);
+
 // Protected test route - returns logged-in user profile
 app.get('/api/auth/me', protect, (req, res) => {
   res.json(req.user);
+});
+
+// Global Express Error Handler
+app.use((err, req, res, next) => {
+  console.error('[EXPRESS ERROR HANDLER]', err.stack || err);
+  const statusCode = err.status || 500;
+  // Only expose error message for client errors (4xx); use generic message for server errors (5xx)
+  const message = statusCode < 500 ? err.message : 'Internal Server Error';
+  res.status(statusCode).json({ message });
+});
+
+// Process-level Crash Prevention: catch unhandled rejections & uncaught exceptions
+process.on('unhandledRejection', (reason, promise) => {
+  console.error('[UNHANDLED REJECTION]', reason);
+});
+
+process.on('uncaughtException', (err) => {
+  console.error('[UNCAUGHT EXCEPTION]', err);
 });
 
 // Create HTTP server

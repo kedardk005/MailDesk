@@ -6,9 +6,29 @@ import { initTilt } from '../utils/tiltEffect';
 const Dashboard = () => {
   const [fetching, setFetching] = useState(false);
   const [alert, setAlert] = useState({ type: '', message: '' });
-  const [tasks, setTasks] = useState([]);
-  const [overallStats, setOverallStats] = useState(null);
-  const [statsLoading, setStatsLoading] = useState(true);
+  const [tasks, setTasks] = useState(() => {
+    try {
+      const cached = localStorage.getItem('cached_dashboard_tasks');
+      return cached ? JSON.parse(cached) : [];
+    } catch {
+      return [];
+    }
+  });
+  const [overallStats, setOverallStats] = useState(() => {
+    try {
+      const cached = localStorage.getItem('cached_dashboard_stats');
+      return cached ? JSON.parse(cached) : null;
+    } catch {
+      return null;
+    }
+  });
+  const [statsLoading, setStatsLoading] = useState(() => {
+    try {
+      return !localStorage.getItem('cached_dashboard_stats') && !localStorage.getItem('cached_dashboard_tasks');
+    } catch {
+      return true;
+    }
+  });
   const [gmailStatus, setGmailStatus] = useState({ connected: false, gmailEmail: '' });
   const containerRef = useRef(null);
 
@@ -34,14 +54,16 @@ const Dashboard = () => {
   }
 
   const fetchDashboardData = async () => {
-    setStatsLoading(true);
+    setStatsLoading(prev => !overallStats && tasks.length === 0 ? true : false);
     try {
       if (user.role === 'Admin' || user.role === 'Head') {
         const statsRes = await api.get('/reports/overall');
         setOverallStats(statsRes.data);
+        localStorage.setItem('cached_dashboard_stats', JSON.stringify(statsRes.data));
       } else {
         const tasksRes = await api.get('/tasks');
         setTasks(tasksRes.data);
+        localStorage.setItem('cached_dashboard_tasks', JSON.stringify(tasksRes.data));
       }
     } catch (err) {
       console.error('Error loading dashboard stats:', err);

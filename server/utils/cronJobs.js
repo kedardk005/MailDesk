@@ -81,7 +81,7 @@ const startCronJobs = (io) => {
           { gmailAccessToken: { $ne: null, $exists: true, $ne: "" } },
           { 'linkedGmailAccounts.0': { $exists: true } }
         ]
-      });
+      }).select('+gmailAccessToken +gmailRefreshToken +linkedGmailAccounts');
 
       if (users.length === 0) {
         console.log('[CRON] No users with connected Gmail accounts found for auto-sync.');

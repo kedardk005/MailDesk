@@ -5,26 +5,60 @@ const Client = require('../models/Client');
  */
 const seedClients = async () => {
   const sampleClients = [
-    "Reliance Industries",
-    "Tata Consultancy",
-    "Infosys",
-    "HDFC Bank",
-    "Wipro",
-    "HCL Technologies",
-    "Mahindra Group",
-    "Bajaj Auto",
-    "ICICI Bank",
-    "Adani Group"
+    {
+      name: "Reliance Industries",
+      contactPerson: "Mukesh Sharma",
+      email: "contact@reliance.com",
+      phone: "+91 98200 11223",
+      associatedEmails: ["billing@reliance.com", "support@reliance.com"],
+      notes: "Enterprise client for logistics and cloud infrastructure.",
+      status: "Active"
+    },
+    {
+      name: "Tata Consultancy",
+      contactPerson: "Rajesh Nambiar",
+      email: "info@tcs.com",
+      phone: "+91 98111 22334",
+      associatedEmails: ["projects@tcs.com", "accounts@tcs.com"],
+      notes: "Strategic IT services partner.",
+      status: "Active"
+    },
+    {
+      name: "Infosys",
+      contactPerson: "Salil Mehta",
+      email: "connect@infosys.com",
+      phone: "+91 98333 44556",
+      associatedEmails: ["vendor@infosys.com"],
+      notes: "Digital transformation projects.",
+      status: "Active"
+    },
+    {
+      name: "HDFC Bank",
+      contactPerson: "Sashi Varma",
+      email: "corporate@hdfcbank.com",
+      phone: "+91 98444 55667",
+      associatedEmails: ["payments@hdfcbank.com"],
+      notes: "Financial services and banking integration.",
+      status: "Active"
+    },
+    {
+      name: "Wipro",
+      contactPerson: "Thierry Delaporte",
+      email: "help@wipro.com",
+      phone: "+91 98555 66778",
+      associatedEmails: ["leads@wipro.com"],
+      notes: "Global technology consulting.",
+      status: "Active"
+    }
   ];
 
   try {
-    for (const name of sampleClients) {
-      // Check if client name already exists
-      const exists = await Client.findOne({ name });
+    for (const item of sampleClients) {
+      const exists = await Client.findOne({ name: item.name });
       if (!exists) {
-        const client = new Client({ name });
+        const client = new Client(item);
         await client.save();
-        console.log(`Seeded client: ${name}`);
+        console.log(`Seeded client: ${item.name}`);
       }
     }
     console.log("Client seeding checks completed successfully.");

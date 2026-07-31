@@ -19,6 +19,18 @@ const ManageUsers = () => {
   const [editUser, setEditUser] = useState({ id: '', name: '', email: '', role: 'Employee', status: 'Approved' });
   const [deleteUserId, setDeleteUserId] = useState('');
 
+  // Client states
+  const [subTab, setSubTab] = useState('users'); // 'users' | 'clients'
+  const [clients, setClients] = useState([]);
+  const [isAddClientOpen, setIsAddClientOpen] = useState(false);
+  const [isEditClientOpen, setIsEditClientOpen] = useState(false);
+  const [selectedClient, setSelectedClient] = useState(null);
+  
+  const [newClientName, setNewClientName] = useState('');
+  const [newClientEmails, setNewClientEmails] = useState('');
+  const [editClientName, setEditClientName] = useState('');
+  const [editClientEmails, setEditClientEmails] = useState('');
+
   const navigate = useNavigate();
 
   useEffect(() => {
@@ -31,6 +43,7 @@ const ManageUsers = () => {
       }
     }
     fetchUsers();
+    fetchClients();
   }, []);
 
   const triggerAlert = (type, message) => {
@@ -90,7 +103,9 @@ const ManageUsers = () => {
         name: editUser.name,
         email: editUser.email,
         role: editUser.role,
-        status: editUser.status
+        status: editUser.status,
+        maxConnectedAccounts: editUser.maxConnectedAccounts,
+        allowedGmailAccounts: editUser.allowedGmailAccounts
       });
       triggerAlert('success', `User '${editUser.name}' updated successfully.`);
       setIsEditOpen(false);
@@ -146,13 +161,102 @@ const ManageUsers = () => {
     }
   };
 
+  const fetchClients = async () => {
+    try {
+      const response = await api.get('/tasks/clients');
+      setClients(response.data);
+    } catch (err) {
+      console.error('Failed to fetch clients:', err);
+      triggerAlert('error', 'Failed to retrieve clients list.');
+    }
+  };
+
+  const handleAddClient = async (e) => {
+    e.preventDefault();
+    if (!newClientName.trim()) {
+      triggerAlert('error', 'Client Name is required.');
+      return;
+    }
+
+    const emailArray = newClientEmails
+      .split(',')
+      .map(email => email.trim())
+      .filter(email => email.length > 0);
+
+    setActionLoading(true);
+    try {
+      await api.post('/tasks/clients', {
+        name: newClientName,
+        associatedEmails: emailArray
+      });
+      triggerAlert('success', `Client '${newClientName}' added successfully.`);
+      setIsAddClientOpen(false);
+      setNewClientName('');
+      setNewClientEmails('');
+      fetchClients();
+    } catch (err) {
+      console.error('Error creating client:', err);
+      triggerAlert('error', err.response?.data?.message || 'Failed to add client.');
+    } finally {
+      setActionLoading(false);
+    }
+  };
+
+  const handleEditClient = async (e) => {
+    e.preventDefault();
+    if (!editClientName.trim()) {
+      triggerAlert('error', 'Client Name is required.');
+      return;
+    }
+
+    const emailArray = editClientEmails
+      .split(',')
+      .map(email => email.trim())
+      .filter(email => email.length > 0);
+
+    setActionLoading(true);
+    try {
+      await api.put(`/tasks/clients/${selectedClient._id}`, {
+        name: editClientName,
+        associatedEmails: emailArray
+      });
+      triggerAlert('success', `Client '${editClientName}' updated successfully.`);
+      setIsEditClientOpen(false);
+      setSelectedClient(null);
+      fetchClients();
+    } catch (err) {
+      console.error('Error updating client:', err);
+      triggerAlert('error', err.response?.data?.message || 'Failed to update client.');
+    } finally {
+      setActionLoading(false);
+    }
+  };
+
+  const handleDeleteClient = async (clientId, clientName) => {
+    if (!window.confirm(`Are you sure you want to permanently delete client '${clientName}'?`)) return;
+
+    setActionLoading(true);
+    try {
+      await api.delete(`/tasks/clients/${clientId}`);
+      triggerAlert('success', `Client '${clientName}' deleted successfully.`);
+      fetchClients();
+    } catch (err) {
+      console.error('Error deleting client:', err);
+      triggerAlert('error', err.response?.data?.message || 'Failed to delete client.');
+    } finally {
+      setActionLoading(false);
+    }
+  };
+
   const openEditModal = (user) => {
     setEditUser({
       id: user._id,
       name: user.name,
       email: user.email,
       role: user.role,
-      status: user.status || 'Approved'
+      status: user.status || 'Approved',
+      maxConnectedAccounts: user.maxConnectedAccounts !== undefined ? user.maxConnectedAccounts : 5,
+      allowedGmailAccounts: Array.isArray(user.allowedGmailAccounts) ? user.allowedGmailAccounts : []
     });
     setIsEditOpen(true);
   };
@@ -167,13 +271,39 @@ const ManageUsers = () => {
     return name.split(' ').map(n => n[0]).join('').toUpperCase().slice(0, 2);
   };
 
+  const allSystemGmailAccounts = Array.from(
+    new Set(
+      users.flatMap(u => [
+        u.gmailEmail,
+        ...(u.linkedGmailAccounts || []).map(a => a.gmailEmail)
+      ]).filter(Boolean)
+    )
+  );
+
   return (
     <main className="flex-grow max-w-7xl w-full mx-auto px-4 sm:px-6 lg:px-8 py-8 relative animate-fade-in select-none">
       {/* Admin Submenu Tabs */}
       <div className="flex justify-start items-center space-x-6 mb-8 border-b border-slate-200 pb-4">
-        <Link to="/admin/users" className="text-sm font-bold text-indigo-600 border-b-2 border-indigo-600 pb-4 -mb-[17px] transition-all">
+        <button
+          onClick={() => setSubTab('users')}
+          className={`text-sm pb-4 -mb-[17px] transition-all focus:outline-none border-b-2 ${
+            subTab === 'users'
+              ? 'font-bold text-indigo-600 border-indigo-600'
+              : 'font-semibold text-slate-500 hover:text-slate-800 border-transparent'
+          }`}
+        >
           Manage Users
-        </Link>
+        </button>
+        <button
+          onClick={() => setSubTab('clients')}
+          className={`text-sm pb-4 -mb-[17px] transition-all focus:outline-none border-b-2 ${
+            subTab === 'clients'
+              ? 'font-bold text-indigo-600 border-indigo-600'
+              : 'font-semibold text-slate-500 hover:text-slate-800 border-transparent'
+          }`}
+        >
+          Manage Clients
+        </button>
         <Link to="/admin/activities" className="text-sm font-semibold text-slate-500 hover:text-slate-800 pb-4 -mb-[17px] transition-all">
           Activity Logs
         </Link>
@@ -197,150 +327,254 @@ const ManageUsers = () => {
         </div>
       )}
 
-      {/* Page Header */}
-      <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between mb-8 gap-4">
-        <div>
-          <h1 className="text-3xl font-extrabold text-slate-800 tracking-tight">User Management</h1>
-          <p className="text-slate-500 text-sm mt-1">
-            Manage workspace users, roles, and permissions
-          </p>
-        </div>
-        <button
-          onClick={() => setIsAddOpen(true)}
-          className="px-5 py-3 rounded-xl bg-indigo-600 hover:bg-indigo-700 text-xs font-bold text-white shadow-md active:scale-[0.98] transition-all flex items-center justify-center space-x-2"
-        >
-          <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M12 6v6m0 0v6m0-6h6m-6 0H6" />
-          </svg>
-          <span>Add User</span>
-        </button>
-      </div>
-
-      {/* Users Table */}
-      <div className="bg-white rounded-2xl shadow-sm border border-slate-200 overflow-hidden hover-glow-card transition-all duration-300">
-        {loading ? (
-          <div className="space-y-4 p-6">
-            {[...Array(4)].map((_, i) => (
-              <div key={i} className="h-16 bg-white border border-slate-200/80 rounded-xl p-4 skeleton-shimmer" />
-            ))}
-          </div>
-        ) : users.length === 0 ? (
-          <div className="text-center py-20">
-            <div className="w-14 h-14 mx-auto bg-slate-50 rounded-2xl flex items-center justify-center mb-4 border border-slate-100">
-              <svg className="w-6 h-6 text-slate-405" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M12 4.354a4 4 0 110 5.292M15 21H3v-1a6 6 0 0112 0v1zm0 0h6v-1a6 6 0 00-9-5.197M13 7a3 3 0 11-6 0 3 3 0 016 0z" />
-              </svg>
+      {subTab === 'users' && (
+        <>
+          {/* Page Header */}
+          <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between mb-8 gap-4">
+            <div>
+              <h1 className="text-3xl font-extrabold text-slate-800 tracking-tight">User Management</h1>
+              <p className="text-slate-500 text-sm mt-1">
+                Manage workspace users, roles, and permissions
+              </p>
             </div>
-            <h3 className="text-md font-bold text-slate-800 mb-1">No users found</h3>
-            <p className="text-xs text-slate-500">Get started by creating a new user account.</p>
+            <button
+              onClick={() => setIsAddOpen(true)}
+              className="px-5 py-3 rounded-xl bg-indigo-600 hover:bg-indigo-700 text-xs font-bold text-white shadow-md active:scale-[0.98] transition-all flex items-center justify-center space-x-2"
+            >
+              <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M12 6v6m0 0v6m0-6h6m-6 0H6" />
+              </svg>
+              <span>Add User</span>
+            </button>
           </div>
-        ) : (
-          <div className="overflow-x-auto">
-            <table className="min-w-full divide-y divide-slate-100">
-              <thead className="bg-slate-50/50 text-left text-xs font-semibold text-slate-500 uppercase tracking-wider">
-                <tr>
-                  <th scope="col" className="px-6 py-4">User</th>
-                  <th scope="col" className="px-6 py-4">Email</th>
-                  <th scope="col" className="px-6 py-4">Role</th>
-                  <th scope="col" className="px-6 py-4">Status</th>
-                  <th scope="col" className="px-6 py-4 text-right">Actions</th>
-                </tr>
-              </thead>
-              <tbody className="bg-white divide-y divide-slate-100 text-sm">
-                {users.map((user) => {
-                  const isSelf = currentUser && currentUser._id === user._id;
-                  const initials = getInitials(user.name);
-                  
-                  // Role label color
-                  let roleClass = 'bg-indigo-50 border-indigo-100 text-indigo-650';
-                  if (user.role === 'Admin') {
-                    roleClass = 'bg-red-50 border-red-100 text-red-600';
-                  } else if (user.role === 'Head') {
-                    roleClass = 'bg-purple-50 border-purple-100 text-purple-650';
-                  }
 
-                  // Status label color
-                  let statusClass = 'bg-emerald-50 border-emerald-100 text-emerald-600';
-                  if (user.status === 'Pending') {
-                    statusClass = 'bg-amber-50 border-amber-100 text-amber-600 animate-pulse';
-                  } else if (user.status === 'Rejected') {
-                    statusClass = 'bg-red-50 border-red-100 text-red-600';
-                  }
-
-                  return (
-                    <tr key={user._id} className="hover:bg-slate-50 transition-colors duration-150">
-                      <td className="px-6 py-4 whitespace-nowrap">
-                        <div className="flex items-center">
-                          <div className="w-9 h-9 bg-indigo-50 border border-indigo-100 rounded-full flex items-center justify-center text-indigo-600 font-extrabold text-sm shrink-0">
-                            {initials}
-                          </div>
-                          <div className="ml-3">
-                            <p className="text-sm font-bold text-slate-800">
-                              {user.name}
-                              {isSelf && <span className="ml-2 text-[10px] bg-slate-105 border border-slate-200 text-slate-500 px-2 py-0.5 rounded-full font-normal">(You)</span>}
-                            </p>
-                          </div>
-                        </div>
-                      </td>
-                      <td className="px-6 py-4 whitespace-nowrap text-slate-600">
-                        {user.email}
-                      </td>
-                      <td className="px-6 py-4 whitespace-nowrap">
-                        <span className={`inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-bold border ${roleClass}`}>
-                          {user.role}
-                        </span>
-                      </td>
-                      <td className="px-6 py-4 whitespace-nowrap">
-                        <span className={`inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-bold border ${statusClass}`}>
-                          {user.status || 'Approved'}
-                        </span>
-                      </td>
-                      <td className="px-6 py-4 whitespace-nowrap text-right space-x-3">
-                        {user.status === 'Pending' && (
-                          <>
-                            <button
-                              onClick={() => handleUpdateStatus(user._id, 'Approved', user.name)}
-                              disabled={actionLoading}
-                              className="text-emerald-600 hover:text-emerald-700 text-sm font-semibold transition-colors"
-                            >
-                              Approve
-                            </button>
-                            <button
-                              onClick={() => handleUpdateStatus(user._id, 'Rejected', user.name)}
-                              disabled={actionLoading}
-                              className="text-red-500 hover:text-red-600 text-sm font-semibold transition-colors"
-                            >
-                              Reject
-                            </button>
-                          </>
-                        )}
-                        <button
-                          onClick={() => openEditModal(user)}
-                          className="text-indigo-600 hover:text-indigo-700 text-sm font-semibold transition-colors"
-                        >
-                          Edit
-                        </button>
-                        <button
-                          onClick={() => openDeleteModal(user._id)}
-                          disabled={isSelf}
-                          className={`text-sm font-semibold transition-colors ${
-                            isSelf
-                              ? 'text-slate-300 cursor-not-allowed'
-                              : 'text-red-500 hover:text-red-600'
-                          }`}
-                          title={isSelf ? 'Cannot delete own account' : 'Delete user'}
-                        >
-                          Delete
-                        </button>
-                      </td>
+          {/* Users Table */}
+          <div className="bg-white rounded-2xl shadow-sm border border-slate-200 overflow-hidden hover-glow-card transition-all duration-300">
+            {loading ? (
+              <div className="space-y-4 p-6">
+                {[...Array(4)].map((_, i) => (
+                  <div key={i} className="h-16 bg-white border border-slate-200/80 rounded-xl p-4 skeleton-shimmer" />
+                ))}
+              </div>
+            ) : users.length === 0 ? (
+              <div className="text-center py-20">
+                <div className="w-14 h-14 mx-auto bg-slate-50 rounded-2xl flex items-center justify-center mb-4 border border-slate-100">
+                  <svg className="w-6 h-6 text-slate-405" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M12 4.354a4 4 0 110 5.292M15 21H3v-1a6 6 0 0112 0v1zm0 0h6v-1a6 6 0 00-9-5.197M13 7a3 3 0 11-6 0 3 3 0 016 0z" />
+                  </svg>
+                </div>
+                <h3 className="text-md font-bold text-slate-800 mb-1">No users found</h3>
+                <p className="text-xs text-slate-500">Get started by creating a new user account.</p>
+              </div>
+            ) : (
+              <div className="overflow-x-auto">
+                <table className="min-w-full divide-y divide-slate-100">
+                  <thead className="bg-slate-50/50 text-left text-xs font-semibold text-slate-500 uppercase tracking-wider">
+                    <tr>
+                      <th scope="col" className="px-6 py-4">User</th>
+                      <th scope="col" className="px-6 py-4">Email</th>
+                      <th scope="col" className="px-6 py-4">Role</th>
+                      <th scope="col" className="px-6 py-4">Status</th>
+                      <th scope="col" className="px-6 py-4 text-right">Actions</th>
                     </tr>
-                  );
-                })}
-              </tbody>
-            </table>
+                  </thead>
+                  <tbody className="bg-white divide-y divide-slate-100 text-sm">
+                    {users.map((user) => {
+                      const isSelf = currentUser && currentUser._id === user._id;
+                      const initials = getInitials(user.name);
+                      
+                      // Role label color
+                      let roleClass = 'bg-indigo-50 border-indigo-100 text-indigo-650';
+                      if (user.role === 'Admin') {
+                        roleClass = 'bg-red-50 border-red-100 text-red-600';
+                      } else if (user.role === 'Head') {
+                        roleClass = 'bg-purple-50 border-purple-100 text-purple-650';
+                      }
+
+                      // Status label color
+                      let statusClass = 'bg-emerald-50 border-emerald-100 text-emerald-600';
+                      if (user.status === 'Pending') {
+                        statusClass = 'bg-amber-50 border-amber-100 text-amber-600 animate-pulse';
+                      } else if (user.status === 'Rejected') {
+                        statusClass = 'bg-red-50 border-red-100 text-red-600';
+                      }
+
+                      return (
+                        <tr key={user._id} className="hover:bg-slate-50 transition-colors duration-150">
+                          <td className="px-6 py-4 whitespace-nowrap">
+                            <div className="flex items-center">
+                              <div className="w-9 h-9 bg-indigo-50 border border-indigo-100 rounded-full flex items-center justify-center text-indigo-600 font-extrabold text-sm shrink-0">
+                                {initials}
+                              </div>
+                              <div className="ml-3">
+                                <p className="text-sm font-bold text-slate-800">
+                                  {user.name}
+                                  {isSelf && <span className="ml-2 text-[10px] bg-slate-105 border border-slate-200 text-slate-500 px-2 py-0.5 rounded-full font-normal">(You)</span>}
+                                </p>
+                              </div>
+                            </div>
+                          </td>
+                          <td className="px-6 py-4 whitespace-nowrap text-slate-600">
+                            {user.email}
+                          </td>
+                          <td className="px-6 py-4 whitespace-nowrap">
+                            <span className={`inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-bold border ${roleClass}`}>
+                              {user.role}
+                            </span>
+                            {user.role === 'Head' && (
+                              <div className="text-[10px] text-indigo-600 font-semibold mt-1">
+                                Max Accts: {user.maxConnectedAccounts ?? 5}
+                              </div>
+                            )}
+                          </td>
+                          <td className="px-6 py-4 whitespace-nowrap">
+                            <span className={`inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-bold border ${statusClass}`}>
+                              {user.status || 'Approved'}
+                            </span>
+                          </td>
+                          <td className="px-6 py-4 whitespace-nowrap text-right space-x-3">
+                            {user.status === 'Pending' && (
+                              <>
+                                <button
+                                  onClick={() => handleUpdateStatus(user._id, 'Approved', user.name)}
+                                  disabled={actionLoading}
+                                  className="text-emerald-600 hover:text-emerald-700 text-sm font-semibold transition-colors"
+                                >
+                                  Approve
+                                </button>
+                                <button
+                                  onClick={() => handleUpdateStatus(user._id, 'Rejected', user.name)}
+                                  disabled={actionLoading}
+                                  className="text-red-500 hover:text-red-600 text-sm font-semibold transition-colors"
+                                >
+                                  Reject
+                                </button>
+                              </>
+                            )}
+                            <button
+                              onClick={() => openEditModal(user)}
+                              className="text-indigo-600 hover:text-indigo-700 text-sm font-semibold transition-colors"
+                            >
+                              Edit
+                            </button>
+                            <button
+                              onClick={() => openDeleteModal(user._id)}
+                              disabled={isSelf}
+                              className={`text-sm font-semibold transition-colors ${
+                                isSelf
+                                  ? 'text-slate-300 cursor-not-allowed'
+                                  : 'text-red-500 hover:text-red-600'
+                              }`}
+                              title={isSelf ? 'Cannot delete own account' : 'Delete user'}
+                            >
+                              Delete
+                            </button>
+                          </td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
+            )}
           </div>
-        )}
-      </div>
+        </>
+      )}
+
+      {subTab === 'clients' && (
+        <>
+          {/* Client Page Header */}
+          <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between mb-8 gap-4">
+            <div>
+              <h1 className="text-3xl font-extrabold text-slate-800 tracking-tight">Client Management</h1>
+              <p className="text-slate-500 text-sm mt-1">
+                Manage clients and their associated email addresses or domains
+              </p>
+            </div>
+            <button
+              onClick={() => {
+                setNewClientName('');
+                setNewClientEmails('');
+                setIsAddClientOpen(true);
+              }}
+              className="px-5 py-3 rounded-xl bg-indigo-600 hover:bg-indigo-700 text-xs font-bold text-white shadow-md active:scale-[0.98] transition-all flex items-center justify-center space-x-2"
+            >
+              <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M12 6v6m0 0v6m0-6h6m-6 0H6" />
+              </svg>
+              <span>Add Client</span>
+            </button>
+          </div>
+
+          {/* Clients Table */}
+          <div className="bg-white rounded-2xl shadow-sm border border-slate-200 overflow-hidden hover-glow-card transition-all duration-300">
+            {clients.length === 0 ? (
+              <div className="text-center py-20">
+                <div className="w-14 h-14 mx-auto bg-slate-50 rounded-2xl flex items-center justify-center mb-4 border border-slate-100">
+                  <svg className="w-6 h-6 text-slate-405" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M19 21V5a2 2 0 00-2-2H7a2 2 0 00-2 2v16m14 0h2m-2 0h-5m-9 0H3m2 0h5M9 7h1m-1 4h1m4-4h1m-1 4h1m-5 10v-5a1 1 0 011-1h2a1 1 0 011-1v5m-4 0h4" />
+                  </svg>
+                </div>
+                <h3 className="text-md font-bold text-slate-800 mb-1">No clients found</h3>
+                <p className="text-xs text-slate-500">Get started by adding a client account.</p>
+              </div>
+            ) : (
+              <div className="overflow-x-auto">
+                <table className="min-w-full divide-y divide-slate-100">
+                  <thead className="bg-slate-50/50 text-left text-xs font-semibold text-slate-500 uppercase tracking-wider">
+                    <tr>
+                      <th scope="col" className="px-6 py-4">Client Name</th>
+                      <th scope="col" className="px-6 py-4">Associated Emails/Domains</th>
+                      <th scope="col" className="px-6 py-4 text-right">Actions</th>
+                    </tr>
+                  </thead>
+                  <tbody className="bg-white divide-y divide-slate-100 text-sm">
+                    {clients.map((client) => (
+                      <tr key={client._id} className="hover:bg-slate-50/50 transition-colors">
+                        <td className="px-6 py-4 whitespace-nowrap">
+                          <span className="font-semibold text-slate-800">{client.name}</span>
+                        </td>
+                        <td className="px-6 py-4">
+                          <div className="flex flex-wrap gap-1.5 max-w-md">
+                            {client.associatedEmails && client.associatedEmails.length > 0 ? (
+                              client.associatedEmails.map((email, idx) => (
+                                <span key={idx} className="text-[10px] font-bold bg-indigo-50 text-indigo-650 px-2 py-0.5 rounded-md border border-indigo-100 font-mono">
+                                  {email}
+                                </span>
+                              ))
+                            ) : (
+                              <span className="text-xs text-slate-400 italic">None</span>
+                            )}
+                          </div>
+                        </td>
+                        <td className="px-6 py-4 text-right whitespace-nowrap space-x-3">
+                          <button
+                            onClick={() => {
+                              setSelectedClient(client);
+                              setEditClientName(client.name);
+                              setEditClientEmails(client.associatedEmails ? client.associatedEmails.join(', ') : '');
+                              setIsEditClientOpen(true);
+                            }}
+                            className="text-indigo-600 hover:text-indigo-700 text-sm font-semibold transition-colors"
+                          >
+                            Edit
+                          </button>
+                          <button
+                            onClick={() => handleDeleteClient(client._id, client.name)}
+                            className="text-red-500 hover:text-red-600 text-sm font-semibold transition-colors"
+                          >
+                            Delete
+                          </button>
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )}
+          </div>
+        </>
+      )}
 
       {/* Add User Modal */}
       {isAddOpen && (
@@ -500,6 +734,89 @@ const ManageUsers = () => {
                 </select>
               </div>
 
+              {editUser.role === 'Head' && (
+                <div className="p-4 bg-indigo-50/60 border border-indigo-100 rounded-2xl space-y-4">
+                  <h4 className="text-xs font-bold text-indigo-900 uppercase tracking-wider flex items-center gap-1.5">
+                    <svg className="w-4 h-4 text-indigo-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z" />
+                    </svg>
+                    Head Connected Accounts Permissions
+                  </h4>
+
+                  <div>
+                    <label className="block text-xs font-bold text-slate-700 mb-1">
+                      Max Connected Accounts Limit
+                    </label>
+                    <input
+                      type="number"
+                      min="1"
+                      max="50"
+                      className="w-full px-3.5 py-2.5 bg-white border border-slate-200 rounded-xl text-slate-800 text-xs focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500 outline-none"
+                      value={editUser.maxConnectedAccounts ?? 5}
+                      onChange={(e) => setEditUser({ ...editUser, maxConnectedAccounts: e.target.value })}
+                    />
+                    <span className="text-[10px] text-slate-500 mt-1 block">
+                      Maximum number of connected Gmail accounts this Head can connect.
+                    </span>
+                  </div>
+
+                  <div>
+                    <label className="block text-xs font-bold text-slate-700 mb-2">
+                      Select Authorized Connected Accounts
+                    </label>
+
+                    {allSystemGmailAccounts.length > 0 ? (
+                      <div className="bg-white border border-slate-200 rounded-xl p-3 max-h-36 overflow-y-auto space-y-2">
+                        {allSystemGmailAccounts.map((gmail) => {
+                          const allowedList = Array.isArray(editUser.allowedGmailAccounts) ? editUser.allowedGmailAccounts : [];
+                          const isChecked = allowedList.includes(gmail);
+                          return (
+                            <label key={gmail} className="flex items-center space-x-2.5 text-xs text-slate-700 cursor-pointer hover:bg-slate-50 p-1.5 rounded-lg transition-colors">
+                              <input
+                                type="checkbox"
+                                checked={isChecked}
+                                onChange={() => {
+                                  const updated = isChecked
+                                    ? allowedList.filter(e => e !== gmail)
+                                    : [...allowedList, gmail];
+                                  setEditUser({ ...editUser, allowedGmailAccounts: updated });
+                                }}
+                                className="rounded border-slate-300 text-indigo-600 focus:ring-indigo-500 h-4 w-4"
+                              />
+                              <span className="font-mono text-xs text-slate-800">{gmail}</span>
+                            </label>
+                          );
+                        })}
+                      </div>
+                    ) : (
+                      <div className="text-[11px] text-slate-400 italic bg-white p-3 border border-slate-200 rounded-xl">
+                        No connected Gmail accounts currently found in the system.
+                      </div>
+                    )}
+                  </div>
+
+                  <div>
+                    <label className="block text-[11px] font-bold text-slate-600 mb-1">
+                      Additional Custom Authorized Emails (Comma Separated)
+                    </label>
+                    <input
+                      type="text"
+                      placeholder="e.g. custom1@gmail.com, custom2@company.com"
+                      className="w-full px-3.5 py-2 bg-white border border-slate-200 rounded-xl text-slate-800 text-xs focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500 outline-none"
+                      value={Array.isArray(editUser.allowedGmailAccounts) ? editUser.allowedGmailAccounts.join(', ') : (editUser.allowedGmailAccounts || '')}
+                      onChange={(e) => {
+                        const val = e.target.value;
+                        const list = val.split(',').map(s => s.trim()).filter(Boolean);
+                        setEditUser({ ...editUser, allowedGmailAccounts: list });
+                      }}
+                    />
+                    <span className="text-[10px] text-slate-500 mt-1 block">
+                      Check the boxes above or type custom allowed emails. Leave empty to allow any account up to the limit.
+                    </span>
+                  </div>
+                </div>
+              )}
+
               <div className="flex space-x-3 pt-4 border-t border-slate-100 mt-6">
                 <button
                   type="button"
@@ -560,6 +877,133 @@ const ManageUsers = () => {
                 {actionLoading ? 'Deleting...' : 'Delete'}
               </button>
             </div>
+          </div>
+        </div>
+      )}
+
+      {/* Add Client Modal */}
+      {isAddClientOpen && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 backdrop-blur-[4px] p-4 overflow-y-auto">
+          <div className="bg-white border border-slate-200 rounded-2xl max-w-md w-full p-6 relative shadow-2xl animate-fade-in my-8 max-h-[90vh] overflow-y-auto select-none">
+            <div className="flex items-center justify-between mb-4">
+              <div>
+                <h3 className="text-lg font-bold text-slate-805">Add Client Account</h3>
+                <p className="text-slate-500 text-xs mt-0.5">Register a new client in the database</p>
+              </div>
+              <button onClick={() => setIsAddClientOpen(false)} className="p-1.5 hover:bg-slate-55 rounded-xl text-slate-400 hover:text-slate-600 transition-colors">
+                <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M6 18L18 6M6 6l12 12" />
+                </svg>
+              </button>
+            </div>
+            
+            <form onSubmit={handleAddClient} className="space-y-4">
+              <div>
+                <label className="block text-xs font-semibold text-slate-500 uppercase tracking-wider mb-1">Client Name</label>
+                <input
+                  type="text"
+                  required
+                  placeholder="e.g. Acme Corp"
+                  className="w-full px-4 py-3 bg-white border border-slate-200 rounded-xl text-slate-800 focus:outline-none focus:ring-2 focus:ring-indigo-150 focus:border-indigo-500 text-sm transition-all duration-200"
+                  value={newClientName}
+                  onChange={(e) => setNewClientName(e.target.value)}
+                />
+              </div>
+
+              <div>
+                <label className="block text-xs font-semibold text-slate-500 uppercase tracking-wider mb-1">Associated Emails / Domains</label>
+                <textarea
+                  placeholder="e.g. acme.com, contact@acme.com (comma separated)"
+                  rows="3"
+                  className="w-full px-4 py-3 bg-white border border-slate-200 rounded-xl text-slate-800 focus:outline-none focus:ring-2 focus:ring-indigo-150 focus:border-indigo-500 text-sm transition-all duration-200 font-mono"
+                  value={newClientEmails}
+                  onChange={(e) => setNewClientEmails(e.target.value)}
+                />
+                <p className="text-[10px] text-slate-450 mt-1 leading-normal">
+                  Emails containing these values (case-insensitive) will be counted in client-wise reports. Use domains like <code>acme.com</code> to capture all emails from a domain.
+                </p>
+              </div>
+
+              <div className="flex space-x-3 pt-4 border-t border-slate-100 mt-6">
+                <button
+                  type="button"
+                  onClick={() => setIsAddClientOpen(false)}
+                  className="w-1/2 py-3 px-4 border border-slate-200 hover:bg-slate-50 rounded-xl text-sm font-semibold text-slate-500 transition-colors"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="submit"
+                  disabled={actionLoading}
+                  className="w-1/2 py-3 px-4 bg-indigo-600 hover:bg-indigo-700 text-white rounded-xl text-sm font-semibold transition-colors disabled:opacity-50 flex items-center justify-center space-x-2 shadow-md hover:translate-y-[-2px] active:translate-y-0"
+                >
+                  {actionLoading ? 'Saving...' : 'Add Client'}
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+
+      {/* Edit Client Modal */}
+      {isEditClientOpen && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 backdrop-blur-[4px] p-4 overflow-y-auto">
+          <div className="bg-white border border-slate-200 rounded-2xl max-w-md w-full p-6 relative shadow-2xl animate-fade-in my-8 max-h-[90vh] overflow-y-auto select-none">
+            <div className="flex items-center justify-between mb-4">
+              <div>
+                <h3 className="text-lg font-bold text-slate-805">Modify Client Account</h3>
+                <p className="text-slate-500 text-xs mt-0.5">Edit name or associated email patterns</p>
+              </div>
+              <button onClick={() => { setIsEditClientOpen(false); setSelectedClient(null); }} className="p-1.5 hover:bg-slate-55 rounded-xl text-slate-400 hover:text-slate-600 transition-colors">
+                <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M6 18L18 6M6 6l12 12" />
+                </svg>
+              </button>
+            </div>
+            
+            <form onSubmit={handleEditClient} className="space-y-4">
+              <div>
+                <label className="block text-xs font-semibold text-slate-500 uppercase tracking-wider mb-1">Client Name</label>
+                <input
+                  type="text"
+                  required
+                  className="w-full px-4 py-3 bg-white border border-slate-200 rounded-xl text-slate-800 focus:outline-none focus:ring-2 focus:ring-indigo-150 focus:border-indigo-500 text-sm transition-all duration-200"
+                  value={editClientName}
+                  onChange={(e) => setEditClientName(e.target.value)}
+                />
+              </div>
+
+              <div>
+                <label className="block text-xs font-semibold text-slate-500 uppercase tracking-wider mb-1">Associated Emails / Domains</label>
+                <textarea
+                  placeholder="e.g. acme.com, contact@acme.com (comma separated)"
+                  rows="3"
+                  className="w-full px-4 py-3 bg-white border border-slate-200 rounded-xl text-slate-800 focus:outline-none focus:ring-2 focus:ring-indigo-150 focus:border-indigo-500 text-sm transition-all duration-200 font-mono"
+                  value={editClientEmails}
+                  onChange={(e) => setEditClientEmails(e.target.value)}
+                />
+                <p className="text-[10px] text-slate-455 mt-1 leading-normal font-sans">
+                  Comma-separated list of emails or domain names. E.g. <code>google.com</code> will match any mail from <code>user@google.com</code>.
+                </p>
+              </div>
+
+              <div className="flex space-x-3 pt-4 border-t border-slate-100 mt-6">
+                <button
+                  type="button"
+                  onClick={() => { setIsEditClientOpen(false); setSelectedClient(null); }}
+                  className="w-1/2 py-3 px-4 border border-slate-200 hover:bg-slate-50 rounded-xl text-sm font-semibold text-slate-500 transition-colors"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="submit"
+                  disabled={actionLoading}
+                  className="w-1/2 py-3 px-4 bg-indigo-600 hover:bg-indigo-700 text-white rounded-xl text-sm font-semibold transition-colors disabled:opacity-50 flex items-center justify-center space-x-2 shadow-md hover:translate-y-[-2px] active:translate-y-0"
+                >
+                  {actionLoading ? 'Saving...' : 'Save Changes'}
+                </button>
+              </div>
+            </form>
           </div>
         </div>
       )}

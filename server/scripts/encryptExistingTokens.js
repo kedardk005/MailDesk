@@ -15,7 +15,7 @@ const migrate = async () => {
     await mongoose.connect(mongoUri);
     console.log('Connected to MongoDB.');
 
-    const users = await User.find({});
+    const users = await User.find({}).select('+gmailAccessToken +gmailRefreshToken +linkedGmailAccounts');
     let updatedCount = 0;
 
     for (const user of users) {

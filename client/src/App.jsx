@@ -10,6 +10,7 @@ import ActivityLog from './pages/admin/ActivityLog';
 import EmailInbox from './pages/EmailInbox';
 import TaskList from './pages/TaskList';
 import Profile from './pages/Profile';
+import ClientList from './pages/ClientList';
 import ProtectedRoute from './components/ProtectedRoute';
 import AdminRoute from './components/AdminRoute';
 import ProtectedLayout from './components/ProtectedLayout';
@@ -46,6 +47,7 @@ function App() {
           <Route path="/dashboard" element={<Dashboard />} />
           <Route path="/inbox" element={<EmailInbox />} />
           <Route path="/tasks" element={<TaskList />} />
+          <Route path="/clients" element={<ClientList />} />
           <Route path="/profile" element={<Profile />} />
           
           {/* Admin Routes */}

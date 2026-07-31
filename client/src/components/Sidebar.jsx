@@ -78,6 +78,16 @@ const Sidebar = ({ isOpen, onClose }) => {
       )
     },
     {
+      path: '/clients',
+      label: 'Clients',
+      roles: ['Admin', 'Head', 'Employee'],
+      icon: (
+        <svg className="h-5 w-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M19 21V5a2 2 0 00-2-2H7a2 2 0 00-2 2v16m14 0h2m-2 0h-5m-9 0H3m2 0h5m0 0h4m-4 0a2 2 0 01-2-2V7a2 2 0 012-2h4a2 2 0 012 2v12a2 2 0 01-2 2m-6 0h6" />
+        </svg>
+      )
+    },
+    {
       path: '/reports',
       label: 'Reports',
       roles: ['Admin'],

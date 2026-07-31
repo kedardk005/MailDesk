@@ -15,7 +15,8 @@ const UserSchema = new mongoose.Schema({
   },
   password: {
     type: String,
-    required: true
+    required: true,
+    select: false
   },
   role: {
     type: String,
@@ -25,11 +26,13 @@ const UserSchema = new mongoose.Schema({
   },
   gmailAccessToken: {
     type: String,
-    default: null
+    default: null,
+    select: false
   },
   gmailRefreshToken: {
     type: String,
-    default: null
+    default: null,
+    select: false
   },
   gmailEmail: {
     type: String,
@@ -43,6 +46,15 @@ const UserSchema = new mongoose.Schema({
         gmailRefreshToken: { type: String, default: null }
       }
     ],
+    default: [],
+    select: false
+  },
+  maxConnectedAccounts: {
+    type: Number,
+    default: 5
+  },
+  allowedGmailAccounts: {
+    type: [String],
     default: []
   },
   birthdate: {

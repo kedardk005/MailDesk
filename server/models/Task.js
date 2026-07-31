@@ -67,4 +67,11 @@ const TaskSchema = new mongoose.Schema({
   }
 });
 
+TaskSchema.index({ assignedTo: 1 });
+TaskSchema.index({ createdBy: 1 });
+TaskSchema.index({ status: 1 });
+TaskSchema.index({ linkedEmail: 1 });
+TaskSchema.index({ deadline: 1 });
+TaskSchema.index({ status: 1, deadline: 1 });
+
 module.exports = mongoose.model('Task', TaskSchema);

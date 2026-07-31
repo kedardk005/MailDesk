@@ -57,7 +57,9 @@ const replyToEmailSchema = z.object({
 
 const bulkAssignEmailsSchema = z.object({
   emailIds: z.array(z.string()).min(1, 'At least one email ID is required.'),
-  userId: z.string().nullable().optional()
+  assignedTo: z.string().min(1, 'Assigned user ID is required.'),
+  deadline: z.string().optional(),
+  priority: z.enum(['Low', 'Medium', 'High', 'Urgent']).optional()
 });
 
 const disconnectLinkedAccountSchema = z.object({
@@ -72,21 +74,21 @@ const createTaskSchema = z.object({
   title: z.string().trim().min(1, 'Title is required.'),
   clientName: z.string().trim().min(1, 'Client Name is required.'),
   description: z.string().optional(),
-  assignedTo: z.string().nullable().optional(),
-  deadline: z.string().optional(),
+  assignedTo: z.string().min(1, 'Assignee is required.'),
+  deadline: z.string().min(1, 'Deadline is required.'),
   isRecurring: z.boolean().optional(),
-  recurrence: z.object({
-    frequency: z.enum(['Daily', 'Weekly', 'Monthly']).optional(),
-    interval: z.number().optional()
-  }).optional(),
-  linkedEmailId: z.string().nullable().optional()
+  recurrence: z.string().nullable().optional(),
+  linkedEmail: z.string().nullable().optional(),
+  notes: z.string().optional(),
+  priority: z.enum(['Low', 'Medium', 'High', 'Urgent']).optional()
 });
 
 const bulkTaskSchema = z.object({
   taskIds: z.array(z.string()).min(1, 'At least one task ID is required.'),
-  action: z.enum(['delete', 'complete', 'incomplete'], {
-    errorMap: () => ({ message: "Action must be delete, complete, or incomplete." })
-  })
+  action: z.enum(['delete', 'status', 'reassign'], {
+    errorMap: () => ({ message: "Action must be delete, status, or reassign." })
+  }),
+  value: z.string().optional()
 });
 
 module.exports = {

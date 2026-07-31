@@ -14,16 +14,31 @@ const getPriorityStyle = (priority) => {
 
 const renderEmailContent = (body) => {
   if (!body) return '<html><body><span style="font-family: sans-serif; font-size: 13px; color: #94a3b8; font-style: italic;">This email has no text content.</span></body></html>';
-  const isHtml = /<[a-z][\s\S]*>/i.test(body);
+  // Strip <script> tags to prevent execution warnings
+  const cleanBody = body.replace(/<script\b[^<]*(?:(?!<\/script>)<[^<]*)*<\/script>/gi, '');
+  const isHtml = /<[a-z][\s\S]*>/i.test(cleanBody);
   const styledBody = isHtml 
-    ? body 
-    : `<div style="white-space: pre-wrap; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; font-size: 13px; line-height: 1.5; color: #334155;">${body.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')}</div>`;
+    ? cleanBody 
+    : `<div style="white-space: pre-wrap; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; font-size: 13px; line-height: 1.5; color: #334155;">${cleanBody.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')}</div>`;
   return `<html><head><style>body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; font-size: 13px; line-height: 1.5; color: #334155; margin: 12px; word-break: break-word; } img { max-width: 100%; height: auto; display: block; margin: 8px 0; }</style></head><body>${styledBody}</body></html>`;
 };
 
 const TaskList = () => {
-  const [tasks, setTasks] = useState([]);
-  const [loading, setLoading] = useState(true);
+  const [tasks, setTasks] = useState(() => {
+    try {
+      const cached = localStorage.getItem('cached_tasks_data');
+      return cached ? JSON.parse(cached) : [];
+    } catch {
+      return [];
+    }
+  });
+  const [loading, setLoading] = useState(() => {
+    try {
+      return !localStorage.getItem('cached_tasks_data');
+    } catch {
+      return true;
+    }
+  });
   const [actionLoading, setActionLoading] = useState(false);
   const [alert, setAlert] = useState({ type: '', message: '' });
   const [creatorFilter, setCreatorFilter] = useState('');
@@ -174,10 +189,15 @@ const TaskList = () => {
   };
 
   const fetchTasks = async () => {
-    setLoading(true);
+    setLoading(prev => tasks.length === 0 ? true : false);
     try {
       const response = await api.get('/tasks');
       setTasks(response.data);
+      try {
+        localStorage.setItem('cached_tasks_data', JSON.stringify(response.data));
+      } catch (e) {
+        console.error('Failed to update task cache:', e);
+      }
     } catch (err) {
       console.error('Error loading task list:', err);
       triggerAlert('error', err.response?.data?.message || 'Failed to retrieve task records.');
@@ -198,8 +218,8 @@ const TaskList = () => {
         const parsed = JSON.parse(userString);
         if (parsed.role === 'Admin' || parsed.role === 'Head') {
           const usersRes = await api.get('/users');
-          // Filter to show only Heads and Employees for assignment list
-          const assignable = usersRes.data.filter(u => u.role === 'Head' || u.role === 'Employee');
+          // Filter to show all approved users for assignment list
+          const assignable = usersRes.data.filter(u => u.status === 'Approved' || !u.status);
           setUsers(assignable);
 
           // 3. Fetch unassigned emails (excluding spam)
@@ -1133,7 +1153,7 @@ const TaskList = () => {
                               <iframe
                                 srcDoc={renderEmailContent(task.linkedEmail.body)}
                                 title="Email Body"
-                                sandbox="allow-same-origin allow-popups allow-popups-to-escape-sandbox"
+                                sandbox="allow-scripts allow-same-origin allow-popups allow-popups-to-escape-sandbox"
                                 className="w-full border border-slate-150 rounded-xl bg-slate-50/50"
                                 style={{ minHeight: '120px', resize: 'vertical' }}
                                 onLoad={(e) => {
@@ -1246,6 +1266,19 @@ const TaskList = () => {
                       <div className="flex items-center justify-end space-x-2 pt-2 border-t border-slate-100">
                         {currentUser.role === 'Admin' || currentUser.role === 'Head' ? (
                           <>
+                            {task.status === 'Pending' && (task.assignedTo?._id || task.assignedTo) === currentUser._id && (
+                              <button
+                                type="button"
+                                disabled={actionLoading}
+                                onClick={(event) => {
+                                  event.stopPropagation();
+                                  handleMarkComplete(task._id);
+                                }}
+                                className="px-4 py-2 bg-emerald-500 text-white rounded-xl text-xs font-bold hover:bg-emerald-600 transition-all duration-200 ease-in-out disabled:opacity-50"
+                              >
+                                Mark Complete
+                              </button>
+                            )}
                             <button
                               type="button"
                               onClick={(event) => {
@@ -1706,7 +1739,7 @@ const TaskList = () => {
                       <iframe
                         srcDoc={renderEmailContent(selectedTask.linkedEmail.body)}
                         title="Linked Email Body"
-                        sandbox="allow-same-origin allow-popups allow-popups-to-escape-sandbox"
+                        sandbox="allow-scripts allow-same-origin allow-popups allow-popups-to-escape-sandbox"
                         className="w-full border border-slate-250 rounded-xl bg-white shadow-inner"
                         style={{ minHeight: '150px', resize: 'vertical' }}
                         onLoad={(e) => {
@@ -1737,20 +1770,47 @@ const TaskList = () => {
                   Close
                 </button>
                 {currentUser.role === 'Admin' || currentUser.role === 'Head' ? (
-                  <button
-                    type="submit"
-                    disabled={actionLoading}
-                    className="w-1/2 py-3 px-4 bg-gradient-to-r from-indigo-600 to-purple-600 text-white rounded-xl text-sm font-semibold transition-all disabled:opacity-50 flex items-center justify-center space-x-2 shadow-md hover:translate-y-[-2px] active:translate-y-0 active:scale-98"
-                  >
-                    {actionLoading ? (
-                      <svg className="animate-spin h-5 w-5 text-white" fill="none" viewBox="0 0 24 24">
-                        <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
-                        <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z" />
-                      </svg>
-                    ) : (
-                      'Save Changes'
+                  <div className="w-1/2 flex space-x-2">
+                    {selectedTask && selectedTask.status === 'Pending' && (selectedTask.assignedTo?._id || selectedTask.assignedTo) === currentUser._id && (
+                      <button
+                        type="button"
+                        disabled={actionLoading}
+                        onClick={() => {
+                          handleMarkComplete(selectedTask._id);
+                          setIsEditOpen(false);
+                          setSelectedTask(null);
+                        }}
+                        className="w-1/2 py-3 px-4 bg-emerald-500 hover:bg-emerald-600 rounded-xl text-sm font-semibold transition-colors disabled:opacity-50 flex items-center justify-center space-x-2 text-white shadow-md hover:translate-y-[-2px] active:translate-y-0"
+                      >
+                        {actionLoading ? (
+                          <svg className="animate-spin h-5 w-5 text-white" fill="none" viewBox="0 0 24 24">
+                            <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+                            <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z" />
+                          </svg>
+                        ) : (
+                          'Mark Complete'
+                        )}
+                      </button>
                     )}
-                  </button>
+                    <button
+                      type="submit"
+                      disabled={actionLoading}
+                      className={`${
+                        selectedTask && selectedTask.status === 'Pending' && (selectedTask.assignedTo?._id || selectedTask.assignedTo) === currentUser._id
+                          ? 'w-1/2'
+                          : 'w-full'
+                      } py-3 px-4 bg-gradient-to-r from-indigo-600 to-purple-600 text-white rounded-xl text-sm font-semibold transition-all disabled:opacity-50 flex items-center justify-center space-x-2 shadow-md hover:translate-y-[-2px] active:translate-y-0 active:scale-98`}
+                    >
+                      {actionLoading ? (
+                        <svg className="animate-spin h-5 w-5 text-white" fill="none" viewBox="0 0 24 24">
+                          <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+                          <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z" />
+                        </svg>
+                      ) : (
+                        'Save Changes'
+                      )}
+                    </button>
+                  </div>
                 ) : (
                   selectedTask.status === 'Pending' && (
                     <button

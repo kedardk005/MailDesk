@@ -5,6 +5,8 @@ const User = require('../models/User');
 const { logActivity } = require('../utils/activityLogger');
 const { createNotification } = require('../utils/notificationHelper');
 const { sendEmail } = require('../utils/emailHelper');
+const { escapeRegex } = require('../utils/regexHelper');
+
 
 // @desc    Create a new task
 // @route   POST /api/tasks
@@ -77,11 +79,11 @@ exports.getAllTasks = async (req, res) => {
   try {
     let query = {};
 
-    // Filter by role: Employees can only see tasks assigned to them, Heads can only see tasks created by them
+    // Filter by role: Employees can only see tasks assigned to them, Heads can see tasks created by or assigned to them
     if (req.user.role === 'Employee') {
       query = { assignedTo: req.user._id };
     } else if (req.user.role === 'Head') {
-      query = { createdBy: req.user._id };
+      query = { $or: [{ createdBy: req.user._id }, { assignedTo: req.user._id }] };
     }
 
     const tasks = await Task.find(query)
@@ -116,9 +118,13 @@ exports.getTaskById = async (req, res) => {
       return res.status(403).json({ message: 'Access denied. You can only access tasks assigned to you.' });
     }
 
-    // Heads can only access tasks created by them
-    if (req.user.role === 'Head' && task.createdBy && task.createdBy._id.toString() !== req.user._id.toString()) {
-      return res.status(403).json({ message: 'Access denied. You can only access tasks created by you.' });
+    // Heads can access tasks created by or assigned to them
+    if (req.user.role === 'Head') {
+      const isCreator = task.createdBy && task.createdBy._id.toString() === req.user._id.toString();
+      const isAssignee = task.assignedTo && task.assignedTo._id.toString() === req.user._id.toString();
+      if (!isCreator && !isAssignee) {
+        return res.status(403).json({ message: 'Access denied. You can only access tasks created by or assigned to you.' });
+      }
     }
 
     return res.status(200).json(task);
@@ -183,9 +189,13 @@ exports.updateTask = async (req, res) => {
         await spawnNextRecurrence(task, io);
       }
     } else {
-      // For Head, check if they created the task
-      if (req.user.role === 'Head' && task.createdBy && task.createdBy.toString() !== req.user._id.toString()) {
-        return res.status(403).json({ message: 'Access denied. You can only update tasks created by you.' });
+      // For Head, check if they created the task or are assigned to it
+      if (req.user.role === 'Head') {
+        const isCreator = task.createdBy && task.createdBy.toString() === req.user._id.toString();
+        const isAssignee = task.assignedTo && task.assignedTo.toString() === req.user._id.toString();
+        if (!isCreator && !isAssignee) {
+          return res.status(403).json({ message: 'Access denied. You can only update tasks created by or assigned to you.' });
+        }
       }
 
       // Admin/Head can update all fields
@@ -357,6 +367,105 @@ exports.bulkTaskAction = async (req, res) => {
   } catch (error) {
     console.error('Error in bulkTaskAction:', error);
     return res.status(500).json({ message: 'Server error. Failed to perform bulk action.' });
+  }
+};
+
+// @desc    Create a new client
+// @route   POST /api/tasks/clients
+// @access  Private (Admin only)
+exports.createClient = async (req, res) => {
+  try {
+    const { name, associatedEmails } = req.body;
+    if (!name || !name.trim()) {
+      return res.status(400).json({ message: 'Client name is required.' });
+    }
+
+    const trimmedName = name.trim();
+    const existing = await Client.findOne({ name: { $regex: new RegExp(`^${escapeRegex(trimmedName)}$`, 'i') } });
+    if (existing) {
+      return res.status(400).json({ message: 'Client name must be unique. Client already exists.' });
+    }
+
+    // Process associatedEmails array
+    let emailArray = [];
+    if (Array.isArray(associatedEmails)) {
+      emailArray = associatedEmails.map(email => email.trim()).filter(email => email.length > 0);
+    }
+
+    const client = new Client({
+      name: trimmedName,
+      associatedEmails: emailArray
+    });
+
+    await client.save();
+    await logActivity(req.user._id, 'Client Creation', `Created client "${client.name}"`);
+
+    return res.status(201).json(client);
+  } catch (error) {
+    console.error('Error in createClient:', error);
+    return res.status(500).json({ message: 'Server error. Failed to create client.' });
+  }
+};
+
+// @desc    Update a client
+// @route   PUT /api/tasks/clients/:id
+// @access  Private (Admin only)
+exports.updateClient = async (req, res) => {
+  try {
+    const { name, associatedEmails } = req.body;
+    const client = await Client.findById(req.params.id);
+    if (!client) {
+      return res.status(404).json({ message: 'Client not found.' });
+    }
+
+    if (name !== undefined) {
+      const trimmedName = name.trim();
+      if (!trimmedName) {
+        return res.status(400).json({ message: 'Client name cannot be empty.' });
+      }
+
+      // Check if client name matches another client
+      const existing = await Client.findOne({ 
+        name: { $regex: new RegExp(`^${escapeRegex(trimmedName)}$`, 'i') }, 
+        _id: { $ne: req.params.id } 
+      });
+      if (existing) {
+        return res.status(400).json({ message: 'Client name must be unique. Another client exists with this name.' });
+      }
+      client.name = trimmedName;
+    }
+
+    if (associatedEmails !== undefined && Array.isArray(associatedEmails)) {
+      client.associatedEmails = associatedEmails.map(email => email.trim()).filter(email => email.length > 0);
+    }
+
+    await client.save();
+    await logActivity(req.user._id, 'Client Update', `Updated client "${client.name}"`);
+
+    return res.status(200).json(client);
+  } catch (error) {
+    console.error('Error in updateClient:', error);
+    return res.status(500).json({ message: 'Server error. Failed to update client.' });
+  }
+};
+
+// @desc    Delete a client
+// @route   DELETE /api/tasks/clients/:id
+// @access  Private (Admin only)
+exports.deleteClient = async (req, res) => {
+  try {
+    const client = await Client.findById(req.params.id);
+    if (!client) {
+      return res.status(404).json({ message: 'Client not found.' });
+    }
+
+    await Client.findByIdAndDelete(req.params.id);
+    await logActivity(req.user._id, 'Client Deletion', `Deleted client "${client.name}"`);
+
+    return res.status(200).json({ message: 'Client deleted successfully.' });
+  } catch (error) {
+    console.error('Error in deleteClient:', error);
+    return res.status(500).json({ message: 'Server error. Failed to delete client.' });
   }
 };
 

@@ -1,6 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import { useNavigate, Link } from 'react-router-dom';
 import api from '../api/axios';
+import KeywordApprovalModal from '../components/KeywordApprovalModal';
 
 const renderEmailContent = (body) => {
   if (!body) return '<html><body><span style="font-family: sans-serif; font-size: 13px; color: #94a3b8; font-style: italic;">This email has no text content.</span></body></html>';
@@ -12,8 +13,21 @@ const renderEmailContent = (body) => {
 };
 
 const EmailInbox = () => {
-  const [emails, setEmails] = useState([]);
-  const [loading, setLoading] = useState(true);
+  const [emails, setEmails] = useState(() => {
+    try {
+      const cached = localStorage.getItem('cached_inbox_emails');
+      return cached ? JSON.parse(cached) : [];
+    } catch {
+      return [];
+    }
+  });
+  const [loading, setLoading] = useState(() => {
+    try {
+      return !localStorage.getItem('cached_inbox_emails');
+    } catch {
+      return true;
+    }
+  });
   const [syncing, setSyncing] = useState(false);
   const [alert, setAlert] = useState({ type: '', message: '' });
   const [expandedEmailId, setExpandedEmailId] = useState(null);
@@ -32,6 +46,10 @@ const EmailInbox = () => {
   const [searchLoading, setSearchLoading] = useState(false);
   const [summaryMap, setSummaryMap] = useState({}); // { emailId: { loading, text, error } }
 
+  // Keyword rules modal state
+  const [isKeywordModalOpen, setIsKeywordModalOpen] = useState(false);
+  const [pendingApprovalCount, setPendingApprovalCount] = useState(0);
+
   // Bulk selection states for Inbox
   const [selectedEmailIds, setSelectedEmailIds] = useState(new Set());
   const [selectAll, setSelectAll] = useState(false);
@@ -43,21 +61,34 @@ const EmailInbox = () => {
 
   const navigate = useNavigate();
 
-  // Get unique source accounts that have fetched emails in the list
+  // Get unique source accounts from connected accounts status AND fetched emails
   const uniqueAccounts = Array.from(
     new Set(
-      emails
-        .map(email => email.fetchedBy?.gmailEmail)
-        .filter(gmail => !!gmail)
+      [
+        ...(gmailStatus.gmailEmail ? [gmailStatus.gmailEmail] : []),
+        ...(gmailStatus.linkedAccounts || []).map(a => a.gmailEmail),
+        ...emails.map(email => email.toEmail),
+        ...emails.map(email => email.fetchedBy?.gmailEmail)
+      ].filter(Boolean)
     )
   );
+
+  // Pagination states
+  const [currentPage, setCurrentPage] = useState(1);
+  const [itemsPerPage, setItemsPerPage] = useState(25);
+
+  useEffect(() => {
+    setCurrentPage(1);
+  }, [searchQuery, selectedAccount, activeTab]);
 
   const getFilteredEmails = () => {
     return emails.filter(email => {
       // 1. Account filter
       if (selectedAccount !== 'all') {
-        const sourceEmail = email.fetchedBy?.gmailEmail;
-        if (sourceEmail !== selectedAccount) {
+        const toAddr = (email.toEmail || '').toLowerCase().trim();
+        const fetchAddr = (email.fetchedBy?.gmailEmail || '').toLowerCase().trim();
+        const selected = selectedAccount.toLowerCase().trim();
+        if (toAddr !== selected && fetchAddr !== selected) {
           return false;
         }
       }
@@ -125,6 +156,11 @@ const EmailInbox = () => {
   };
 
   const filteredEmails = getFilteredEmails();
+  const totalPages = Math.ceil(filteredEmails.length / itemsPerPage) || 1;
+  const paginatedEmails = filteredEmails.slice(
+    (currentPage - 1) * itemsPerPage,
+    currentPage * itemsPerPage
+  );
 
   useEffect(() => {
     const userString = localStorage.getItem('user');
@@ -151,13 +187,25 @@ const EmailInbox = () => {
 
     loadEmails('');
     fetchGmailStatus();
+    fetchPendingApprovalsCount();
   }, []);
 
   useEffect(() => {
     const timer = setTimeout(() => {
       loadEmails(searchQuery);
     }, 400);
-    return () => clearTimeout(timer);
+
+    // Auto-reload Inbox every 5 minutes (300,000 ms)
+    const fiveMinInterval = setInterval(() => {
+      console.log('[AUTO-RELOAD 5M] Refreshing inbox emails...');
+      loadEmails(searchQuery);
+      fetchPendingApprovalsCount();
+    }, 5 * 60 * 1000);
+
+    return () => {
+      clearTimeout(timer);
+      clearInterval(fiveMinInterval);
+    };
   }, [searchQuery]);
 
   const fetchGmailStatus = async () => {
@@ -170,6 +218,15 @@ const EmailInbox = () => {
       });
     } catch (err) {
       console.error('Error checking Gmail status in Inbox:', err);
+    }
+  };
+
+  const fetchPendingApprovalsCount = async () => {
+    try {
+      const res = await api.get('/keyword-rules/pending-approvals');
+      setPendingApprovalCount(res.data?.length || 0);
+    } catch (err) {
+      console.error('Error fetching pending approvals count:', err);
     }
   };
 
@@ -199,7 +256,7 @@ const EmailInbox = () => {
     if (selectAll) {
       setSelectedEmailIds(new Set());
     } else {
-      const ids = filteredEmails.map((e) => e._id);
+      const ids = paginatedEmails.map((e) => e._id);
       setSelectedEmailIds(new Set(ids));
     }
     setSelectAll(!selectAll);
@@ -287,6 +344,20 @@ const EmailInbox = () => {
       const params = query.trim() ? { q: query.trim() } : {};
       const res = await api.get('/gmail/emails', { params });
       setEmails(res.data);
+
+      // Cache fresh lightweight emails for instant next load
+      if (!query.trim()) {
+        try {
+          const lightweightCache = res.data.slice(0, 50).map(email => ({
+            ...email,
+            body: email.body ? email.body.slice(0, 300) : ''
+          }));
+          localStorage.setItem('cached_inbox_emails', JSON.stringify(lightweightCache));
+        } catch (e) {
+          console.warn('Failed to update email cache in localStorage:', e);
+          try { localStorage.removeItem('cached_inbox_emails'); } catch {}
+        }
+      }
     } catch (err) {
       setAlert({ type: 'error', message: 'Failed to load emails.' });
     } finally {
@@ -572,6 +643,23 @@ const EmailInbox = () => {
               }`}>
                 {1 + (gmailStatus.linkedAccounts?.length || 0)}
               </span>
+            </button>
+          )}
+
+          {(userRole === 'Admin' || userRole === 'Head') && (
+            <button
+              onClick={() => setIsKeywordModalOpen(true)}
+              className="px-5 py-3 rounded-xl text-xs font-bold transition-all active:scale-[0.98] flex items-center justify-center gap-2 shadow-sm border bg-indigo-50 hover:bg-indigo-100 text-indigo-700 border-indigo-200"
+            >
+              <svg className="w-4 h-4 text-indigo-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M9 12l2 2 4-4m5.618-4.016A11.955 11.955 0 0112 2.944a11.955 11.955 0 01-8.618 3.04A12.02 12.02 0 003 9c0 5.591 3.824 10.29 9 11.622 5.176-1.332 9-6.03 9-11.622 0-1.042-.133-2.052-.382-3.016z" />
+              </svg>
+              <span>Keyword Rules & Approvals</span>
+              {pendingApprovalCount > 0 && (
+                <span className="px-2 py-0.5 text-[10px] bg-amber-500 text-white font-extrabold rounded-full">
+                  {pendingApprovalCount}
+                </span>
+              )}
             </button>
           )}
 
@@ -995,7 +1083,7 @@ const EmailInbox = () => {
           )}
 
           <div className="space-y-3.5">
-            {filteredEmails.map((email) => {
+            {paginatedEmails.map((email) => {
               const isExpanded = expandedEmailId === email._id;
               const senderInitial = email.from ? email.from.charAt(0).toUpperCase() : '✉️';
               
@@ -1266,9 +1354,69 @@ const EmailInbox = () => {
             );
           })}
         </div>
+
+        {/* Pagination Bar */}
+        {filteredEmails.length > 0 && (
+          <div className="flex flex-col sm:flex-row items-center justify-between gap-4 mt-6 p-4 bg-white border border-slate-200 rounded-2xl shadow-sm">
+            <div className="text-xs font-semibold text-slate-500">
+              Showing <span className="font-bold text-slate-800">{Math.min((currentPage - 1) * itemsPerPage + 1, filteredEmails.length)}</span> to{' '}
+              <span className="font-bold text-slate-800">{Math.min(currentPage * itemsPerPage, filteredEmails.length)}</span> of{' '}
+              <span className="font-bold text-slate-800">{filteredEmails.length}</span> emails
+            </div>
+
+            <div className="flex items-center gap-4">
+              <div className="flex items-center gap-1.5 text-xs text-slate-500 font-semibold">
+                <span>Per page:</span>
+                <select
+                  value={itemsPerPage}
+                  onChange={(e) => {
+                    setItemsPerPage(Number(e.target.value));
+                    setCurrentPage(1);
+                  }}
+                  className="bg-slate-50 border border-slate-200 rounded-lg px-2 py-1 text-xs font-bold text-slate-700 focus:outline-none focus:ring-2 focus:ring-indigo-500/20"
+                >
+                  <option value={25}>25</option>
+                  <option value={50}>50</option>
+                  <option value={100}>100</option>
+                </select>
+              </div>
+
+              <div className="flex items-center gap-2">
+                <button
+                  onClick={() => setCurrentPage(prev => Math.max(prev - 1, 1))}
+                  disabled={currentPage === 1}
+                  className="px-3 py-1.5 text-xs font-bold rounded-xl border border-slate-200 text-slate-700 bg-white hover:bg-slate-50 disabled:opacity-40 disabled:cursor-not-allowed transition-all"
+                >
+                  Previous
+                </button>
+                <span className="text-xs font-bold text-slate-700 px-1">
+                  {currentPage} / {totalPages}
+                </span>
+                <button
+                  onClick={() => setCurrentPage(prev => Math.min(prev + 1, totalPages))}
+                  disabled={currentPage >= totalPages}
+                  className="px-3 py-1.5 text-xs font-bold rounded-xl border border-slate-200 text-slate-700 bg-white hover:bg-slate-50 disabled:opacity-40 disabled:cursor-not-allowed transition-all"
+                >
+                  Next
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
         </>
       )
       )}
+      {/* Keyword Rules & Approval Modal */}
+      <KeywordApprovalModal
+        isOpen={isKeywordModalOpen}
+        onClose={() => setIsKeywordModalOpen(false)}
+        onRuleUpdated={() => {
+          Promise.all([
+            fetchEmails ? fetchEmails() : Promise.resolve(),
+            fetchPendingApprovalsCount ? fetchPendingApprovalsCount() : Promise.resolve()
+          ]).catch(err => console.error('Error refreshing inbox state:', err));
+        }}
+      />
     </main>
   );
 };

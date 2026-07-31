@@ -175,3 +175,115 @@ exports.getTaskTimeline = async (req, res) => {
     return res.status(500).json({ message: 'Server error. Failed to retrieve timeline logs.' });
   }
 };
+
+const { escapeRegex } = require('../utils/regexHelper');
+
+// @desc    Get Client-wise statistics (received emails and assigned/completed tasks count)
+// @route   GET /api/reports/client-stats
+// @access  Private (Admin, Head only)
+exports.getClientStats = async (req, res) => {
+  try {
+    const clients = await Client.find({}).sort({ name: 1 });
+    const stats = [];
+
+    for (const client of clients) {
+      let emailCount = 0;
+      if (client.associatedEmails && client.associatedEmails.length > 0) {
+        // Build search conditions to match from field containing any of the associated email/domain strings
+        const conditions = client.associatedEmails.map(email => ({
+          from: { $regex: new RegExp(escapeRegex(email), 'i') }
+        }));
+        emailCount = await Email.countDocuments({ $or: conditions });
+      }
+
+      const escapedName = escapeRegex(client.name);
+
+      // Count tasks matching the client name
+      const taskCount = await Task.countDocuments({
+        clientName: { $regex: new RegExp(`^${escapedName}$`, 'i') }
+      });
+
+      // Count completed tasks
+      const completedTaskCount = await Task.countDocuments({
+        clientName: { $regex: new RegExp(`^${escapedName}$`, 'i') },
+        status: 'Completed'
+      });
+
+      stats.push({
+        _id: client._id,
+        name: client.name,
+        associatedEmails: client.associatedEmails || [],
+        emailCount,
+        taskCount,
+        completedTaskCount
+      });
+    }
+
+    return res.status(200).json(stats);
+  } catch (error) {
+    console.error('Error in getClientStats:', error);
+    return res.status(500).json({ message: 'Server error. Failed to retrieve client statistics.' });
+  }
+};
+
+// @desc    Get Email Timeline (Received day-wise for last N days)
+// @route   GET /api/reports/email-timeline
+// @access  Private (Admin, Head only)
+exports.getEmailTimeline = async (req, res) => {
+  try {
+    const days = parseInt(req.query.days) || 14;
+    const now = new Date();
+    const dateMap = {};
+    const timelineDates = [];
+
+    for (let i = days - 1; i >= 0; i--) {
+      const d = new Date(now.getFullYear(), now.getMonth(), now.getDate() - i);
+      const year = d.getFullYear();
+      const month = String(d.getMonth() + 1).padStart(2, '0');
+      const day = String(d.getDate()).padStart(2, '0');
+      const dateStr = `${year}-${month}-${day}`;
+      const labelStr = d.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
+
+      dateMap[dateStr] = { count: 0, assignedCount: 0, label: labelStr };
+      timelineDates.push(dateStr);
+    }
+
+    const startDate = new Date(now.getFullYear(), now.getMonth(), now.getDate() - (days - 1));
+    startDate.setHours(0, 0, 0, 0);
+
+    let emailQuery = { date: { $gte: startDate } };
+    if (req.user.role === 'Head') {
+      emailQuery.fetchedBy = req.user._id;
+    }
+
+    const emails = await Email.find(emailQuery, 'date status');
+
+    emails.forEach((email) => {
+      if (!email.date) return;
+      const d = new Date(email.date);
+      const year = d.getFullYear();
+      const month = String(d.getMonth() + 1).padStart(2, '0');
+      const day = String(d.getDate()).padStart(2, '0');
+      const dateStr = `${year}-${month}-${day}`;
+
+      if (dateMap[dateStr]) {
+        dateMap[dateStr].count++;
+        if (email.status === 'assigned') {
+          dateMap[dateStr].assignedCount++;
+        }
+      }
+    });
+
+    const result = timelineDates.map((dateStr) => ({
+      date: dateStr,
+      label: dateMap[dateStr].label,
+      count: dateMap[dateStr].count,
+      assignedCount: dateMap[dateStr].assignedCount
+    }));
+
+    return res.status(200).json(result);
+  } catch (error) {
+    console.error('Error in getEmailTimeline:', error);
+    return res.status(500).json({ message: 'Server error. Failed to retrieve email timeline.' });
+  }
+};
