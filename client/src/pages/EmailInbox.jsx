@@ -374,32 +374,137 @@ const EmailInbox = () => {
         return;
       }
 
-      // CSV Headers
-      const headers = ['Subject', 'From', 'To Inbox', 'Status', 'Date', 'Body Preview'];
-      
-      const rows = emails.map(email => [
-        email.subject || '(No Subject)',
-        email.from || 'Unknown Sender',
-        email.toEmail || email.fetchedBy?.gmailEmail || 'Unknown Inbox',
-        email.status || 'unassigned',
-        email.date ? new Date(email.date).toLocaleString() : 'N/A',
-        email.body ? email.body.replace(/<[^>]*>/g, '').substring(0, 200).replace(/\s+/g, ' ').trim() : ''
-      ]);
+      const nowStr = new Date().toLocaleString();
+      const exportDateStr = new Date().toISOString().split('T')[0];
+      const totalEmails = emails.length;
+      const assignedCount = emails.filter(e => e.status === 'assigned').length;
+      const unassignedCount = totalEmails - assignedCount;
 
-      // Convert to CSV format with proper cell escaping
-      const csvContent = [
-        headers.join(','),
-        ...rows.map(row => 
-          row.map(val => `"${val.replace(/"/g, '""')}"`).join(',')
-        )
-      ].join('\n');
+      // Group counts by account
+      const accountCounts = {};
+      emails.forEach(e => {
+        const acct = e.toEmail || e.fetchedBy?.gmailEmail || 'Other';
+        accountCounts[acct] = (accountCounts[acct] || 0) + 1;
+      });
+      const accountSummaryStr = Object.entries(accountCounts)
+        .map(([acct, count]) => `${acct}: ${count}`)
+        .join(' | ');
 
-      // Create download link
-      const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
+      // Build formatted HTML document for Excel
+      const excelHtml = `
+        <html xmlns:o="urn:schemas-microsoft-com:office:office" xmlns:x="urn:schemas-microsoft-com:office:excel" xmlns="http://www.w3.org/TR/REC-html40">
+        <head>
+          <meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+          <!--[if gte mso 9]>
+          <xml>
+            <x:ExcelWorkbook>
+              <x:ExcelWorksheets>
+                <x:ExcelWorksheet>
+                  <x:Name>Inbox Backup</x:Name>
+                  <x:WorksheetOptions>
+                    <x:DisplayGridlines/>
+                  </x:WorksheetOptions>
+                </x:ExcelWorksheet>
+              </x:ExcelWorksheets>
+            </x:ExcelWorkbook>
+          </xml>
+          <![endif]-->
+          <style>
+            body { font-family: 'Calibri', 'Segoe UI', Arial, sans-serif; font-size: 11pt; color: #1e293b; }
+            .title-header { font-size: 18pt; font-weight: bold; color: #4f46e5; padding: 10px 0 5px 0; }
+            .subtitle { font-size: 10pt; color: #64748b; margin-bottom: 15px; }
+            .summary-table { margin-bottom: 20px; font-size: 10pt; border-collapse: collapse; }
+            .summary-table td { padding: 6px 12px; border: 1px solid #cbd5e1; font-weight: bold; }
+            .summary-table .label { background-color: #e2e8f0; color: #334155; }
+            .summary-table .val { background-color: #ffffff; color: #4f46e5; }
+            
+            table.data-table { border-collapse: collapse; width: 100%; font-size: 10pt; }
+            table.data-table th { background-color: #4f46e5; color: #ffffff; font-weight: bold; text-align: left; padding: 10px 12px; border: 1px solid #3730a3; white-space: nowrap; }
+            table.data-table td { padding: 8px 12px; border: 1px solid #cbd5e1; vertical-align: top; }
+            table.data-table tr:nth-child(even) { background-color: #f8fafc; }
+            table.data-table tr:nth-child(odd) { background-color: #ffffff; }
+            
+            .badge-assigned { background-color: #dcfce7; color: #166534; font-weight: bold; padding: 3px 8px; border-radius: 12px; text-align: center; }
+            .badge-unassigned { background-color: #f1f5f9; color: #475569; font-weight: bold; padding: 3px 8px; border-radius: 12px; text-align: center; }
+            .text-muted { color: #64748b; font-size: 9pt; }
+            .subject-cell { font-weight: bold; color: #0f172a; }
+          </style>
+        </head>
+        <body>
+          <div class="title-header">MailDesk &mdash; Workspace Email Backup Report</div>
+          <div class="subtitle">Exported on ${nowStr}</div>
+
+          <table class="summary-table">
+            <tr>
+              <td class="label">Total Emails:</td>
+              <td class="val">${totalEmails}</td>
+              <td class="label">Assigned:</td>
+              <td class="val">${assignedCount}</td>
+              <td class="label">Unassigned:</td>
+              <td class="val">${unassignedCount}</td>
+            </tr>
+            <tr>
+              <td class="label">Accounts:</td>
+              <td class="val" colspan="5">${accountSummaryStr}</td>
+            </tr>
+          </table>
+
+          <table class="data-table">
+            <thead>
+              <tr>
+                <th style="width: 40px;">#</th>
+                <th style="width: 140px;">Date & Time</th>
+                <th style="width: 180px;">From (Sender)</th>
+                <th style="width: 180px;">To (Inbox)</th>
+                <th style="width: 250px;">Subject</th>
+                <th style="width: 100px;">Status</th>
+                <th style="width: 140px;">Assigned To</th>
+                <th style="width: 120px;">Keyword Rule</th>
+                <th style="width: 80px;">Attachments</th>
+                <th style="width: 400px;">Body Content Preview</th>
+              </tr>
+            </thead>
+            <tbody>
+              ${emails.map((email, idx) => {
+                const dateFormatted = email.date ? new Date(email.date).toLocaleString() : 'N/A';
+                const subjectStr = (email.subject || '(No Subject)').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+                const fromStr = (email.from || 'Unknown Sender').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+                const toStr = (email.toEmail || email.fetchedBy?.gmailEmail || 'Unknown Inbox').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+                const statusStr = email.status === 'assigned' ? 'Assigned' : 'Unassigned';
+                const statusClass = email.status === 'assigned' ? 'badge-assigned' : 'badge-unassigned';
+                const assignedName = email.assignedTo?.name || '-';
+                const keywordStr = email.matchedKeyword || '-';
+                const attachCount = (email.attachments || []).length;
+                const cleanBody = email.body
+                  ? email.body.replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 300).replace(/</g, '&lt;').replace(/>/g, '&gt;')
+                  : '';
+
+                return `
+                  <tr>
+                    <td style="text-align: center;">${idx + 1}</td>
+                    <td>${dateFormatted}</td>
+                    <td>${fromStr}</td>
+                    <td>${toStr}</td>
+                    <td class="subject-cell">${subjectStr}</td>
+                    <td><div class="${statusClass}">${statusStr}</div></td>
+                    <td>${assignedName}</td>
+                    <td>${keywordStr}</td>
+                    <td style="text-align: center;">${attachCount}</td>
+                    <td class="text-muted">${cleanBody}</td>
+                  </tr>
+                `;
+              }).join('')}
+            </tbody>
+          </table>
+        </body>
+        </html>
+      `;
+
+      const blob = new Blob([excelHtml], { type: 'application/vnd.ms-excel;charset=utf-8;' });
       const url = URL.createObjectURL(blob);
       const link = document.createElement('a');
       link.setAttribute('href', url);
-      link.setAttribute('download', `workspace_emails_backup_${new Date().toISOString().split('T')[0]}.csv`);
+      link.setAttribute('download', `MailDesk_Inbox_Backup_${exportDateStr}.xls`);
       link.style.visibility = 'hidden';
       document.body.appendChild(link);
       link.click();
@@ -407,7 +512,7 @@ const EmailInbox = () => {
 
       setHasDownloaded(true);
       localStorage.setItem('emailsDownloaded', 'true');
-      triggerAlert('success', 'Emails downloaded successfully! Delete operations are now unlocked.');
+      triggerAlert('success', 'Formatted Excel backup report downloaded successfully! Delete operations are now unlocked.');
     } catch (err) {
       console.error('Error exporting emails:', err);
       triggerAlert('error', 'Failed to export emails.');
