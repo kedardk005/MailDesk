@@ -109,7 +109,16 @@ exports.addComment = async (req, res) => {
     }
     await Promise.all(notifications);
 
-    await logActivity(req.user._id, 'Task Comment', `Commented on task "${task.title}"`);
+    // The audit target is the TASK, not the comment: `targetType` has no
+    // 'Comment' member and "everything that happened to this task" is the
+    // question the log is asked. No before/after — a new comment has no
+    // prior state worth rendering as a diff.
+    await logActivity(req.user._id, 'Task Comment', `Commented on task "${task.title}"`, {
+      req,
+      targetType: 'Task',
+      targetId: task._id,
+      targetLabel: task.title
+    });
 
     // Emit real-time comment event scoped to task assignee and creator rooms
     if (io) {
@@ -175,7 +184,12 @@ exports.deleteComment = async (req, res) => {
 
     await TaskComment.findByIdAndDelete(req.params.commentId);
 
-    await logActivity(req.user._id, 'Task Comment Delete', `Deleted a comment on task "${task.title}"`);
+    await logActivity(req.user._id, 'Task Comment Delete', `Deleted a comment on task "${task.title}"`, {
+      req,
+      targetType: 'Task',
+      targetId: task._id,
+      targetLabel: task.title
+    });
 
     const io = req.app.get('io');
     if (io) {

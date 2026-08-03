@@ -528,7 +528,15 @@ exports.handleOAuthCallback = async (req, res) => {
         user.markModified('linkedGmailAccounts');
         await user.save();
         logger.info({ gmailAddress, userId: String(user._id) }, 'linked extra Gmail account');
-        await logActivity(user._id, 'Gmail Link Extra', `Linked extra Gmail account: ${gmailAddress}`);
+        // Only the ADDRESS is recorded. The OAuth tokens that were just written
+        // to the document must never reach the audit trail — the logger would
+        // redact them, but they are not passed in the first place.
+        await logActivity(user._id, 'Gmail Link Extra', `Linked extra Gmail account: ${gmailAddress}`, {
+          req,
+          targetType: 'User',
+          targetId: user._id,
+          targetLabel: gmailAddress
+        });
       } else {
         // Update tokens if account already exists
         const acct = user.linkedGmailAccounts.find(a => a.gmailEmail === gmailAddress);
@@ -542,6 +550,7 @@ exports.handleOAuthCallback = async (req, res) => {
       }
     } else {
       // Save as primary Gmail account
+      const previousPrimary = user.gmailEmail || null;
       user.gmailAccessToken = encrypt(tokens.access_token);
       if (tokens.refresh_token) {
         user.gmailRefreshToken = encrypt(tokens.refresh_token);
@@ -549,7 +558,15 @@ exports.handleOAuthCallback = async (req, res) => {
       user.gmailEmail = gmailAddress;
       await user.save();
       logger.info({ userId: String(user._id) }, 'saved primary Google credentials');
-      await logActivity(user._id, 'Gmail Connection', `Connected Gmail account: ${gmailAddress}`);
+      // ADDRESSES ONLY — the token fields written above are never passed here.
+      await logActivity(user._id, 'Gmail Connection', `Connected Gmail account: ${gmailAddress}`, {
+        req,
+        targetType: 'User',
+        targetId: user._id,
+        targetLabel: gmailAddress,
+        before: { gmailEmail: previousPrimary },
+        after: { gmailEmail: gmailAddress }
+      });
     }
 
     // No workspace-wide de-duplication sweep here: the uniqueness check above
@@ -969,10 +986,19 @@ const syncUserEmails = async (user, isManual = false, onProgress = null) => {
     await cache.invalidateStats();
   }
 
+  // NO `req`: this runs inside the gmail-sync queue worker (and the cron job),
+  // so there genuinely is no client IP or user agent to record. Leaving them
+  // null is the accurate answer; the actor's last request address would be a
+  // fabrication. The target is the mailbox set that was synced.
   await logActivity(
     user._id,
     isManual ? 'Gmail Fetch' : 'Gmail Fetch Auto',
-    `${isManual ? 'Manually' : 'Automatically'} fetched Gmail emails (Found ${totalNew} new emails)`
+    `${isManual ? 'Manually' : 'Automatically'} fetched Gmail emails (Found ${totalNew} new emails)`,
+    {
+      targetType: 'User',
+      targetId: user._id,
+      targetLabel: mailboxes.map((m) => m.inboxEmail).filter(Boolean).join(', ')
+    }
   );
 
   return totalNew;
@@ -1656,7 +1682,13 @@ exports.deleteAllEmails = async (req, res) => {
     await Task.updateMany({ linkedEmail: { $ne: null } }, { $set: { linkedEmail: null } });
     await cache.invalidateStats();
 
-    await logActivity(req.user._id, 'Gmail Delete All', `Cleared all emails (${result.modifiedCount} emails deleted)`);
+    // Workspace-wide sweep: no single target document exists, so `targetId`
+    // stays null rather than being invented.
+    await logActivity(req.user._id, 'Gmail Delete All', `Cleared all emails (${result.modifiedCount} emails deleted)`, {
+      req,
+      targetType: 'Email',
+      targetLabel: `${result.modifiedCount} email(s) (entire workspace inbox)`
+    });
 
     return res.status(200).json({
       message: "All emails cleared",
@@ -1827,7 +1859,12 @@ exports.disconnectLinkedAccount = async (req, res) => {
       // Remove blank linked accounts
       user.linkedGmailAccounts = user.linkedGmailAccounts.filter(a => !!a.gmailEmail);
       await user.save();
-      await logActivity(req.user._id, 'Gmail Clean Blank Accounts', `Cleared blank Gmail connections for user ${user.email}`);
+      await logActivity(req.user._id, 'Gmail Clean Blank Accounts', `Cleared blank Gmail connections for user ${user.email}`, {
+        req,
+        targetType: 'User',
+        targetId: targetUserId,
+        targetLabel: user.email
+      });
       return res.status(200).json({ message: 'Blank connection cleared successfully.' });
     }
 
@@ -1906,6 +1943,7 @@ exports.disconnectGmail = async (req, res) => {
     if (!user) {
       return res.status(404).json({ message: "User not found" });
     }
+    const previousGmailEmail = user.gmailEmail || null;
     user.gmailAccessToken = "";
     user.gmailRefreshToken = "";
     user.gmailEmail = "";
@@ -1931,7 +1969,16 @@ exports.disconnectGmail = async (req, res) => {
     await cache.delPrefix(`gtok:${String(userId)}:`);
     await cache.invalidateStats();
 
-    await logActivity(userId, 'Gmail Disconnect', `Disconnected Gmail account for user ${user.email}`);
+    // Addresses and counts only — the token fields cleared above are never
+    // passed into the audit payload.
+    await logActivity(userId, 'Gmail Disconnect', `Disconnected Gmail account for user ${user.email}`, {
+      req,
+      targetType: 'User',
+      targetId: userId,
+      targetLabel: user.email,
+      before: { gmailEmail: previousGmailEmail },
+      after: { gmailEmail: null, emailsSoftDeleted: emailIds.length }
+    });
 
     return res.status(200).json({ message: "Gmail disconnected successfully" });
   } catch (error) {
@@ -1957,11 +2004,13 @@ exports.disconnectGmail = async (req, res) => {
  *  - Every single change writes an ActivityLog entry.
  *  - Supports a dry run so conflicts can be reported without mutating anything.
  *
- * @param {{ dryRun?: Boolean, actorId?: String }} options
+ * @param {{ dryRun?: Boolean, actorId?: String, req?: Object }} options - `req`
+ *   is optional and used only to stamp the audit entries with the caller's IP
+ *   and user agent; omit it when the sweep is not driven by a request.
  * @returns {Promise<{ changes: Array, scannedUsers: Number, dryRun: Boolean }>}
  */
 const deduplicateConnections = async (options = {}) => {
-  const { dryRun = false, actorId = null } = options;
+  const { dryRun = false, actorId = null, req = null } = options;
   const changes = [];
 
   const users = await User.find({ deletedAt: null })
@@ -2086,11 +2135,21 @@ const deduplicateConnections = async (options = {}) => {
   // Audit every change, not just a console line.
   if (!dryRun && changes.length > 0 && actorId) {
     for (const change of changes) {
+      // The target is the user whose connection was removed, NOT the admin who
+      // triggered the sweep (that is the actor, `userId`).
       await logActivity(
         actorId,
         'Gmail Deduplicate',
         `Removed ${change.reason} ${change.type} Gmail connection ${change.gmailEmail || '(blank)'} from user ${change.userEmail}` +
-          (change.ownedBy ? ` (owned by ${change.ownedBy})` : '')
+          (change.ownedBy ? ` (owned by ${change.ownedBy})` : ''),
+        {
+          req,
+          targetType: 'User',
+          targetId: change.userId,
+          targetLabel: change.userEmail,
+          before: { connectionType: change.type, gmailEmail: change.gmailEmail || null },
+          after: { connectionType: change.type, gmailEmail: null, reason: change.reason }
+        }
       );
     }
   }
@@ -2106,7 +2165,7 @@ exports.deduplicateGmailConnections = async (req, res) => {
     // Defaults to a dry run: pass { "apply": true } to actually write.
     const apply = req.body && req.body.apply === true;
 
-    const result = await deduplicateConnections({ dryRun: !apply, actorId: req.user._id });
+    const result = await deduplicateConnections({ dryRun: !apply, actorId: req.user._id, req });
 
     return res.status(200).json({
       message: apply
@@ -2335,7 +2394,15 @@ exports.replyToEmail = async (req, res) => {
       );
     }
 
-    await logActivity(req.user._id, 'Email Reply', `Replied to email "${email.subject}" from ${email.from}`);
+    // Target is the email that was REPLIED TO. No before/after: sending a reply
+    // creates a new outbound message rather than transitioning this one, and
+    // the reply body is deliberately not copied into the audit trail.
+    await logActivity(req.user._id, 'Email Reply', `Replied to email "${email.subject}" from ${email.from}`, {
+      req,
+      targetType: 'Email',
+      targetId: email._id,
+      targetLabel: email.subject
+    });
 
     // Additive only: the pre-existing `message` field is unchanged.
     return res.status(200).json({
@@ -2382,7 +2449,10 @@ exports.bulkAssignEmails = async (req, res) => {
 
     // Projection: only the fields the task body needs. This used to load every
     // full document including the base64-laden body.
-    const emails = await Email.find(scope).select('_id subject from').lean();
+    // `status` is additionally selected so the audit entry can record the state
+    // this assignment replaced. `emails` is not echoed in the response, so the
+    // response shape is untouched.
+    const emails = await Email.find(scope).select('_id subject from status').lean();
     if (emails.length === 0) {
       return res.status(404).json({ message: 'No matching emails found.' });
     }
@@ -2447,7 +2517,30 @@ exports.bulkAssignEmails = async (req, res) => {
     await logActivity(
       req.user._id,
       'Bulk Email Assignment',
-      `Assigned ${emails.length} emails to ${assignee.name}`
+      `Assigned ${emails.length} emails to ${assignee.name}`,
+      {
+        req,
+        targetType: 'Email',
+        // N emails: a single id would be arbitrary, so only the count is named.
+        targetId: emails.length === 1 ? emails[0]._id : null,
+        targetLabel: emails.length === 1 ? emails[0].subject : `${emails.length} email(s)`,
+        // Real prior statuses, summarised — the scope does not require the
+        // emails to have been unassigned, so it must not be assumed.
+        before: {
+          statusCounts: emails.reduce((acc, e) => {
+            const key = e.status || 'Unknown';
+            acc[key] = (acc[key] || 0) + 1;
+            return acc;
+          }, {}),
+          emailCount: emails.length
+        },
+        after: {
+          status: 'assigned',
+          assignedTo: String(assignee._id),
+          assignedToName: assignee.name,
+          emailCount: emails.length
+        }
+      }
     );
 
     return res.status(200).json({

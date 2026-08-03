@@ -124,7 +124,20 @@ exports.createKeywordRule = async (req, res) => {
     await logActivity(
       req.user._id,
       'Keyword Rule Creation',
-      `Created keyword rule: "${cleanKeyword}" mapped to ${employee.name}`
+      `Created keyword rule: "${cleanKeyword}" mapped to ${employee.name}`,
+      {
+        req,
+        targetType: 'KeywordRule',
+        targetId: rule._id,
+        targetLabel: cleanKeyword,
+        after: {
+          keyword: cleanKeyword,
+          assignedTo: String(assignedTo),
+          assignedToName: employee.name,
+          autoApprove: rule.autoApprove,
+          isActive: rule.isActive
+        }
+      }
     );
 
     // The active-rule cache feeds the Gmail sync loop, so it must be dropped the
@@ -221,7 +234,16 @@ exports.runKeywordBackfillJob = async (data, context) => {
   }
 
   await cache.invalidateStats();
-  await logActivity(actorId, 'Keyword Rule Backfill', `Flagged ${matched} existing email(s) for keyword "${keyword}"`);
+  // Runs on the keyword-backfill QUEUE WORKER, not in a request: there is no
+  // `req`, so `ip`/`userAgent` stay null. That is the honest record — a
+  // background job has no client address, and synthesising one would make the
+  // audit trail lie. `targetId` is the keyword itself (targetId is a String
+  // precisely so non-document targets like this can be recorded).
+  await logActivity(actorId, 'Keyword Rule Backfill', `Flagged ${matched} existing email(s) for keyword "${keyword}"`, {
+    targetType: 'KeywordRule',
+    targetId: keyword,
+    targetLabel: keyword
+  });
 
   return { keyword, matched };
 };
@@ -243,6 +265,14 @@ exports.updateKeywordRule = async (req, res) => {
       return res.status(403).json({ message: 'Access denied. You can only modify keyword rules you created.' });
     }
 
+    // Snapshot before the assignments below mutate the document.
+    const beforeRule = {
+      keyword: rule.keyword,
+      assignedTo: rule.assignedTo ? String(rule.assignedTo) : null,
+      autoApprove: rule.autoApprove,
+      isActive: rule.isActive
+    };
+
     if (assignedTo) {
       const employee = await User.findOne({ _id: assignedTo, deletedAt: null });
       if (!employee) {
@@ -263,7 +293,21 @@ exports.updateKeywordRule = async (req, res) => {
     await logActivity(
       req.user._id,
       'Keyword Rule Update',
-      `Updated rule for keyword: "${rule.keyword}"`
+      `Updated rule for keyword: "${rule.keyword}"`,
+      {
+        req,
+        targetType: 'KeywordRule',
+        targetId: rule._id,
+        targetLabel: rule.keyword,
+        before: beforeRule,
+        after: {
+          keyword: rule.keyword,
+          // `assignedTo` is populated by this point, so read the id off the doc.
+          assignedTo: rule.assignedTo?._id ? String(rule.assignedTo._id) : null,
+          autoApprove: rule.autoApprove,
+          isActive: rule.isActive
+        }
+      }
     );
 
     return res.status(200).json(rule);
@@ -295,7 +339,19 @@ exports.deleteKeywordRule = async (req, res) => {
     await logActivity(
       req.user._id,
       'Keyword Rule Delete',
-      `Deleted keyword rule for "${rule.keyword}"`
+      `Deleted keyword rule for "${rule.keyword}"`,
+      {
+        req,
+        targetType: 'KeywordRule',
+        targetId: rule._id,
+        targetLabel: rule.keyword,
+        before: {
+          keyword: rule.keyword,
+          assignedTo: rule.assignedTo ? String(rule.assignedTo) : null,
+          autoApprove: rule.autoApprove,
+          isActive: rule.isActive
+        }
+      }
     );
 
     return res.status(200).json({ message: `Keyword rule "${rule.keyword}" deleted successfully.` });
@@ -350,13 +406,24 @@ exports.approveEmailAssignment = async (req, res) => {
 
     // Scoped: a Head could previously approve/reassign ANY email by id.
     // Projection: this handler needs six fields, not a base64-laden body.
+    // `status`, `approvalStatus` and `assignedTo` are selected so the audit
+    // entry can record the state this approval replaced. The response shape is
+    // unchanged: all three are assigned onto `email` unconditionally below, so
+    // they were already present on the returned object.
     const email = await Email.findOne(scopeEmailQuery(req.user, { _id: req.params.id }))
-      .select('_id subject snippet from matchedKeyword suggestedAssignedTo fetchedBy')
+      .select('_id subject snippet from matchedKeyword suggestedAssignedTo fetchedBy status approvalStatus assignedTo')
       .lean();
 
     if (!email) {
       return res.status(404).json({ message: 'Email not found.' });
     }
+
+    // Captured before the local mutations below overwrite the lean copy.
+    const beforeEmail = {
+      status: email.status,
+      approvalStatus: email.approvalStatus,
+      assignedTo: email.assignedTo ? String(email.assignedTo) : null
+    };
 
     let assignedUserId = targetUserId;
     if (typeof assignedUserId === 'object' && assignedUserId !== null && assignedUserId._id) {
@@ -401,7 +468,20 @@ exports.approveEmailAssignment = async (req, res) => {
     await logActivity(
       req.user._id,
       'Keyword Mail Approved',
-      `Approved assignment of email "${email.subject}" to ${employee.name}`
+      `Approved assignment of email "${email.subject}" to ${employee.name}`,
+      {
+        req,
+        targetType: 'Email',
+        targetId: email._id,
+        targetLabel: email.subject,
+        before: beforeEmail,
+        after: {
+          status: 'assigned',
+          approvalStatus: 'approved',
+          assignedTo: String(assignedUserId),
+          assignedToName: employee.name
+        }
+      }
     );
 
     return res.status(200).json({
@@ -505,10 +585,19 @@ exports.bulkApproveEmails = async (req, res) => {
       await cache.invalidateStats();
     }
 
+    // N emails, so no single honest `targetId`; the keyword is what scoped the
+    // sweep and is recorded as the label.
     await logActivity(
       req.user._id,
       'Keyword Mail Bulk Approved',
-      `Approved ${approvedCount} email assignment(s) for keyword: ${keyword || 'All'}`
+      `Approved ${approvedCount} email assignment(s) for keyword: ${keyword || 'All'}`,
+      {
+        req,
+        targetType: 'Email',
+        targetLabel: `${approvedCount} email(s) matching "${keyword.trim().toUpperCase()}"`,
+        before: { approvalStatus: 'pending', emailCount: approvedCount },
+        after: { approvalStatus: 'approved', status: 'assigned', emailCount: approvedCount }
+      }
     );
 
     return res.status(200).json({
