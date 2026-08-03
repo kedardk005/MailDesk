@@ -453,7 +453,11 @@ exports.approveEmailAssignment = async (req, res) => {
     email.approvalStatus = 'approved';
 
     // Create / link Task for TaskList module (atomic upsert)
-    await ensureTaskForEmail(email, assignedUserId, req.user._id);
+    // Capture the task: this is the single-email path, so the notification can
+    // deep-link straight to the work item. It previously passed taskId: null
+    // despite having just created the task, leaving the bell entry with
+    // nowhere to go.
+    const linkedTask = await ensureTaskForEmail(email, assignedUserId, req.user._id);
     await cache.invalidateStats();
 
     const io = req.app.get('io');
@@ -461,7 +465,7 @@ exports.approveEmailAssignment = async (req, res) => {
       employee._id,
       `Mail assigned to you (Keyword: ${email.matchedKeyword || 'Auto'}): "${email.subject}"`,
       io,
-      null,
+      linkedTask?._id || null,
       'email_assigned'
     );
 

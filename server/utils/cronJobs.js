@@ -81,7 +81,13 @@ const runOverdueScan = async (io) => {
       notifications.push({
         userId: task.assignedTo._id,
         message: `Your task is overdue: ${task.title}`,
-        taskId: task._id
+        taskId: task._id,
+        // Was untyped while the supervisor digest below set `task_overdue`, so
+        // the person who actually owns the task got a row the bell rendered as
+        // a generic "Update" — and, worse, one that per-type preference
+        // suppression skipped entirely, making the Profile toggle a no-op for
+        // exactly the user it matters most to.
+        type: 'task_overdue'
       });
     }
   }
