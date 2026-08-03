@@ -1262,6 +1262,105 @@ const main = async () => {
   adminSecondTab.disconnect();
   empSocket.disconnect();
 
+  // =====================================================================
+  // S-2 — structured audit trail
+  //
+  // The Admin Activity Log renders ip / userAgent / target / before / after,
+  // but those columns are only populated when a call site passes the `meta`
+  // argument. Asserting the API returned 200 proves nothing about them, so
+  // these checks read the ActivityLog document straight out of MongoDB and
+  // assert the structured fields the page actually shows.
+  // =====================================================================
+  console.log('\nS-2: audit entries carry ip and a structured target');
+  const ActivityLog = require('../models/ActivityLog');
+  const AUDIT_UA = 'MailDeskSmokeTest/1.0';
+  const auditClientName = 'Smoke Audit Client';
+  await Client.deleteMany({ name: auditClientName });
+
+  // A task action.
+  const auditTaskRes = await api('/api/tasks', {
+    token: adminToken,
+    method: 'POST',
+    headers: { 'User-Agent': AUDIT_UA },
+    body: {
+      title: 'Smoke Audit Task',
+      clientName: 'Smoke Client',
+      assignedTo: String(adminUser._id),
+      deadline: new Date(Date.now() + 86400000).toISOString(),
+      priority: 'High'
+    }
+  });
+  check('audit fixture: POST /api/tasks is 201', auditTaskRes.status === 201, `got ${auditTaskRes.status} ${JSON.stringify(auditTaskRes.json)}`);
+  const auditTaskId = auditTaskRes.json?._id;
+
+  const taskLog = await ActivityLog.findOne({ action: 'Task Creation', targetId: String(auditTaskId) }).lean();
+  check('Task Creation writes an ActivityLog row', Boolean(taskLog), `no row for target ${auditTaskId}`);
+  check('Task Creation records the client ip', Boolean(taskLog?.ip), `ip=${JSON.stringify(taskLog?.ip)}`);
+  check('Task Creation records the user agent', taskLog?.userAgent === AUDIT_UA, `userAgent=${JSON.stringify(taskLog?.userAgent)}`);
+  check("Task Creation targetType is 'Task'", taskLog?.targetType === 'Task', `targetType=${JSON.stringify(taskLog?.targetType)}`);
+  check('Task Creation targetId is the created task', taskLog?.targetId === String(auditTaskId), `targetId=${JSON.stringify(taskLog?.targetId)}`);
+  check('Task Creation targetLabel is the task title', taskLog?.targetLabel === 'Smoke Audit Task', `targetLabel=${JSON.stringify(taskLog?.targetLabel)}`);
+  check('Task Creation records the actor, not the target, as userId', String(taskLog?.userId) === String(adminUser._id), `userId=${taskLog?.userId}`);
+  check('a create records `after` only (no meaningless `before`)', Boolean(taskLog?.after) && taskLog?.before === null, JSON.stringify({ before: taskLog?.before, after: taskLog?.after }));
+
+  // A genuine state transition must record BOTH sides.
+  const auditTaskUpdate = await api(`/api/tasks/${auditTaskId}`, {
+    token: adminToken,
+    method: 'PUT',
+    headers: { 'User-Agent': AUDIT_UA },
+    body: { status: 'Completed' }
+  });
+  check('audit fixture: PUT /api/tasks/:id is 200', auditTaskUpdate.status === 200, `got ${auditTaskUpdate.status}`);
+  const taskUpdateLog = await ActivityLog.findOne({ action: 'Task Update', targetId: String(auditTaskId) }).sort({ createdAt: -1 }).lean();
+  check('Task Update records the client ip', Boolean(taskUpdateLog?.ip), `ip=${JSON.stringify(taskUpdateLog?.ip)}`);
+  check('Task Update targets the task', taskUpdateLog?.targetType === 'Task' && taskUpdateLog?.targetId === String(auditTaskId), JSON.stringify({ t: taskUpdateLog?.targetType, id: taskUpdateLog?.targetId }));
+  check(
+    'a status transition records both before and after',
+    taskUpdateLog?.before?.status === 'Pending' && taskUpdateLog?.after?.status === 'Completed',
+    JSON.stringify({ before: taskUpdateLog?.before?.status, after: taskUpdateLog?.after?.status })
+  );
+
+  // A client action.
+  const auditClientRes = await api('/api/tasks/clients', {
+    token: adminToken,
+    method: 'POST',
+    headers: { 'User-Agent': AUDIT_UA },
+    body: { name: auditClientName, associatedEmails: ['audit@example.test'] }
+  });
+  check('audit fixture: POST /api/tasks/clients is 201', auditClientRes.status === 201, `got ${auditClientRes.status} ${JSON.stringify(auditClientRes.json)}`);
+  const auditClientId = auditClientRes.json?._id;
+
+  const clientLog = await ActivityLog.findOne({ action: 'Client Creation', targetId: String(auditClientId) }).lean();
+  check('Client Creation writes an ActivityLog row', Boolean(clientLog), `no row for target ${auditClientId}`);
+  check('Client Creation records the client ip', Boolean(clientLog?.ip), `ip=${JSON.stringify(clientLog?.ip)}`);
+  check('Client Creation records the user agent', clientLog?.userAgent === AUDIT_UA, `userAgent=${JSON.stringify(clientLog?.userAgent)}`);
+  check("Client Creation targetType is 'Client'", clientLog?.targetType === 'Client', `targetType=${JSON.stringify(clientLog?.targetType)}`);
+  check('Client Creation targetId is the created client', clientLog?.targetId === String(auditClientId), `targetId=${JSON.stringify(clientLog?.targetId)}`);
+  check('Client Creation targetLabel is the client name', clientLog?.targetLabel === auditClientName, `targetLabel=${JSON.stringify(clientLog?.targetLabel)}`);
+
+  // The structured target is queryable through the admin endpoint, which is
+  // what makes the Activity Log page's target filter work.
+  // `page` is what switches the endpoint into the paginated envelope
+  // (utils/paginate listResponse), so it must be sent to read `.data`.
+  const byTarget = await api(`/api/users/activity-logs?page=1&limit=10&targetType=Task&targetId=${auditTaskId}`, { token: adminToken });
+  const byTargetRows = byTarget.json?.data || [];
+  check('activity-logs can be filtered by targetType + targetId', byTarget.status === 200 && byTargetRows.length >= 2, `got ${byTarget.status} with ${byTargetRows.length} rows`);
+  check(
+    'the filtered rows expose ip and target to the UI',
+    byTargetRows.length >= 2 && byTargetRows.every((r) => r.ip && r.targetType === 'Task' && r.targetId === String(auditTaskId)),
+    JSON.stringify(byTargetRows[0])
+  );
+
+  // No credential may reach the audit trail, whatever a call site passes.
+  const auditPayloads = JSON.stringify(
+    await ActivityLog.find({ userId: adminUser._id }).select('before after').lean()
+  );
+  check(
+    'no audit before/after payload contains a credential-shaped value',
+    !/gmailAccessToken|gmailRefreshToken|"password"|resetTokenHash/i.test(auditPayloads),
+    'a credential key survived into an audit payload'
+  );
+
   console.log('\nS-6: change-password returns a replacement token');
   const NEW_PASSWORD = 'SmokeTest!9876';
   const changed = await api('/api/users/change-password', {
@@ -1291,7 +1390,10 @@ const main = async () => {
   // Covers the F-3 fixture (`smoke-ai-hostile`) too.
   await Email.deleteMany({ messageId: /^smoke-/ });
   await Task.deleteMany({ clientName: { $in: ['Smoke Client', 'Smoke Pref Client', slaClient] } });
-  await Client.deleteMany({ name: 'Smoke Client' });
+  await Client.deleteMany({ name: { $in: ['Smoke Client', auditClientName] } });
+  // The S-2 section reads real audit rows, so the rows this run wrote are
+  // removed with the users that authored them rather than left as orphans.
+  await ActivityLog.deleteMany({ userId: { $in: [adminUser._id, headUser._id] } });
   await User.deleteMany({ email: { $in: [adminEmail, employeeEmail, headEmail] } });
   await mongoose.disconnect();
 

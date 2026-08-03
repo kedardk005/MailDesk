@@ -56,6 +56,30 @@ const claimRecurrenceSpawn = async (task, io) => {
   await spawnNextRecurrence(task, io);
 };
 
+/**
+ * The audit-visible shape of a task, for ActivityLog `before`/`after`.
+ *
+ * Deliberately a small, stable projection rather than the whole document: the
+ * log renders these as a diff, and dumping every field would bury the one that
+ * actually changed. Contains nothing credential-shaped.
+ *
+ * @param {Object} doc - a Task document (or lean object)
+ * @returns {Object|null}
+ */
+const taskSnapshot = (doc) => {
+  if (!doc) return null;
+  return {
+    title: doc.title,
+    status: doc.status,
+    priority: doc.priority,
+    clientName: doc.clientName,
+    assignedTo: doc.assignedTo?._id ? String(doc.assignedTo._id) : (doc.assignedTo ? String(doc.assignedTo) : null),
+    deadline: doc.deadline || null,
+    isRecurring: !!doc.isRecurring,
+    completedAt: doc.completedAt || null
+  };
+};
+
 
 // @desc    Create a new task
 // @route   POST /api/tasks
@@ -133,7 +157,15 @@ exports.createTask = async (req, res) => {
       .populate('linkedEmail', 'subject from')
       .populate('createdBy', 'name');
 
-    await logActivity(req.user._id, 'Task Creation', `Created task "${populatedTask.title}" (Assigned to: ${populatedTask.assignedTo?.name || 'N/A'}, Client: ${populatedTask.clientName})`);
+    // A create has no meaningful `before`, so only `after` is attached — the
+    // log renders a one-sided change as a single snapshot.
+    await logActivity(req.user._id, 'Task Creation', `Created task "${populatedTask.title}" (Assigned to: ${populatedTask.assignedTo?.name || 'N/A'}, Client: ${populatedTask.clientName})`, {
+      req,
+      targetType: 'Task',
+      targetId: populatedTask._id,
+      targetLabel: populatedTask.title,
+      after: taskSnapshot(populatedTask)
+    });
 
     // Send real-time notification to the assignee
     const io = req.app.get('io');
@@ -262,6 +294,11 @@ exports.updateTask = async (req, res) => {
       return res.status(404).json({ message: 'Task not found.' });
     }
 
+    // Captured BEFORE any branch mutates the in-memory document (the Employee
+    // completion path assigns `task.status` directly), so the audit `before`
+    // is genuinely the prior state.
+    const beforeState = taskSnapshot(task);
+
     let shouldSpawnRecurrence = false;
 
     // Role checks
@@ -343,7 +380,15 @@ exports.updateTask = async (req, res) => {
       await logActivity(
         req.user._id,
         'Task Update',
-        `Updated task "${completedTask.title}" (Status: ${completedTask.status})`
+        `Updated task "${completedTask.title}" (Status: ${completedTask.status})`,
+        {
+          req,
+          targetType: 'Task',
+          targetId: completedTask._id,
+          targetLabel: completedTask.title,
+          before: beforeState,
+          after: taskSnapshot(completedTask)
+        }
       );
 
       // Return early: the status write already happened atomically above, so
@@ -420,7 +465,14 @@ exports.updateTask = async (req, res) => {
       .populate('linkedEmail', LINKED_EMAIL_DETAIL_FIELDS)
       .populate('createdBy', 'name');
 
-    await logActivity(req.user._id, 'Task Update', `Updated task "${populatedTask.title}" (Status: ${populatedTask.status}, Assigned to: ${populatedTask.assignedTo?.name || 'N/A'})`);
+    await logActivity(req.user._id, 'Task Update', `Updated task "${populatedTask.title}" (Status: ${populatedTask.status}, Assigned to: ${populatedTask.assignedTo?.name || 'N/A'})`, {
+      req,
+      targetType: 'Task',
+      targetId: populatedTask._id,
+      targetLabel: populatedTask.title,
+      before: beforeState,
+      after: taskSnapshot(populatedTask)
+    });
 
     return res.status(200).json(sanitizeTaskLinkedEmail(populatedTask));
   } catch (error) {
@@ -454,7 +506,15 @@ exports.deleteTask = async (req, res) => {
 
     await Task.findByIdAndDelete(req.params.id);
 
-    await logActivity(req.user._id, 'Task Deletion', `Deleted task "${task.title}" (Client: ${task.clientName})`);
+    // No before/after on a delete: the "after" side is meaningless and the UI
+    // already renders a one-sided change as a single snapshot.
+    await logActivity(req.user._id, 'Task Deletion', `Deleted task "${task.title}" (Client: ${task.clientName})`, {
+      req,
+      targetType: 'Task',
+      targetId: task._id,
+      targetLabel: task.title,
+      before: taskSnapshot(task)
+    });
     await cache.invalidateStats();
 
     return res.status(200).json({ message: 'Task deleted successfully.' });
@@ -508,8 +568,10 @@ exports.bulkTaskAction = async (req, res) => {
     // ONE query, reused by every branch below. The original ran up to three
     // separate `Task.find({_id:{$in:taskIds}})` calls in a single handler, each
     // hydrating up to 500 full documents.
+    // `status` and `assignedTo` are selected purely so the audit entry can
+    // record the state the bulk write replaced. Still one lean query.
     const tasks = await Task.find({ _id: { $in: taskIds } })
-      .select('_id createdBy linkedEmail')
+      .select('_id createdBy linkedEmail status assignedTo')
       .lean();
 
     // For Head role, make sure they created all tasks they are trying to perform bulk action on
@@ -533,7 +595,14 @@ exports.bulkTaskAction = async (req, res) => {
       }
       await Task.deleteMany({ _id: { $in: taskIds } });
       result = { deleted: taskIds.length };
-      await logActivity(req.user._id, 'Bulk Task Delete', `Bulk deleted ${taskIds.length} tasks`);
+      // A bulk action has N targets, so there is no single honest `targetId`.
+      // The type and a countable label are recorded; inventing one id would be
+      // worse than leaving it null.
+      await logActivity(req.user._id, 'Bulk Task Delete', `Bulk deleted ${taskIds.length} tasks`, {
+        req,
+        targetType: 'Task',
+        targetLabel: `${taskIds.length} task(s)`
+      });
     }
 
     else if (action === 'status') {
@@ -555,7 +624,20 @@ exports.bulkTaskAction = async (req, res) => {
         await Task.updateMany({ _id: { $in: taskIds } }, { $set: { status: value, completedAt: null } });
       }
       result = { updated: taskIds.length, status: value };
-      await logActivity(req.user._id, 'Bulk Task Status', `Bulk set ${taskIds.length} tasks to "${value}"`);
+      // Summarised rather than per-task: 500 rows of before/after would blow
+      // past the logger's size bound and be discarded wholesale.
+      const beforeStatusCounts = tasks.reduce((acc, t) => {
+        const key = t.status || 'Unknown';
+        acc[key] = (acc[key] || 0) + 1;
+        return acc;
+      }, {});
+      await logActivity(req.user._id, 'Bulk Task Status', `Bulk set ${taskIds.length} tasks to "${value}"`, {
+        req,
+        targetType: 'Task',
+        targetLabel: `${taskIds.length} task(s)`,
+        before: { statusCounts: beforeStatusCounts },
+        after: { status: value, taskCount: taskIds.length }
+      });
     }
 
     else if (action === 'reassign') {
@@ -569,7 +651,16 @@ exports.bulkTaskAction = async (req, res) => {
         await Email.updateMany({ _id: { $in: linkedEmailIds } }, { $set: { assignedTo: value, status: 'assigned' } });
       }
       result = { updated: taskIds.length, assignedTo: targetUser.name };
-      await logActivity(req.user._id, 'Bulk Task Reassign', `Bulk reassigned ${taskIds.length} tasks to ${targetUser.name}`);
+      const beforeAssignees = [
+        ...new Set(tasks.map((t) => (t.assignedTo ? String(t.assignedTo) : 'unassigned')))
+      ].slice(0, 20);
+      await logActivity(req.user._id, 'Bulk Task Reassign', `Bulk reassigned ${taskIds.length} tasks to ${targetUser.name}`, {
+        req,
+        targetType: 'Task',
+        targetLabel: `${taskIds.length} task(s)`,
+        before: { assignedTo: beforeAssignees },
+        after: { assignedTo: String(value), assignedToName: targetUser.name, taskCount: taskIds.length }
+      });
     }
 
     await cache.invalidateStats();
@@ -610,7 +701,13 @@ exports.createClient = async (req, res) => {
 
     await client.save();
     await cache.invalidateClients();
-    await logActivity(req.user._id, 'Client Creation', `Created client "${client.name}"`);
+    await logActivity(req.user._id, 'Client Creation', `Created client "${client.name}"`, {
+      req,
+      targetType: 'Client',
+      targetId: client._id,
+      targetLabel: client.name,
+      after: { name: client.name, associatedEmails: [...(client.associatedEmails || [])] }
+    });
 
     return res.status(201).json(client);
   } catch (error) {
@@ -629,6 +726,9 @@ exports.updateClient = async (req, res) => {
     if (!client) {
       return res.status(404).json({ message: 'Client not found.' });
     }
+
+    // Snapshot before the field assignments below mutate the document.
+    const beforeClient = { name: client.name, associatedEmails: [...(client.associatedEmails || [])] };
 
     if (name !== undefined) {
       const trimmedName = name.trim();
@@ -653,7 +753,14 @@ exports.updateClient = async (req, res) => {
 
     await client.save();
     await cache.invalidateClients();
-    await logActivity(req.user._id, 'Client Update', `Updated client "${client.name}"`);
+    await logActivity(req.user._id, 'Client Update', `Updated client "${client.name}"`, {
+      req,
+      targetType: 'Client',
+      targetId: client._id,
+      targetLabel: client.name,
+      before: beforeClient,
+      after: { name: client.name, associatedEmails: [...(client.associatedEmails || [])] }
+    });
 
     return res.status(200).json(client);
   } catch (error) {
@@ -674,7 +781,13 @@ exports.deleteClient = async (req, res) => {
 
     await Client.findByIdAndDelete(req.params.id);
     await cache.invalidateClients();
-    await logActivity(req.user._id, 'Client Deletion', `Deleted client "${client.name}"`);
+    await logActivity(req.user._id, 'Client Deletion', `Deleted client "${client.name}"`, {
+      req,
+      targetType: 'Client',
+      targetId: client._id,
+      targetLabel: client.name,
+      before: { name: client.name, associatedEmails: [...(client.associatedEmails || [])] }
+    });
 
     return res.status(200).json({ message: 'Client deleted successfully.' });
   } catch (error) {
