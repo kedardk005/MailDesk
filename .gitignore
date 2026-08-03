@@ -60,11 +60,10 @@ node_modules/
 .yarn-integrity
 
 # dotenv environment variable files
-.env
-.env.development.local
-.env.test.local
-.env.production.local
-.env.local
+# Ignore every .env variant (including .env.production, which the previous
+# block missed) and keep only the committed template.
+.env*
+!.env.example
 
 # OS files
 .DS_Store

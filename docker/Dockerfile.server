@@ -1,0 +1,34 @@
+# syntax=docker/dockerfile:1
+# ---- Build stage: install production deps only ----
+FROM node:22-alpine AS deps
+
+WORKDIR /app
+
+# Copy manifests first so this layer caches across source changes
+COPY server/package.json server/package-lock.json ./
+RUN npm ci --omit=dev
+
+# ---- Runtime stage ----
+FROM node:22-alpine AS runtime
+
+# dumb-init gives us correct PID-1 signal forwarding so SIGTERM reaches Node
+# and the app's graceful-shutdown handler actually runs.
+RUN apk add --no-cache dumb-init
+
+ENV NODE_ENV=production
+WORKDIR /app
+
+# Run unprivileged. The node image ships a `node` user (uid 1000).
+COPY --from=deps --chown=node:node /app/node_modules ./node_modules
+COPY --chown=node:node server/ ./
+
+USER node
+
+EXPOSE 5015
+
+# The server exposes GET /api/health, which returns 503 when Mongo is down.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
+  CMD node -e "require('http').get('http://127.0.0.1:'+(process.env.PORT||5015)+'/api/health',r=>process.exit(r.statusCode===200?0:1)).on('error',()=>process.exit(1))"
+
+ENTRYPOINT ["dumb-init", "--"]
+CMD ["node", "index.js"]
