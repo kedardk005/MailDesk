@@ -1,1014 +1,1510 @@
-import React, { useState, useEffect } from 'react';
-import { useNavigate, Link } from 'react-router-dom';
-import api from '../../api/axios';
+import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useSearchParams } from 'react-router-dom'
+import {
+  Ban,
+  Check,
+  Mail,
+  MoreHorizontal,
+  Pencil,
+  Plus,
+  RefreshCw,
+  Search,
+  ShieldCheck,
+  Trash2,
+  UserCheck,
+  UserCog,
+  Users,
+  UserX,
+  X,
+} from 'lucide-react'
+import api, { getErrorMessage, isCanceled } from '../../api/axios'
+import { useAuth } from '../../components/AuthProvider'
+import { useRegisterCommands } from '../../components/CommandRegistry'
+import {
+  Alert,
+  Avatar,
+  Badge,
+  Button,
+  Checkbox,
+  DataTable,
+  Dialog,
+  DialogClose,
+  DialogContent,
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuLabel,
+  DropdownMenuRadioGroup,
+  DropdownMenuRadioItem,
+  DropdownMenuSeparator,
+  DropdownMenuSub,
+  DropdownMenuSubContent,
+  DropdownMenuSubTrigger,
+  DropdownMenuTrigger,
+  FormField,
+  Input,
+  PageBody,
+  PageHeader,
+  Select,
+  Toolbar,
+  Tooltip,
+  toast,
+  useConfirm,
+} from '../../components/ui'
+import { formatNumber, timeAgo } from '../../lib/utils'
 
-const ManageUsers = () => {
-  const [users, setUsers] = useState([]);
-  const [loading, setLoading] = useState(true);
-  const [actionLoading, setActionLoading] = useState(false);
-  const [alert, setAlert] = useState({ type: '', message: '' });
-  const [currentUser, setCurrentUser] = useState(null);
+/* ---------------------------------------------------------------------------
+ * Constants — the role/status vocabularies mirror server/models/User.js and the
+ * Zod schemas in server/middleware/schemas.js exactly.
+ * ------------------------------------------------------------------------ */
 
-  // Modal states
-  const [isAddOpen, setIsAddOpen] = useState(false);
-  const [isEditOpen, setIsEditOpen] = useState(false);
-  const [isDeleteOpen, setIsDeleteOpen] = useState(false);
+const DEFAULT_SORT = '-createdAt'
+const DEFAULT_LIMIT = 25
+const PAGE_SIZES = [25, 50, 100]
 
-  // Form states
-  const [newUser, setNewUser] = useState({ name: '', email: '', password: '', role: 'Employee' });
-  const [editUser, setEditUser] = useState({ id: '', name: '', email: '', role: 'Employee', status: 'Approved' });
-  const [deleteUserId, setDeleteUserId] = useState('');
+/** POST /api/users accepts Head|Employee only. PUT /api/users/:id accepts all three. */
+const CREATABLE_ROLES = ['Employee', 'Head']
+const EDITABLE_ROLES = ['Employee', 'Head', 'Admin']
+const STATUSES = ['Pending', 'Approved', 'Rejected']
 
-  // Client states
-  const [subTab, setSubTab] = useState('users'); // 'users' | 'clients'
-  const [clients, setClients] = useState([]);
-  const [isAddClientOpen, setIsAddClientOpen] = useState(false);
-  const [isEditClientOpen, setIsEditClientOpen] = useState(false);
-  const [selectedClient, setSelectedClient] = useState(null);
-  
-  const [newClientName, setNewClientName] = useState('');
-  const [newClientEmails, setNewClientEmails] = useState('');
-  const [editClientName, setEditClientName] = useState('');
-  const [editClientEmails, setEditClientEmails] = useState('');
+const ROLE_FILTER_OPTIONS = [
+  { value: '', label: 'All roles' },
+  ...EDITABLE_ROLES.map((r) => ({ value: r, label: r })),
+]
 
-  const navigate = useNavigate();
+const STATUS_FILTER_OPTIONS = [
+  { value: '', label: 'All statuses' },
+  ...STATUSES.map((s) => ({ value: s, label: s })),
+]
+
+/**
+ * Sorting is server-side and lives in `?sort=`. `DataTable` is fed the same
+ * state through `sorting`/`onSortingChange`, so the headers are real and the
+ * visible page is never re-ordered locally.
+ *
+ * Mirrors `USER_SORT_FIELDS` in `server/controllers/userController.js` — a
+ * column outside this list must not get a sortable header.
+ */
+const SORT_FIELDS = ['createdAt', 'name', 'email', 'role', 'status', 'lastLoginAt']
+
+const ROLE_BADGE = { Admin: 'warning', Head: 'info', Employee: 'neutral' }
+const STATUS_BADGE = { Approved: 'success', Pending: 'warning', Rejected: 'danger' }
+
+const MAX_ACCOUNTS_CEILING = 50
+const MAX_ALLOWED_ADDRESSES = 100
+const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/
+
+const dateFormatter = new Intl.DateTimeFormat(undefined, { dateStyle: 'medium' })
+const dateTimeFormatter = new Intl.DateTimeFormat(undefined, {
+  dateStyle: 'medium',
+  timeStyle: 'short',
+})
+
+/* ---------------------------------------------------------------------------
+ * Pure helpers
+ * ------------------------------------------------------------------------ */
+
+function formatDate(value) {
+  if (!value) return '—'
+  const d = new Date(value)
+  return Number.isNaN(d.getTime()) ? '—' : dateFormatter.format(d)
+}
+
+function formatDateTime(value) {
+  if (!value) return 'Unknown'
+  const d = new Date(value)
+  return Number.isNaN(d.getTime()) ? 'Unknown' : dateTimeFormatter.format(d)
+}
+
+/**
+ * Accepts both shapes from docs/audits/API-LIST-CONTRACT.md:
+ *   paginated -> { data: [...], pagination: {...} }
+ *   legacy    -> [...]        (bare array, capped server-side)
+ * `pagination: null` tells the caller it must page/filter/sort locally.
+ */
+function readList(payload) {
+  if (Array.isArray(payload)) return { rows: payload, pagination: null }
+  if (payload && Array.isArray(payload.data)) {
+    return { rows: payload.data, pagination: payload.pagination || null }
+  }
+  return { rows: [], pagination: null }
+}
+
+/** Fallback view maths for the legacy (un-paginated) response shape. */
+function applyLocalView(rows, { q, role, status, sort, page, limit }) {
+  const needle = q.trim().toLowerCase()
+  let out = rows.filter((u) => {
+    if (role && u.role !== role) return false
+    if (status && (u.status || 'Approved') !== status) return false
+    if (!needle) return true
+    return `${u.name || ''} ${u.email || ''} ${u.gmailEmail || ''}`.toLowerCase().includes(needle)
+  })
+
+  const desc = sort.startsWith('-')
+  const field = desc ? sort.slice(1) : sort
+  out = [...out].sort((a, b) => {
+    const av = a?.[field]
+    const bv = b?.[field]
+    if (av === bv) return 0
+    if (av == null) return 1
+    if (bv == null) return -1
+    const cmp =
+      field === 'createdAt'
+        ? new Date(av).getTime() - new Date(bv).getTime()
+        : String(av).localeCompare(String(bv), undefined, { sensitivity: 'base' })
+    return desc ? -cmp : cmp
+  })
+
+  const start = (page - 1) * limit
+  return { rows: out.slice(start, start + limit), total: out.length }
+}
+
+/** Gmail connections visible on a user record, tolerating `select: false` fields. */
+function gmailSummary(user) {
+  // S-4: `linkedGmailAccounts` is `select: false` on the schema and never
+  // reaches the client (it holds OAuth refresh tokens). The server now sends
+  // `connectedAccountCount` and the address list without the credentials, so
+  // the count no longer under-reports a Head with several linked mailboxes.
+  const serverAddresses = Array.isArray(user?.connectedAccountEmails)
+    ? user.connectedAccountEmails.filter(Boolean)
+    : null
+  const legacyLinked = Array.isArray(user?.linkedGmailAccounts)
+    ? user.linkedGmailAccounts.map((a) => a?.gmailEmail).filter(Boolean)
+    : []
+  const addresses =
+    serverAddresses ??
+    Array.from(new Set([user?.gmailEmail, ...legacyLinked].filter(Boolean)))
+  const rawCount = Number(user?.connectedAccountCount)
+  const rawLimit = Number(user?.maxConnectedAccounts)
+  return {
+    addresses,
+    count: Number.isFinite(rawCount) ? rawCount : addresses.length,
+    limit: Number.isFinite(rawLimit) ? rawLimit : 5,
+    allowed: Array.isArray(user?.allowedGmailAccounts) ? user.allowedGmailAccounts : [],
+  }
+}
+
+/** Mirrors createUserSchema / updateUserSchema so the user sees errors inline. */
+function validateUserForm(values, { requirePassword }) {
+  const errors = {}
+
+  const name = (values.name || '').trim()
+  if (!name) errors.name = 'Name is required.'
+  else if (name.length > 120) errors.name = 'Name is too long (120 characters maximum).'
+
+  const email = (values.email || '').trim()
+  if (!email) errors.email = 'Email address is required.'
+  else if (!EMAIL_RE.test(email)) errors.email = 'Enter a valid email address.'
+  else if (email.length > 254) errors.email = 'Email address is too long (254 characters maximum).'
+
+  if (requirePassword) {
+    const password = values.password || ''
+    if (!password) errors.password = 'Password is required.'
+    else if (password.length < 6) errors.password = 'Password must be at least 6 characters.'
+    else if (password.length > 128) errors.password = 'Password is too long (128 characters maximum).'
+  }
+
+  const allowedRoles = requirePassword ? CREATABLE_ROLES : EDITABLE_ROLES
+  if (!allowedRoles.includes(values.role)) errors.role = 'Select a role.'
+
+  if (!requirePassword && !STATUSES.includes(values.status)) {
+    errors.status = 'Select an account status.'
+  }
+
+  return errors
+}
+
+/** Mirrors the maxConnectedAccounts / allowedGmailAccounts rules on the server. */
+function validatePermissionsForm({ maxConnectedAccounts, allowedGmailAccounts }) {
+  const errors = {}
+  const raw = String(maxConnectedAccounts ?? '').trim()
+  const n = Number(raw)
+
+  if (raw === '') errors.maxConnectedAccounts = 'Enter a connection limit.'
+  else if (!Number.isInteger(n)) errors.maxConnectedAccounts = 'Enter a whole number.'
+  else if (n < 0) errors.maxConnectedAccounts = 'The limit cannot be negative.'
+  else if (n > MAX_ACCOUNTS_CEILING) {
+    errors.maxConnectedAccounts = `The limit cannot exceed ${MAX_ACCOUNTS_CEILING}.`
+  }
+
+  if (allowedGmailAccounts.length > MAX_ALLOWED_ADDRESSES) {
+    errors.allowedGmailAccounts = `No more than ${MAX_ALLOWED_ADDRESSES} addresses can be allow-listed.`
+  } else if (allowedGmailAccounts.some((a) => !EMAIL_RE.test(a))) {
+    errors.allowedGmailAccounts = 'Every allow-listed entry must be a valid email address.'
+  }
+
+  return errors
+}
+
+const EMPTY_CREATE = { name: '', email: '', password: '', role: 'Employee' }
+
+/* ---------------------------------------------------------------------------
+ * Page
+ * ------------------------------------------------------------------------ */
+
+export default function ManageUsers() {
+  const { user: currentUser } = useAuth()
+  const confirm = useConfirm()
+  const [searchParams, setSearchParams] = useSearchParams()
+
+  /* --- URL-owned view state ------------------------------------------- */
+  const page = Math.max(1, Number(searchParams.get('page')) || 1)
+  const limitParam = Number(searchParams.get('limit')) || DEFAULT_LIMIT
+  const limit = PAGE_SIZES.includes(limitParam) ? limitParam : DEFAULT_LIMIT
+  const sortParam = searchParams.get('sort') || DEFAULT_SORT
+  const sortField = sortParam.startsWith('-') ? sortParam.slice(1) : sortParam
+  const sort = SORT_FIELDS.includes(sortField) ? sortParam : DEFAULT_SORT
+  const qParam = searchParams.get('q') || ''
+  const roleParam = EDITABLE_ROLES.includes(searchParams.get('role')) ? searchParams.get('role') : ''
+  const statusParam = STATUSES.includes(searchParams.get('status')) ? searchParams.get('status') : ''
+  const hasFilters = Boolean(qParam || roleParam || statusParam)
+
+  const setParams = useCallback(
+    (patch, { replace = false } = {}) => {
+      setSearchParams(
+        (prev) => {
+          const next = new URLSearchParams(prev)
+          Object.entries(patch).forEach(([key, value]) => {
+            if (value === null || value === undefined || value === '') next.delete(key)
+            else next.set(key, String(value))
+          })
+          return next
+        },
+        { replace }
+      )
+    },
+    [setSearchParams]
+  )
+
+  const sorting = useMemo(
+    () => [{ id: sort.startsWith('-') ? sort.slice(1) : sort, desc: sort.startsWith('-') }],
+    [sort]
+  )
+
+  const handleSortingChange = useCallback(
+    (next) => {
+      const [s] = next
+      setParams({ sort: s ? `${s.desc ? '-' : ''}${s.id}` : null, page: 1 })
+    },
+    [setParams]
+  )
+
+  const reviewPending = useCallback(
+    () => setParams({ status: 'Pending', page: 1 }),
+    [setParams]
+  )
+
+  useRegisterCommands(
+    [
+      {
+        id: 'users-review-pending',
+        label: 'Review pending registrations',
+        group: 'Users',
+        icon: <UserCheck className="h-4 w-4" />,
+        keywords: ['approve', 'awaiting', 'signup'],
+        onSelect: reviewPending,
+      },
+    ],
+    [reviewPending]
+  )
+
+  /* --- Data ------------------------------------------------------------ */
+  const [reloadToken, setReloadToken] = useState(0)
+  const [pendingToken, setPendingToken] = useState(0)
+  const [debouncedQ, setDebouncedQ] = useState(qParam)
+  const [result, setResult] = useState({ key: null, rows: [], total: 0, error: null })
+  const [pendingCount, setPendingCount] = useState(null)
+  const [rowSelection, setRowSelection] = useState({})
+  const [busy, setBusy] = useState(false)
 
   useEffect(() => {
-    const userString = localStorage.getItem('user');
-    if (userString) {
-      try {
-        setCurrentUser(JSON.parse(userString));
-      } catch (err) {
-        console.error('Error parsing current user:', err);
+    const timer = setTimeout(() => setDebouncedQ(qParam), 300)
+    return () => clearTimeout(timer)
+  }, [qParam])
+
+  const query = useMemo(
+    () => ({ page, limit, sort, q: debouncedQ, role: roleParam, status: statusParam }),
+    [page, limit, sort, debouncedQ, roleParam, statusParam]
+  )
+  const queryKey = useMemo(() => `${reloadToken}:${JSON.stringify(query)}`, [reloadToken, query])
+
+  useEffect(() => {
+    const controller = new AbortController()
+    const params = { page: query.page, limit: query.limit, sort: query.sort }
+    if (query.q) params.q = query.q
+    if (query.role) params.role = query.role
+    if (query.status) params.status = query.status
+
+    api
+      .get('/users', { params, signal: controller.signal })
+      .then((res) => {
+        const { rows, pagination } = readList(res.data)
+        if (pagination) {
+          setResult({
+            key: queryKey,
+            rows,
+            total: Number(pagination.total) || rows.length,
+            error: null,
+          })
+        } else {
+          // Legacy un-paginated response: page and filter locally so the screen
+          // stays correct until the server migration lands.
+          const view = applyLocalView(rows, query)
+          setResult({ key: queryKey, rows: view.rows, total: view.total, error: null })
+        }
+      })
+      .catch((err) => {
+        if (isCanceled(err)) return
+        setResult({
+          key: queryKey,
+          rows: [],
+          total: 0,
+          error: getErrorMessage(err, 'Could not load users.'),
+        })
+      })
+
+    return () => controller.abort()
+  }, [query, queryKey])
+
+  // Pending registrations are the gate on access now that registration issues no
+  // token, so the count is fetched independently of the current filter.
+  useEffect(() => {
+    const controller = new AbortController()
+    api
+      .get('/users', { params: { page: 1, limit: 1, status: 'Pending' }, signal: controller.signal })
+      .then((res) => {
+        const { rows, pagination } = readList(res.data)
+        setPendingCount(
+          pagination
+            ? Number(pagination.total) || 0
+            : rows.filter((u) => (u.status || 'Approved') === 'Pending').length
+        )
+      })
+      .catch((err) => {
+        // Unknown, not zero — the banner simply stays hidden.
+        if (!isCanceled(err)) setPendingCount(null)
+      })
+    return () => controller.abort()
+  }, [reloadToken, pendingToken])
+
+  const loading = result.key !== queryKey
+  const rows = result.rows
+  const total = result.total
+  const error = result.error
+
+  const reload = useCallback(() => setReloadToken((n) => n + 1), [])
+
+  /**
+   * S-5: `PUT /api/users/:id` returns the full updated document (including
+   * `maxConnectedAccounts` and `allowedGmailAccounts`, the two fields the Gmail
+   * permission form edits), so a saved row is patched in place. The page used to
+   * re-GET the entire list after every save purely to see what it had written.
+   */
+  const applyUser = useCallback((updated) => {
+    if (!updated?._id) return
+    setResult((prev) => ({
+      ...prev,
+      rows: prev.rows.map((u) => (u._id === updated._id ? { ...u, ...updated } : u)),
+    }))
+  }, [])
+
+  /**
+   * A row patched in place is enough for a detail edit, but a role or status
+   * change can move the row out of an active filter and always changes the
+   * pending-registration count — so those two consequences are refreshed
+   * explicitly rather than by reloading the page's data wholesale.
+   */
+  const afterSave = useCallback(
+    (previous, updated) => {
+      if (!updated?._id) {
+        // Older server build: partial response, nothing safe to patch from.
+        reload()
+        return
       }
-    }
-    fetchUsers();
-    fetchClients();
-  }, []);
+      applyUser(updated)
 
-  const triggerAlert = (type, message) => {
-    setAlert({ type, message });
-    setTimeout(() => {
-      setAlert({ type: '', message: '' });
-    }, 4000);
-  };
+      const roleChanged = Boolean(previous) && updated.role !== previous.role
+      const statusChanged =
+        Boolean(previous) &&
+        (updated.status || 'Approved') !== (previous.status || 'Approved')
 
-  const fetchUsers = async () => {
-    setLoading(true);
-    try {
-      const response = await api.get('/users');
-      setUsers(response.data);
-    } catch (err) {
-      console.error('Failed to fetch users:', err);
-      const message = err.response?.data?.message || 'Failed to load users. Please refresh the page.';
-      triggerAlert('error', message);
-    } finally {
-      setLoading(false);
-    }
-  };
+      if (roleChanged || statusChanged) {
+        setPendingToken((n) => n + 1)
+        if (roleParam || statusParam) reload()
+      }
+    },
+    [applyUser, reload, roleParam, statusParam]
+  )
 
-  const handleAddUser = async (e) => {
-    e.preventDefault();
-    if (!newUser.name || !newUser.email || !newUser.password || !newUser.role) {
-      triggerAlert('error', 'All fields are required.');
-      return;
-    }
+  const selectedUsers = useMemo(
+    () => rows.filter((u) => rowSelection[u._id]),
+    [rows, rowSelection]
+  )
 
-    setActionLoading(true);
-    try {
-      await api.post('/users', newUser);
-      triggerAlert('success', `User '${newUser.name}' created successfully.`);
-      setIsAddOpen(false);
-      setNewUser({ name: '', email: '', password: '', role: 'Employee' });
-      fetchUsers();
-    } catch (err) {
-      console.error('Error creating user:', err);
-      const message = err.response?.data?.message || 'Failed to create user.';
-      triggerAlert('error', message);
-    } finally {
-      setActionLoading(false);
-    }
-  };
+  /** Gmail addresses already known to the system, for the allow-list picker. */
+  const knownGmailAddresses = useMemo(() => {
+    const set = new Set()
+    rows.forEach((u) => gmailSummary(u).addresses.forEach((a) => set.add(a)))
+    return Array.from(set).sort()
+  }, [rows])
 
-  const handleEditUser = async (e) => {
-    e.preventDefault();
-    if (!editUser.name || !editUser.email || !editUser.role) {
-      triggerAlert('error', 'Name, email, and role are required.');
-      return;
-    }
+  /* --- Dialog state ---------------------------------------------------- */
+  const [createOpen, setCreateOpen] = useState(false)
+  const [editTarget, setEditTarget] = useState(null)
+  const [permissionsTarget, setPermissionsTarget] = useState(null)
 
-    setActionLoading(true);
-    try {
-      await api.put(`/users/${editUser.id}`, {
-        name: editUser.name,
-        email: editUser.email,
-        role: editUser.role,
-        status: editUser.status,
-        maxConnectedAccounts: editUser.maxConnectedAccounts,
-        allowedGmailAccounts: editUser.allowedGmailAccounts
-      });
-      triggerAlert('success', `User '${editUser.name}' updated successfully.`);
-      setIsEditOpen(false);
-      fetchUsers();
-    } catch (err) {
-      console.error('Error updating user:', err);
-      const message = err.response?.data?.message || 'Failed to update user.';
-      triggerAlert('error', message);
-    } finally {
-      setActionLoading(false);
-    }
-  };
+  /* --- Mutations ------------------------------------------------------- */
 
-  const handleUpdateStatus = async (userId, newStatus, userName) => {
-    setActionLoading(true);
-    try {
-      await api.put(`/users/${userId}`, {
-        status: newStatus
-      });
-      triggerAlert('success', `User '${userName}' has been ${newStatus.toLowerCase()} successfully.`);
-      fetchUsers();
-    } catch (err) {
-      console.error(`Error updating status for user ${userId}:`, err);
-      const message = err.response?.data?.message || 'Failed to update user status.';
-      triggerAlert('error', message);
-    } finally {
-      setActionLoading(false);
-    }
-  };
+  const patchUser = useCallback(
+    async (target, body, successMessage) => {
+      setBusy(true)
+      try {
+        const res = await api.put(`/users/${target._id}`, body)
+        toast.success(successMessage)
+        afterSave(target, res.data)
+        return true
+      } catch (err) {
+        toast.error('Could not update user', { description: getErrorMessage(err) })
+        return false
+      } finally {
+        setBusy(false)
+      }
+    },
+    [afterSave]
+  )
 
-  const handleDeleteUser = async () => {
-    if (!deleteUserId) return;
-    
-    if (currentUser && currentUser._id === deleteUserId) {
-      triggerAlert('error', 'You cannot delete your own Administrator account.');
-      setIsDeleteOpen(false);
-      return;
-    }
+  const changeStatus = useCallback(
+    async (target, status) => {
+      const label = status === 'Approved' ? 'approve' : status === 'Rejected' ? 'reject' : 'suspend'
+      const ok = await confirm({
+        title: `${label[0].toUpperCase()}${label.slice(1)} ${target.name}?`,
+        description:
+          status === 'Approved'
+            ? `${target.email} will be able to sign in immediately.`
+            : `${target.email} loses access immediately and every active session is signed out.`,
+        confirmLabel: `${label[0].toUpperCase()}${label.slice(1)} account`,
+        tone: status === 'Approved' ? 'info' : 'warning',
+      })
+      if (!ok) return
+      await patchUser(target, { status }, `${target.name} — status set to ${status}.`)
+    },
+    [confirm, patchUser]
+  )
 
-    setActionLoading(true);
-    try {
-      await api.delete(`/users/${deleteUserId}`);
-      triggerAlert('success', 'User account deleted successfully.');
-      setIsDeleteOpen(false);
-      setDeleteUserId('');
-      fetchUsers();
-    } catch (err) {
-      console.error('Error deleting user:', err);
-      const message = err.response?.data?.message || 'Failed to delete user.';
-      triggerAlert('error', message);
-    } finally {
-      setActionLoading(false);
-    }
-  };
+  const changeRole = useCallback(
+    async (target, role) => {
+      if (role === target.role) return
+      const ok = await confirm({
+        title: `Change ${target.name} to ${role}?`,
+        description: `${target.email} moves from ${target.role} to ${role}. Their current sessions are signed out so the new permissions take effect immediately.`,
+        confirmLabel: `Set role to ${role}`,
+        tone: 'warning',
+      })
+      if (!ok) return
+      await patchUser(target, { role }, `${target.name} is now ${role}.`)
+    },
+    [confirm, patchUser]
+  )
 
-  const fetchClients = async () => {
-    try {
-      const response = await api.get('/tasks/clients');
-      setClients(response.data);
-    } catch (err) {
-      console.error('Failed to fetch clients:', err);
-      triggerAlert('error', 'Failed to retrieve clients list.');
-    }
-  };
+  /* Typed confirmation comes from the shared dialog (`requireTyped`); the
+   * consequence summary below is the only part that was ever page-specific. */
+  const deleteUser = useCallback(
+    async (target) => {
+      const email = target.email || ''
+      const ok = await confirm({
+        title: `Delete ${target.name || email}?`,
+        description: (
+          <div className="flex flex-col gap-3">
+            <p>
+              This removes their access immediately. Sessions are revoked, Gmail credentials are
+              deleted, and their tasks and emails are unassigned. Activity log entries and task
+              comments are retained for the audit trail.
+            </p>
+            <dl className="grid grid-cols-[auto_1fr] gap-x-4 gap-y-1">
+              <dt className="text-fg-3">Role</dt>
+              <dd>{target.role || 'Unknown'}</dd>
+              <dt className="text-fg-3">Status</dt>
+              <dd>{target.status || 'Approved'}</dd>
+              <dt className="text-fg-3">Created</dt>
+              <dd className="tabular">{formatDateTime(target.createdAt)}</dd>
+            </dl>
+          </div>
+        ),
+        confirmLabel: 'Delete user',
+        cancelLabel: 'Keep account',
+        tone: 'danger',
+        requireTyped: {
+          value: email,
+          hint: 'Deletion is confirmed by typing the exact email address on the account.',
+        },
+      })
+      if (!ok) return
 
-  const handleAddClient = async (e) => {
-    e.preventDefault();
-    if (!newClientName.trim()) {
-      triggerAlert('error', 'Client Name is required.');
-      return;
-    }
+      try {
+        await api.delete(`/users/${target._id}`)
+        toast.success(`${target.name || email} deleted.`)
+        setRowSelection({})
+        reload()
+      } catch (err) {
+        toast.error('Could not delete user', { description: getErrorMessage(err) })
+      }
+    },
+    [confirm, reload]
+  )
 
-    const emailArray = newClientEmails
-      .split(',')
-      .map(email => email.trim())
-      .filter(email => email.length > 0);
+  const runBulkStatus = useCallback(
+    async (status) => {
+      const targets = selectedUsers.filter(
+        (u) => (u.status || 'Approved') !== status && u._id !== currentUser?._id
+      )
+      if (targets.length === 0) {
+        toast.warning(`Nothing to ${status === 'Approved' ? 'approve' : 'reject'} in the selection.`)
+        return
+      }
+      const ok = await confirm({
+        title: `${status === 'Approved' ? 'Approve' : 'Reject'} ${formatNumber(targets.length)} ${
+          targets.length === 1 ? 'account' : 'accounts'
+        }?`,
+        description:
+          status === 'Approved'
+            ? 'Each account will be able to sign in immediately and will receive an approval email.'
+            : 'Each account loses access immediately and every active session is signed out.',
+        confirmLabel: status === 'Approved' ? 'Approve accounts' : 'Reject accounts',
+        tone: status === 'Approved' ? 'info' : 'warning',
+      })
+      if (!ok) return
 
-    setActionLoading(true);
-    try {
-      await api.post('/tasks/clients', {
-        name: newClientName,
-        associatedEmails: emailArray
-      });
-      triggerAlert('success', `Client '${newClientName}' added successfully.`);
-      setIsAddClientOpen(false);
-      setNewClientName('');
-      setNewClientEmails('');
-      fetchClients();
-    } catch (err) {
-      console.error('Error creating client:', err);
-      triggerAlert('error', err.response?.data?.message || 'Failed to add client.');
-    } finally {
-      setActionLoading(false);
-    }
-  };
+      setBusy(true)
+      try {
+        const outcomes = await Promise.allSettled(
+          targets.map((u) => api.put(`/users/${u._id}`, { status }))
+        )
+        const failed = outcomes.filter((o) => o.status === 'rejected')
+        const succeeded = outcomes.length - failed.length
+        if (succeeded > 0) {
+          toast.success(
+            `${formatNumber(succeeded)} ${succeeded === 1 ? 'account' : 'accounts'} ${
+              status === 'Approved' ? 'approved' : 'rejected'
+            }.`
+          )
+        }
+        if (failed.length > 0) {
+          toast.error(
+            `${formatNumber(failed.length)} ${failed.length === 1 ? 'account' : 'accounts'} failed.`,
+            { description: getErrorMessage(failed[0].reason) }
+          )
+        }
+        setRowSelection({})
+        reload()
+      } finally {
+        setBusy(false)
+      }
+    },
+    [confirm, currentUser, reload, selectedUsers]
+  )
 
-  const handleEditClient = async (e) => {
-    e.preventDefault();
-    if (!editClientName.trim()) {
-      triggerAlert('error', 'Client Name is required.');
-      return;
-    }
+  /* --- Columns --------------------------------------------------------- */
 
-    const emailArray = editClientEmails
-      .split(',')
-      .map(email => email.trim())
-      .filter(email => email.length > 0);
+  const columns = useMemo(
+    () => [
+      {
+        /* accessorKey, not id: TanStack's getCanSort() requires an accessor,
+         * so an id-only column renders no sort button at all. The key is also
+         * the server's sort field name. */
+        accessorKey: 'name',
+        header: 'User',
+        meta: { primary: true, width: '220px' },
+        cell: ({ row }) => {
+          const u = row.original
+          const isSelf = u._id === currentUser?._id
+          return (
+            <div className="flex items-center gap-2.5">
+              <Avatar size="sm" name={u.name} id={u._id} />
+              <span className="min-w-0 truncate">
+                {u.name || 'Unnamed user'}
+                {isSelf ? <span className="ml-1.5 text-xs text-fg-3">(you)</span> : null}
+              </span>
+            </div>
+          )
+        },
+      },
+      {
+        accessorKey: 'email',
+        header: 'Email',
+        meta: { width: '230px' },
+        cell: ({ row }) => (
+          <span className="font-mono text-xs text-fg-2">{row.original.email || '—'}</span>
+        ),
+      },
+      {
+        accessorKey: 'role',
+        header: 'Role',
+        meta: { width: '110px', truncate: false },
+        cell: ({ row }) => (
+          <Badge size="sm" variant={ROLE_BADGE[row.original.role] || 'neutral'}>
+            {row.original.role || 'Unknown'}
+          </Badge>
+        ),
+      },
+      {
+        accessorKey: 'status',
+        header: 'Status',
+        meta: { width: '110px', truncate: false },
+        cell: ({ row }) => {
+          const status = row.original.status || 'Approved'
+          return (
+            <Badge size="sm" variant={STATUS_BADGE[status] || 'neutral'}>
+              {status}
+            </Badge>
+          )
+        },
+      },
+      {
+        id: 'gmail',
+        header: 'Gmail',
+        enableSorting: false,
+        meta: { width: '120px', truncate: false, numeric: true },
+        cell: ({ row }) => {
+          const { addresses, count, limit: cap, allowed } = gmailSummary(row.original)
+          const detail =
+            addresses.length > 0
+              ? addresses.join(', ')
+              : 'No Gmail account connected on this record.'
+          return (
+            <Tooltip
+              content={
+                allowed.length > 0
+                  ? `${detail} — restricted to ${allowed.length} allow-listed ${
+                      allowed.length === 1 ? 'address' : 'addresses'
+                    }.`
+                  : detail
+              }
+            >
+              <span className="inline-flex items-center gap-1.5 tabular">
+                <span className={count > 0 ? 'text-fg' : 'text-fg-3'}>
+                  {count} / {cap}
+                </span>
+                {allowed.length > 0 ? (
+                  <ShieldCheck aria-hidden="true" className="h-3.5 w-3.5 text-fg-3" />
+                ) : null}
+              </span>
+            </Tooltip>
+          )
+        },
+      },
+      {
+        accessorKey: 'createdAt',
+        header: 'Created',
+        meta: { width: '120px' },
+        cell: ({ row }) => (
+          <span className="tabular text-fg-3">{formatDate(row.original.createdAt)}</span>
+        ),
+      },
+      {
+        // S-4: `lastLoginAt` is a real, indexed, sortable field now.
+        accessorKey: 'lastLoginAt',
+        header: 'Last sign-in',
+        meta: { width: '130px' },
+        cell: ({ row }) => {
+          const value = row.original.lastLoginAt
+          return value ? (
+            <Tooltip content={formatDateTime(value)}>
+              <span className="text-fg-3">{timeAgo(value)}</span>
+            </Tooltip>
+          ) : (
+            <span className="text-fg-3">Never signed in</span>
+          )
+        },
+      },
+      {
+        id: 'actions',
+        // A blank <th> is an axe `empty-table-header` violation — the actions
+        // cells would be announced with no column name.
+        header: () => <span className="sr-only">Actions</span>,
+        enableSorting: false,
+        meta: { width: '56px', truncate: false },
+        cell: ({ row }) => {
+          const u = row.original
+          const isSelf = u._id === currentUser?._id
+          const status = u.status || 'Approved'
+          return (
+            <div className="flex justify-end">
+              <DropdownMenu>
+                <DropdownMenuTrigger asChild>
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    iconOnly
+                    aria-label={`Actions for ${u.name || u.email}`}
+                  >
+                    <MoreHorizontal className="h-4 w-4" />
+                  </Button>
+                </DropdownMenuTrigger>
+                <DropdownMenuContent align="end">
+                  <DropdownMenuLabel>{u.name || u.email}</DropdownMenuLabel>
+                  <DropdownMenuItem onSelect={() => setEditTarget(u)}>
+                    <Pencil className="h-4 w-4" />
+                    Edit details
+                  </DropdownMenuItem>
 
-    setActionLoading(true);
-    try {
-      await api.put(`/tasks/clients/${selectedClient._id}`, {
-        name: editClientName,
-        associatedEmails: emailArray
-      });
-      triggerAlert('success', `Client '${editClientName}' updated successfully.`);
-      setIsEditClientOpen(false);
-      setSelectedClient(null);
-      fetchClients();
-    } catch (err) {
-      console.error('Error updating client:', err);
-      triggerAlert('error', err.response?.data?.message || 'Failed to update client.');
-    } finally {
-      setActionLoading(false);
-    }
-  };
+                  <DropdownMenuSub>
+                    <DropdownMenuSubTrigger>
+                      <UserCog className="h-4 w-4" />
+                      Change role
+                    </DropdownMenuSubTrigger>
+                    <DropdownMenuSubContent>
+                      <DropdownMenuRadioGroup
+                        value={u.role}
+                        onValueChange={(role) => changeRole(u, role)}
+                      >
+                        {EDITABLE_ROLES.map((role) => (
+                          <DropdownMenuRadioItem key={role} value={role} disabled={isSelf}>
+                            {role}
+                          </DropdownMenuRadioItem>
+                        ))}
+                      </DropdownMenuRadioGroup>
+                    </DropdownMenuSubContent>
+                  </DropdownMenuSub>
 
-  const handleDeleteClient = async (clientId, clientName) => {
-    if (!window.confirm(`Are you sure you want to permanently delete client '${clientName}'?`)) return;
+                  <DropdownMenuItem onSelect={() => setPermissionsTarget(u)}>
+                    <Mail className="h-4 w-4" />
+                    Gmail permissions
+                  </DropdownMenuItem>
 
-    setActionLoading(true);
-    try {
-      await api.delete(`/tasks/clients/${clientId}`);
-      triggerAlert('success', `Client '${clientName}' deleted successfully.`);
-      fetchClients();
-    } catch (err) {
-      console.error('Error deleting client:', err);
-      triggerAlert('error', err.response?.data?.message || 'Failed to delete client.');
-    } finally {
-      setActionLoading(false);
-    }
-  };
+                  <DropdownMenuSeparator />
 
-  const openEditModal = (user) => {
-    setEditUser({
-      id: user._id,
-      name: user.name,
-      email: user.email,
-      role: user.role,
-      status: user.status || 'Approved',
-      maxConnectedAccounts: user.maxConnectedAccounts !== undefined ? user.maxConnectedAccounts : 5,
-      allowedGmailAccounts: Array.isArray(user.allowedGmailAccounts) ? user.allowedGmailAccounts : []
-    });
-    setIsEditOpen(true);
-  };
+                  {status === 'Pending' ? (
+                    <>
+                      <DropdownMenuItem onSelect={() => changeStatus(u, 'Approved')}>
+                        <UserCheck className="h-4 w-4" />
+                        Approve registration
+                      </DropdownMenuItem>
+                      <DropdownMenuItem onSelect={() => changeStatus(u, 'Rejected')}>
+                        <UserX className="h-4 w-4" />
+                        Reject registration
+                      </DropdownMenuItem>
+                    </>
+                  ) : null}
 
-  const openDeleteModal = (id) => {
-    setDeleteUserId(id);
-    setIsDeleteOpen(true);
-  };
+                  {status === 'Approved' ? (
+                    <DropdownMenuItem disabled={isSelf} onSelect={() => changeStatus(u, 'Rejected')}>
+                      <Ban className="h-4 w-4" />
+                      Deactivate access
+                    </DropdownMenuItem>
+                  ) : null}
 
-  const getInitials = (name) => {
-    if (!name) return '?';
-    return name.split(' ').map(n => n[0]).join('').toUpperCase().slice(0, 2);
-  };
+                  {status === 'Rejected' ? (
+                    <DropdownMenuItem onSelect={() => changeStatus(u, 'Approved')}>
+                      <UserCheck className="h-4 w-4" />
+                      Restore access
+                    </DropdownMenuItem>
+                  ) : null}
 
-  const allSystemGmailAccounts = Array.from(
-    new Set(
-      users.flatMap(u => [
-        u.gmailEmail,
-        ...(u.linkedGmailAccounts || []).map(a => a.gmailEmail)
-      ]).filter(Boolean)
-    )
-  );
+                  <DropdownMenuSeparator />
+                  <DropdownMenuItem destructive disabled={isSelf} onSelect={() => deleteUser(u)}>
+                    <Trash2 className="h-4 w-4" />
+                    Delete user
+                  </DropdownMenuItem>
+                </DropdownMenuContent>
+              </DropdownMenu>
+            </div>
+          )
+        },
+      },
+    ],
+    [changeRole, changeStatus, deleteUser, currentUser]
+  )
+
+  /* --- Render ---------------------------------------------------------- */
+
+  const selectionCount = selectedUsers.length
+  const pendingInSelection = selectedUsers.filter(
+    (u) => (u.status || 'Approved') === 'Pending'
+  ).length
+
+  const clearFilters = useCallback(() => {
+    setParams({ q: null, role: null, status: null, page: 1 })
+  }, [setParams])
 
   return (
-    <main className="flex-grow max-w-7xl w-full mx-auto px-4 sm:px-6 lg:px-8 py-8 relative animate-fade-in select-none">
-      {/* Admin Submenu Tabs */}
-      <div className="flex justify-start items-center space-x-6 mb-8 border-b border-slate-200 pb-4">
-        <button
-          onClick={() => setSubTab('users')}
-          className={`text-sm pb-4 -mb-[17px] transition-all focus:outline-none border-b-2 ${
-            subTab === 'users'
-              ? 'font-bold text-indigo-600 border-indigo-600'
-              : 'font-semibold text-slate-500 hover:text-slate-800 border-transparent'
-          }`}
-        >
-          Manage Users
-        </button>
-        <button
-          onClick={() => setSubTab('clients')}
-          className={`text-sm pb-4 -mb-[17px] transition-all focus:outline-none border-b-2 ${
-            subTab === 'clients'
-              ? 'font-bold text-indigo-600 border-indigo-600'
-              : 'font-semibold text-slate-500 hover:text-slate-800 border-transparent'
-          }`}
-        >
-          Manage Clients
-        </button>
-        <Link to="/admin/activities" className="text-sm font-semibold text-slate-500 hover:text-slate-800 pb-4 -mb-[17px] transition-all">
-          Activity Logs
-        </Link>
-      </div>
-
-      {/* Alert */}
-      {alert.message && (
-        <div className={`fixed top-20 right-6 z-50 px-4 py-3 rounded-xl shadow-lg border flex items-start space-x-3 max-w-md animate-slide-in ${
-          alert.type === 'success'
-            ? 'bg-emerald-50 border-emerald-100 text-emerald-600'
-            : 'bg-red-50 border-red-100 text-red-550'
-        }`}>
-          <svg className="w-5 h-5 flex-shrink-0 mt-0.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-            {alert.type === 'success' ? (
-              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z" />
-            ) : (
-              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M12 8v4m0 4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
-            )}
-          </svg>
-          <span className="text-xs font-semibold">{alert.message}</span>
-        </div>
-      )}
-
-      {subTab === 'users' && (
-        <>
-          {/* Page Header */}
-          <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between mb-8 gap-4">
-            <div>
-              <h1 className="text-3xl font-extrabold text-slate-800 tracking-tight">User Management</h1>
-              <p className="text-slate-500 text-sm mt-1">
-                Manage workspace users, roles, and permissions
-              </p>
-            </div>
-            <button
-              onClick={() => setIsAddOpen(true)}
-              className="px-5 py-3 rounded-xl bg-indigo-600 hover:bg-indigo-700 text-xs font-bold text-white shadow-md active:scale-[0.98] transition-all flex items-center justify-center space-x-2"
+    <>
+      <PageHeader
+        title="Users"
+        description="Accounts, roles, approvals and Gmail permissions for the workspace."
+        actions={
+          <>
+            <Button
+              variant="secondary"
+              leftIcon={<RefreshCw className="h-4 w-4" />}
+              onClick={reload}
+              disabled={loading}
             >
-              <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M12 6v6m0 0v6m0-6h6m-6 0H6" />
-              </svg>
-              <span>Add User</span>
-            </button>
-          </div>
-
-          {/* Users Table */}
-          <div className="bg-white rounded-2xl shadow-sm border border-slate-200 overflow-hidden hover-glow-card transition-all duration-300">
-            {loading ? (
-              <div className="space-y-4 p-6">
-                {[...Array(4)].map((_, i) => (
-                  <div key={i} className="h-16 bg-white border border-slate-200/80 rounded-xl p-4 skeleton-shimmer" />
-                ))}
-              </div>
-            ) : users.length === 0 ? (
-              <div className="text-center py-20">
-                <div className="w-14 h-14 mx-auto bg-slate-50 rounded-2xl flex items-center justify-center mb-4 border border-slate-100">
-                  <svg className="w-6 h-6 text-slate-405" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M12 4.354a4 4 0 110 5.292M15 21H3v-1a6 6 0 0112 0v1zm0 0h6v-1a6 6 0 00-9-5.197M13 7a3 3 0 11-6 0 3 3 0 016 0z" />
-                  </svg>
-                </div>
-                <h3 className="text-md font-bold text-slate-800 mb-1">No users found</h3>
-                <p className="text-xs text-slate-500">Get started by creating a new user account.</p>
-              </div>
-            ) : (
-              <div className="overflow-x-auto">
-                <table className="min-w-full divide-y divide-slate-100">
-                  <thead className="bg-slate-50/50 text-left text-xs font-semibold text-slate-500 uppercase tracking-wider">
-                    <tr>
-                      <th scope="col" className="px-6 py-4">User</th>
-                      <th scope="col" className="px-6 py-4">Email</th>
-                      <th scope="col" className="px-6 py-4">Role</th>
-                      <th scope="col" className="px-6 py-4">Status</th>
-                      <th scope="col" className="px-6 py-4 text-right">Actions</th>
-                    </tr>
-                  </thead>
-                  <tbody className="bg-white divide-y divide-slate-100 text-sm">
-                    {users.map((user) => {
-                      const isSelf = currentUser && currentUser._id === user._id;
-                      const initials = getInitials(user.name);
-                      
-                      // Role label color
-                      let roleClass = 'bg-indigo-50 border-indigo-100 text-indigo-650';
-                      if (user.role === 'Admin') {
-                        roleClass = 'bg-red-50 border-red-100 text-red-600';
-                      } else if (user.role === 'Head') {
-                        roleClass = 'bg-purple-50 border-purple-100 text-purple-650';
-                      }
-
-                      // Status label color
-                      let statusClass = 'bg-emerald-50 border-emerald-100 text-emerald-600';
-                      if (user.status === 'Pending') {
-                        statusClass = 'bg-amber-50 border-amber-100 text-amber-600 animate-pulse';
-                      } else if (user.status === 'Rejected') {
-                        statusClass = 'bg-red-50 border-red-100 text-red-600';
-                      }
-
-                      return (
-                        <tr key={user._id} className="hover:bg-slate-50 transition-colors duration-150">
-                          <td className="px-6 py-4 whitespace-nowrap">
-                            <div className="flex items-center">
-                              <div className="w-9 h-9 bg-indigo-50 border border-indigo-100 rounded-full flex items-center justify-center text-indigo-600 font-extrabold text-sm shrink-0">
-                                {initials}
-                              </div>
-                              <div className="ml-3">
-                                <p className="text-sm font-bold text-slate-800">
-                                  {user.name}
-                                  {isSelf && <span className="ml-2 text-[10px] bg-slate-105 border border-slate-200 text-slate-500 px-2 py-0.5 rounded-full font-normal">(You)</span>}
-                                </p>
-                              </div>
-                            </div>
-                          </td>
-                          <td className="px-6 py-4 whitespace-nowrap text-slate-600">
-                            {user.email}
-                          </td>
-                          <td className="px-6 py-4 whitespace-nowrap">
-                            <span className={`inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-bold border ${roleClass}`}>
-                              {user.role}
-                            </span>
-                            {user.role === 'Head' && (
-                              <div className="text-[10px] text-indigo-600 font-semibold mt-1">
-                                Max Accts: {user.maxConnectedAccounts ?? 5}
-                              </div>
-                            )}
-                          </td>
-                          <td className="px-6 py-4 whitespace-nowrap">
-                            <span className={`inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-bold border ${statusClass}`}>
-                              {user.status || 'Approved'}
-                            </span>
-                          </td>
-                          <td className="px-6 py-4 whitespace-nowrap text-right space-x-3">
-                            {user.status === 'Pending' && (
-                              <>
-                                <button
-                                  onClick={() => handleUpdateStatus(user._id, 'Approved', user.name)}
-                                  disabled={actionLoading}
-                                  className="text-emerald-600 hover:text-emerald-700 text-sm font-semibold transition-colors"
-                                >
-                                  Approve
-                                </button>
-                                <button
-                                  onClick={() => handleUpdateStatus(user._id, 'Rejected', user.name)}
-                                  disabled={actionLoading}
-                                  className="text-red-500 hover:text-red-600 text-sm font-semibold transition-colors"
-                                >
-                                  Reject
-                                </button>
-                              </>
-                            )}
-                            <button
-                              onClick={() => openEditModal(user)}
-                              className="text-indigo-600 hover:text-indigo-700 text-sm font-semibold transition-colors"
-                            >
-                              Edit
-                            </button>
-                            <button
-                              onClick={() => openDeleteModal(user._id)}
-                              disabled={isSelf}
-                              className={`text-sm font-semibold transition-colors ${
-                                isSelf
-                                  ? 'text-slate-300 cursor-not-allowed'
-                                  : 'text-red-500 hover:text-red-600'
-                              }`}
-                              title={isSelf ? 'Cannot delete own account' : 'Delete user'}
-                            >
-                              Delete
-                            </button>
-                          </td>
-                        </tr>
-                      );
-                    })}
-                  </tbody>
-                </table>
-              </div>
-            )}
-          </div>
-        </>
-      )}
-
-      {subTab === 'clients' && (
-        <>
-          {/* Client Page Header */}
-          <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between mb-8 gap-4">
-            <div>
-              <h1 className="text-3xl font-extrabold text-slate-800 tracking-tight">Client Management</h1>
-              <p className="text-slate-500 text-sm mt-1">
-                Manage clients and their associated email addresses or domains
-              </p>
-            </div>
-            <button
-              onClick={() => {
-                setNewClientName('');
-                setNewClientEmails('');
-                setIsAddClientOpen(true);
-              }}
-              className="px-5 py-3 rounded-xl bg-indigo-600 hover:bg-indigo-700 text-xs font-bold text-white shadow-md active:scale-[0.98] transition-all flex items-center justify-center space-x-2"
+              Refresh
+            </Button>
+            <Button
+              variant="primary"
+              leftIcon={<Plus className="h-4 w-4" />}
+              onClick={() => setCreateOpen(true)}
             >
-              <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M12 6v6m0 0v6m0-6h6m-6 0H6" />
-              </svg>
-              <span>Add Client</span>
-            </button>
-          </div>
+              Add user
+            </Button>
+          </>
+        }
+      />
 
-          {/* Clients Table */}
-          <div className="bg-white rounded-2xl shadow-sm border border-slate-200 overflow-hidden hover-glow-card transition-all duration-300">
-            {clients.length === 0 ? (
-              <div className="text-center py-20">
-                <div className="w-14 h-14 mx-auto bg-slate-50 rounded-2xl flex items-center justify-center mb-4 border border-slate-100">
-                  <svg className="w-6 h-6 text-slate-405" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M19 21V5a2 2 0 00-2-2H7a2 2 0 00-2 2v16m14 0h2m-2 0h-5m-9 0H3m2 0h5M9 7h1m-1 4h1m4-4h1m-1 4h1m-5 10v-5a1 1 0 011-1h2a1 1 0 011-1v5m-4 0h4" />
-                  </svg>
-                </div>
-                <h3 className="text-md font-bold text-slate-800 mb-1">No clients found</h3>
-                <p className="text-xs text-slate-500">Get started by adding a client account.</p>
-              </div>
-            ) : (
-              <div className="overflow-x-auto">
-                <table className="min-w-full divide-y divide-slate-100">
-                  <thead className="bg-slate-50/50 text-left text-xs font-semibold text-slate-500 uppercase tracking-wider">
-                    <tr>
-                      <th scope="col" className="px-6 py-4">Client Name</th>
-                      <th scope="col" className="px-6 py-4">Associated Emails/Domains</th>
-                      <th scope="col" className="px-6 py-4 text-right">Actions</th>
-                    </tr>
-                  </thead>
-                  <tbody className="bg-white divide-y divide-slate-100 text-sm">
-                    {clients.map((client) => (
-                      <tr key={client._id} className="hover:bg-slate-50/50 transition-colors">
-                        <td className="px-6 py-4 whitespace-nowrap">
-                          <span className="font-semibold text-slate-800">{client.name}</span>
-                        </td>
-                        <td className="px-6 py-4">
-                          <div className="flex flex-wrap gap-1.5 max-w-md">
-                            {client.associatedEmails && client.associatedEmails.length > 0 ? (
-                              client.associatedEmails.map((email, idx) => (
-                                <span key={idx} className="text-[10px] font-bold bg-indigo-50 text-indigo-650 px-2 py-0.5 rounded-md border border-indigo-100 font-mono">
-                                  {email}
-                                </span>
-                              ))
-                            ) : (
-                              <span className="text-xs text-slate-400 italic">None</span>
-                            )}
-                          </div>
-                        </td>
-                        <td className="px-6 py-4 text-right whitespace-nowrap space-x-3">
-                          <button
-                            onClick={() => {
-                              setSelectedClient(client);
-                              setEditClientName(client.name);
-                              setEditClientEmails(client.associatedEmails ? client.associatedEmails.join(', ') : '');
-                              setIsEditClientOpen(true);
-                            }}
-                            className="text-indigo-600 hover:text-indigo-700 text-sm font-semibold transition-colors"
-                          >
-                            Edit
-                          </button>
-                          <button
-                            onClick={() => handleDeleteClient(client._id, client.name)}
-                            className="text-red-500 hover:text-red-600 text-sm font-semibold transition-colors"
-                          >
-                            Delete
-                          </button>
-                        </td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
+      <Toolbar
+        left={
+          <>
+            <label htmlFor="filter-role" className="text-xs text-fg-3">
+              Role
+            </label>
+            <Select
+              id="filter-role"
+              size="sm"
+              className="w-[130px]"
+              value={roleParam}
+              onChange={(e) => setParams({ role: e.target.value, page: 1 })}
+              options={ROLE_FILTER_OPTIONS}
+            />
+            <label htmlFor="filter-status" className="text-xs text-fg-3">
+              Status
+            </label>
+            <Select
+              id="filter-status"
+              size="sm"
+              className="w-[140px]"
+              value={statusParam}
+              onChange={(e) => setParams({ status: e.target.value, page: 1 })}
+              options={STATUS_FILTER_OPTIONS}
+            />
+            {hasFilters ? (
+              <Button variant="ghost" size="sm" onClick={clearFilters}>
+                Clear filters
+              </Button>
+            ) : null}
+          </>
+        }
+        right={
+          <>
+            <label htmlFor="user-search" className="sr-only">
+              Search users by name or email
+            </label>
+            <Input
+              id="user-search"
+              size="sm"
+              type="search"
+              className="w-[240px]"
+              placeholder="Search name or email…"
+              leadingIcon={<Search className="h-4 w-4" />}
+              value={qParam}
+              onChange={(e) => setParams({ q: e.target.value, page: 1 }, { replace: true })}
+            />
+          </>
+        }
+      />
+
+      {selectionCount > 0 ? (
+        <Toolbar
+          className="bg-primary-subtle"
+          left={
+            <span className="text-sm text-fg-2">
+              {formatNumber(selectionCount)} selected
+              {pendingInSelection > 0
+                ? ` · ${formatNumber(pendingInSelection)} awaiting approval`
+                : ''}
+            </span>
+          }
+          right={
+            <>
+              <Button
+                size="sm"
+                variant="secondary"
+                leftIcon={<Check className="h-4 w-4" />}
+                loading={busy}
+                onClick={() => runBulkStatus('Approved')}
+              >
+                Approve
+              </Button>
+              <Button
+                size="sm"
+                variant="secondary"
+                leftIcon={<X className="h-4 w-4" />}
+                loading={busy}
+                onClick={() => runBulkStatus('Rejected')}
+              >
+                Reject
+              </Button>
+              <Button size="sm" variant="ghost" onClick={() => setRowSelection({})}>
+                Clear selection
+              </Button>
+            </>
+          }
+        />
+      ) : null}
+
+      <PageBody>
+        {pendingCount > 0 && statusParam !== 'Pending' ? (
+          <Alert
+            variant="warning"
+            title={`${formatNumber(pendingCount)} ${
+              pendingCount === 1 ? 'registration is' : 'registrations are'
+            } awaiting approval`}
+            className="mb-4"
+            action={
+              <Button size="sm" onClick={() => setParams({ status: 'Pending', page: 1 })}>
+                Review pending
+              </Button>
+            }
+          >
+            Registration no longer signs anyone in. These people cannot access the workspace until
+            an administrator approves them here.
+          </Alert>
+        ) : null}
+
+        {error ? (
+          <Alert
+            variant="danger"
+            title="Could not load users"
+            className="mb-4"
+            action={
+              <Button size="sm" onClick={reload}>
+                Retry
+              </Button>
+            }
+          >
+            {error}
+          </Alert>
+        ) : null}
+
+        <DataTable
+          ariaLabel="Users"
+          data={rows}
+          columns={columns}
+          loading={loading}
+          enableSelection
+          rowSelection={rowSelection}
+          onRowSelectionChange={setRowSelection}
+          getRowId={(r) => r._id}
+          density="default"
+          sorting={sorting}
+          onSortingChange={handleSortingChange}
+          pagination={{
+            page,
+            pageSize: limit,
+            total,
+            onPageChange: (p) => setParams({ page: p }),
+            onPageSizeChange: (size) => setParams({ limit: size, page: 1 }),
+            itemLabel: 'users',
+          }}
+          emptyState={
+            hasFilters
+              ? {
+                  icon: Search,
+                  title: 'No users match these filters',
+                  description: 'Try a different role, status or search term.',
+                  secondaryAction: { label: 'Clear filters', onClick: clearFilters },
+                }
+              : {
+                  icon: Users,
+                  title: 'No users yet',
+                  description: 'Add the first Head or Employee account to get started.',
+                  action: { label: 'Add user', onClick: () => setCreateOpen(true) },
+                }
+          }
+        />
+      </PageBody>
+
+      <CreateUserDialog
+        open={createOpen}
+        onOpenChange={setCreateOpen}
+        onCreated={() => {
+          setCreateOpen(false)
+          reload()
+        }}
+      />
+
+      {/* Mounted per target so form state is seeded from props on mount — no
+          state-syncing effect, and no stale values when a second row is opened. */}
+      {editTarget ? (
+        <EditUserDialog
+          key={editTarget._id}
+          target={editTarget}
+          isSelf={editTarget._id === currentUser?._id}
+          onClose={() => setEditTarget(null)}
+          onSaved={(updated) => {
+            const previous = editTarget
+            setEditTarget(null)
+            afterSave(previous, updated)
+          }}
+        />
+      ) : null}
+
+      {permissionsTarget ? (
+        <GmailPermissionsDialog
+          key={permissionsTarget._id}
+          target={permissionsTarget}
+          knownAddresses={knownGmailAddresses}
+          onClose={() => setPermissionsTarget(null)}
+          onSaved={(updated) => {
+            const previous = permissionsTarget
+            setPermissionsTarget(null)
+            afterSave(previous, updated)
+          }}
+        />
+      ) : null}
+    </>
+  )
+}
+
+/* ---------------------------------------------------------------------------
+ * Create
+ * ------------------------------------------------------------------------ */
+
+function CreateUserDialog({ open, onOpenChange, onCreated }) {
+  const [values, setValues] = useState(EMPTY_CREATE)
+  const [errors, setErrors] = useState({})
+  const [saving, setSaving] = useState(false)
+
+  const handleOpenChange = (next) => {
+    if (!next) {
+      setValues(EMPTY_CREATE)
+      setErrors({})
+    }
+    onOpenChange(next)
+  }
+
+  const submit = async (e) => {
+    e.preventDefault()
+    const found = validateUserForm(values, { requirePassword: true })
+    setErrors(found)
+    if (Object.keys(found).length > 0) return
+
+    setSaving(true)
+    try {
+      await api.post('/users', {
+        name: values.name.trim(),
+        email: values.email.trim(),
+        password: values.password,
+        role: values.role,
+      })
+      toast.success(`${values.name.trim()} created.`)
+      setValues(EMPTY_CREATE)
+      setErrors({})
+      onCreated()
+    } catch (err) {
+      toast.error('Could not create user', { description: getErrorMessage(err) })
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  return (
+    <Dialog open={open} onOpenChange={handleOpenChange}>
+      <DialogContent
+        size="md"
+        title="Add user"
+        description="Creates an approved Head or Employee account. Administrators cannot be created here."
+        dismissable={!saving}
+        footer={
+          <>
+            <DialogClose asChild>
+              <Button variant="secondary" disabled={saving}>
+                Cancel
+              </Button>
+            </DialogClose>
+            <Button variant="primary" loading={saving} onClick={submit}>
+              Create user
+            </Button>
+          </>
+        }
+      >
+        <form className="flex flex-col gap-4" onSubmit={submit} noValidate>
+          <FormField label="Full name" required error={errors.name}>
+            {(field) => (
+              <Input
+                {...field}
+                value={values.name}
+                autoComplete="off"
+                maxLength={120}
+                onChange={(e) => setValues((v) => ({ ...v, name: e.target.value }))}
+              />
             )}
-          </div>
-        </>
-      )}
+          </FormField>
 
-      {/* Add User Modal */}
-      {isAddOpen && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 backdrop-blur-[4px] p-4 overflow-y-auto">
-          <div className="bg-white border border-slate-200 rounded-2xl max-w-md w-full p-6 relative shadow-2xl animate-fade-in my-8 max-h-[90vh] overflow-y-auto select-none">
-            <div className="flex items-center justify-between mb-4">
-              <div>
-                <h3 className="text-xl font-bold text-slate-805">Add New User</h3>
-                <p className="text-xs text-slate-500 mt-1">Create a new Head or Employee account</p>
-              </div>
-              <button onClick={() => setIsAddOpen(false)} className="text-slate-400 hover:text-slate-600 transition-colors">
-                <svg className="h-5 w-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M6 18L18 6M6 6l12 12" />
-                </svg>
-              </button>
-            </div>
-            
-            <form onSubmit={handleAddUser} className="space-y-4">
-              <div>
-                <label className="block text-xs font-semibold text-slate-500 uppercase tracking-wider mb-1">Full Name</label>
-                <input
-                  type="text"
-                  required
-                  placeholder="John Doe"
-                  className="w-full px-4 py-3 bg-white border border-slate-200 rounded-xl text-slate-800 placeholder-slate-400 focus:outline-none focus:ring-2 focus:ring-indigo-150 focus:border-indigo-500 text-sm transition-all duration-200"
-                  value={newUser.name}
-                  onChange={(e) => setNewUser({ ...newUser, name: e.target.value })}
+          <FormField label="Email address" required error={errors.email}>
+            {(field) => (
+              <Input
+                {...field}
+                type="email"
+                value={values.email}
+                autoComplete="off"
+                maxLength={254}
+                onChange={(e) => setValues((v) => ({ ...v, email: e.target.value }))}
+              />
+            )}
+          </FormField>
+
+          <FormField
+            label="Temporary password"
+            required
+            hint="At least 6 characters. Ask the user to change it after their first sign-in."
+            error={errors.password}
+          >
+            {(field) => (
+              <Input
+                {...field}
+                type="password"
+                value={values.password}
+                autoComplete="new-password"
+                maxLength={128}
+                onChange={(e) => setValues((v) => ({ ...v, password: e.target.value }))}
+              />
+            )}
+          </FormField>
+
+          <FormField label="Role" required error={errors.role}>
+            {(field) => (
+              <Select
+                {...field}
+                value={values.role}
+                onChange={(e) => setValues((v) => ({ ...v, role: e.target.value }))}
+                options={CREATABLE_ROLES.map((r) => ({ value: r, label: r }))}
+              />
+            )}
+          </FormField>
+
+          {/* Enables Enter-to-submit without a second visible button. */}
+          <button type="submit" className="sr-only" tabIndex={-1} aria-hidden="true">
+            Create user
+          </button>
+        </form>
+      </DialogContent>
+    </Dialog>
+  )
+}
+
+/* ---------------------------------------------------------------------------
+ * Edit
+ * ------------------------------------------------------------------------ */
+
+function EditUserDialog({ target, isSelf, onClose, onSaved }) {
+  const [values, setValues] = useState(() => ({
+    name: target.name || '',
+    email: target.email || '',
+    role: target.role || 'Employee',
+    status: target.status || 'Approved',
+  }))
+  const [errors, setErrors] = useState({})
+  const [saving, setSaving] = useState(false)
+
+  const submit = async (e) => {
+    e.preventDefault()
+    const found = validateUserForm(values, { requirePassword: false })
+    setErrors(found)
+    if (Object.keys(found).length > 0) return
+
+    setSaving(true)
+    try {
+      const res = await api.put(`/users/${target._id}`, {
+        name: values.name.trim(),
+        email: values.email.trim(),
+        role: values.role,
+        status: values.status,
+      })
+      toast.success(`${values.name.trim()} updated.`)
+      // S-5: hand the full updated document back so the list patches the row
+      // instead of re-fetching the page.
+      onSaved(res.data)
+    } catch (err) {
+      toast.error('Could not update user', { description: getErrorMessage(err) })
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  const roleChanged = values.role !== target.role
+  const statusChanged = values.status !== (target.status || 'Approved')
+
+  return (
+    <Dialog open onOpenChange={(next) => !next && onClose()}>
+      <DialogContent
+        size="md"
+        title={`Edit ${target.name || target.email}`}
+        description="Changes to role or status sign the account out of every active session."
+        dismissable={!saving}
+        footer={
+          <>
+            <DialogClose asChild>
+              <Button variant="secondary" disabled={saving}>
+                Cancel
+              </Button>
+            </DialogClose>
+            <Button variant="primary" loading={saving} onClick={submit}>
+              Save changes
+            </Button>
+          </>
+        }
+      >
+        <form className="flex flex-col gap-4" onSubmit={submit} noValidate>
+          <FormField label="Full name" required error={errors.name}>
+            {(field) => (
+              <Input
+                {...field}
+                value={values.name}
+                maxLength={120}
+                onChange={(e) => setValues((v) => ({ ...v, name: e.target.value }))}
+              />
+            )}
+          </FormField>
+
+          <FormField label="Email address" required error={errors.email}>
+            {(field) => (
+              <Input
+                {...field}
+                type="email"
+                value={values.email}
+                maxLength={254}
+                onChange={(e) => setValues((v) => ({ ...v, email: e.target.value }))}
+              />
+            )}
+          </FormField>
+
+          <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
+            <FormField
+              label="Role"
+              required
+              error={errors.role}
+              hint={isSelf ? 'You cannot change your own role.' : undefined}
+            >
+              {(field) => (
+                <Select
+                  {...field}
+                  disabled={isSelf}
+                  value={values.role}
+                  onChange={(e) => setValues((v) => ({ ...v, role: e.target.value }))}
+                  options={EDITABLE_ROLES.map((r) => ({ value: r, label: r }))}
                 />
-              </div>
-
-              <div>
-                <label className="block text-xs font-semibold text-slate-500 uppercase tracking-wider mb-1">Email Address</label>
-                <input
-                  type="email"
-                  required
-                  placeholder="john@example.com"
-                  className="w-full px-4 py-3 bg-white border border-slate-200 rounded-xl text-slate-800 placeholder-slate-400 focus:outline-none focus:ring-2 focus:ring-indigo-150 focus:border-indigo-500 text-sm transition-all duration-200"
-                  value={newUser.email}
-                  onChange={(e) => setNewUser({ ...newUser, email: e.target.value })}
-                />
-              </div>
-
-              <div>
-                <label className="block text-xs font-semibold text-slate-500 uppercase tracking-wider mb-1">Password</label>
-                <input
-                  type="password"
-                  required
-                  placeholder="••••••••"
-                  className="w-full px-4 py-3 bg-white border border-slate-200 rounded-xl text-slate-800 placeholder-slate-400 focus:outline-none focus:ring-2 focus:ring-indigo-150 focus:border-indigo-500 text-sm transition-all duration-200"
-                  value={newUser.password}
-                  onChange={(e) => setNewUser({ ...newUser, password: e.target.value })}
-                />
-              </div>
-
-              <div>
-                <label className="block text-xs font-semibold text-slate-500 uppercase tracking-wider mb-1">Role</label>
-                <select
-                  className="w-full px-4 py-3 bg-white border border-slate-200 rounded-xl text-slate-805 focus:outline-none focus:ring-2 focus:ring-indigo-150 focus:border-indigo-505 text-sm transition-all duration-200"
-                  value={newUser.role}
-                  onChange={(e) => setNewUser({ ...newUser, role: e.target.value })}
-                >
-                  <option value="Employee">Employee</option>
-                  <option value="Head">Head</option>
-                </select>
-              </div>
-
-              <div className="flex space-x-3 pt-4 border-t border-slate-100 mt-6">
-                <button
-                  type="button"
-                  onClick={() => setIsAddOpen(false)}
-                  className="w-1/2 py-3 px-4 border border-slate-200 hover:bg-slate-50 rounded-xl text-sm font-semibold text-slate-500 transition-colors"
-                >
-                  Cancel
-                </button>
-                <button
-                  type="submit"
-                  disabled={actionLoading}
-                  className="w-1/2 py-3 px-4 bg-indigo-600 hover:bg-indigo-700 text-white rounded-xl text-sm font-semibold transition-colors disabled:opacity-50 flex items-center justify-center space-x-2 shadow-md hover:translate-y-[-2px] active:translate-y-0"
-                >
-                  {actionLoading ? (
-                    <svg className="animate-spin h-5 w-5 text-white" fill="none" viewBox="0 0 24 24">
-                      <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
-                      <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z" />
-                    </svg>
-                  ) : (
-                    'Add User'
-                  )}
-                </button>
-              </div>
-            </form>
-          </div>
-        </div>
-      )}
-
-      {/* Edit User Modal */}
-      {isEditOpen && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 backdrop-blur-[4px] p-4 overflow-y-auto">
-          <div className="bg-white border border-slate-200 rounded-2xl max-w-md w-full p-6 relative shadow-2xl animate-fade-in my-8 max-h-[90vh] overflow-y-auto select-none">
-            <div className="flex items-center justify-between mb-4">
-              <div>
-                <h3 className="text-xl font-bold text-slate-805">Edit User</h3>
-                <p className="text-xs text-slate-500 mt-1">Update user profile information</p>
-              </div>
-              <button onClick={() => setIsEditOpen(false)} className="text-slate-400 hover:text-slate-655 transition-colors">
-                <svg className="h-5 w-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M6 18L18 6M6 6l12 12" />
-                </svg>
-              </button>
-            </div>
-            
-            <form onSubmit={handleEditUser} className="space-y-4">
-              <div>
-                <label className="block text-xs font-semibold text-slate-500 uppercase tracking-wider mb-1">Full Name</label>
-                <input
-                  type="text"
-                  required
-                  className="w-full px-4 py-3 bg-white border border-slate-200 rounded-xl text-slate-800 focus:outline-none focus:ring-2 focus:ring-indigo-150 focus:border-indigo-500 text-sm transition-all duration-200"
-                  value={editUser.name}
-                  onChange={(e) => setEditUser({ ...editUser, name: e.target.value })}
-                />
-              </div>
-
-              <div>
-                <label className="block text-xs font-semibold text-slate-500 uppercase tracking-wider mb-1">Email Address</label>
-                <input
-                  type="email"
-                  required
-                  className="w-full px-4 py-3 bg-white border border-slate-200 rounded-xl text-slate-800 focus:outline-none focus:ring-2 focus:ring-indigo-150 focus:border-indigo-500 text-sm transition-all duration-200"
-                  value={editUser.email}
-                  onChange={(e) => setEditUser({ ...editUser, email: e.target.value })}
-                />
-              </div>
-
-              <div>
-                <label className="block text-xs font-semibold text-slate-500 uppercase tracking-wider mb-1">Role</label>
-                <select
-                  className="w-full px-4 py-3 bg-white border border-slate-200 rounded-xl text-slate-805 focus:outline-none focus:ring-2 focus:ring-indigo-150 focus:border-indigo-505 text-sm transition-all duration-200"
-                  value={editUser.role}
-                  onChange={(e) => setEditUser({ ...editUser, role: e.target.value })}
-                >
-                  <option value="Employee">Employee</option>
-                  <option value="Head">Head</option>
-                  <option value="Admin">Admin</option>
-                </select>
-              </div>
-
-              <div>
-                <label className="block text-xs font-semibold text-slate-500 uppercase tracking-wider mb-1">Status</label>
-                <select
-                  className="w-full px-4 py-3 bg-white border border-slate-200 rounded-xl text-slate-805 focus:outline-none focus:ring-2 focus:ring-indigo-150 focus:border-indigo-505 text-sm transition-all duration-200"
-                  value={editUser.status}
-                  onChange={(e) => setEditUser({ ...editUser, status: e.target.value })}
-                >
-                  <option value="Approved">Approved</option>
-                  <option value="Pending">Pending</option>
-                  <option value="Rejected">Rejected</option>
-                </select>
-              </div>
-
-              {editUser.role === 'Head' && (
-                <div className="p-4 bg-indigo-50/60 border border-indigo-100 rounded-2xl space-y-4">
-                  <h4 className="text-xs font-bold text-indigo-900 uppercase tracking-wider flex items-center gap-1.5">
-                    <svg className="w-4 h-4 text-indigo-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z" />
-                    </svg>
-                    Head Connected Accounts Permissions
-                  </h4>
-
-                  <div>
-                    <label className="block text-xs font-bold text-slate-700 mb-1">
-                      Max Connected Accounts Limit
-                    </label>
-                    <input
-                      type="number"
-                      min="1"
-                      max="50"
-                      className="w-full px-3.5 py-2.5 bg-white border border-slate-200 rounded-xl text-slate-800 text-xs focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500 outline-none"
-                      value={editUser.maxConnectedAccounts ?? 5}
-                      onChange={(e) => setEditUser({ ...editUser, maxConnectedAccounts: e.target.value })}
-                    />
-                    <span className="text-[10px] text-slate-500 mt-1 block">
-                      Maximum number of connected Gmail accounts this Head can connect.
-                    </span>
-                  </div>
-
-                  <div>
-                    <label className="block text-xs font-bold text-slate-700 mb-2">
-                      Select Authorized Connected Accounts
-                    </label>
-
-                    {allSystemGmailAccounts.length > 0 ? (
-                      <div className="bg-white border border-slate-200 rounded-xl p-3 max-h-36 overflow-y-auto space-y-2">
-                        {allSystemGmailAccounts.map((gmail) => {
-                          const allowedList = Array.isArray(editUser.allowedGmailAccounts) ? editUser.allowedGmailAccounts : [];
-                          const isChecked = allowedList.includes(gmail);
-                          return (
-                            <label key={gmail} className="flex items-center space-x-2.5 text-xs text-slate-700 cursor-pointer hover:bg-slate-50 p-1.5 rounded-lg transition-colors">
-                              <input
-                                type="checkbox"
-                                checked={isChecked}
-                                onChange={() => {
-                                  const updated = isChecked
-                                    ? allowedList.filter(e => e !== gmail)
-                                    : [...allowedList, gmail];
-                                  setEditUser({ ...editUser, allowedGmailAccounts: updated });
-                                }}
-                                className="rounded border-slate-300 text-indigo-600 focus:ring-indigo-500 h-4 w-4"
-                              />
-                              <span className="font-mono text-xs text-slate-800">{gmail}</span>
-                            </label>
-                          );
-                        })}
-                      </div>
-                    ) : (
-                      <div className="text-[11px] text-slate-400 italic bg-white p-3 border border-slate-200 rounded-xl">
-                        No connected Gmail accounts currently found in the system.
-                      </div>
-                    )}
-                  </div>
-
-                  <div>
-                    <label className="block text-[11px] font-bold text-slate-600 mb-1">
-                      Additional Custom Authorized Emails (Comma Separated)
-                    </label>
-                    <input
-                      type="text"
-                      placeholder="e.g. custom1@gmail.com, custom2@company.com"
-                      className="w-full px-3.5 py-2 bg-white border border-slate-200 rounded-xl text-slate-800 text-xs focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500 outline-none"
-                      value={Array.isArray(editUser.allowedGmailAccounts) ? editUser.allowedGmailAccounts.join(', ') : (editUser.allowedGmailAccounts || '')}
-                      onChange={(e) => {
-                        const val = e.target.value;
-                        const list = val.split(',').map(s => s.trim()).filter(Boolean);
-                        setEditUser({ ...editUser, allowedGmailAccounts: list });
-                      }}
-                    />
-                    <span className="text-[10px] text-slate-500 mt-1 block">
-                      Check the boxes above or type custom allowed emails. Leave empty to allow any account up to the limit.
-                    </span>
-                  </div>
-                </div>
               )}
+            </FormField>
 
-              <div className="flex space-x-3 pt-4 border-t border-slate-100 mt-6">
-                <button
-                  type="button"
-                  onClick={() => setIsEditOpen(false)}
-                  className="w-1/2 py-3 px-4 border border-slate-200 hover:bg-slate-50 rounded-xl text-sm font-semibold text-slate-500 transition-colors"
-                >
-                  Cancel
-                </button>
-                <button
-                  type="submit"
-                  disabled={actionLoading}
-                  className="w-1/2 py-3 px-4 bg-indigo-600 hover:bg-indigo-700 text-white rounded-xl text-sm font-semibold transition-colors disabled:opacity-50 flex items-center justify-center space-x-2 shadow-md hover:translate-y-[-2px] active:translate-y-0"
-                >
-                  {actionLoading ? (
-                    <svg className="animate-spin h-5 w-5 text-white" fill="none" viewBox="0 0 24 24">
-                      <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
-                      <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z" />
-                    </svg>
-                  ) : (
-                    'Save Changes'
-                  )}
-                </button>
-              </div>
-            </form>
+            <FormField
+              label="Account status"
+              required
+              error={errors.status}
+              hint={isSelf ? 'You cannot change your own status.' : undefined}
+            >
+              {(field) => (
+                <Select
+                  {...field}
+                  disabled={isSelf}
+                  value={values.status}
+                  onChange={(e) => setValues((v) => ({ ...v, status: e.target.value }))}
+                  options={STATUSES.map((s) => ({ value: s, label: s }))}
+                />
+              )}
+            </FormField>
           </div>
-        </div>
-      )}
 
-      {/* Delete Confirmation Modal */}
-      {isDeleteOpen && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 backdrop-blur-[4px] p-4">
-          <div className="bg-white border border-slate-200 rounded-2xl max-w-sm w-full p-6 relative shadow-2xl animate-fade-in select-none">
-            <div className="w-12 h-12 mx-auto bg-red-50 border border-red-100 rounded-full flex items-center justify-center mb-4">
-              <svg className="w-6 h-6 text-red-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" />
-              </svg>
-            </div>
-            
-            <h3 className="text-lg font-bold text-slate-800 text-center mb-2">Delete User</h3>
-            <p className="text-xs text-slate-500 text-center mb-6">
-              Are you sure you want to delete this user? This action cannot be undone.
+          {roleChanged || statusChanged ? (
+            <Alert variant="warning" title="This will sign the account out">
+              {roleChanged ? `Role ${target.role} → ${values.role}. ` : ''}
+              {statusChanged ? `Status ${target.status || 'Approved'} → ${values.status}. ` : ''}
+              Every active session and socket connection for {target.email} is revoked on save.
+            </Alert>
+          ) : null}
+
+          <button type="submit" className="sr-only" tabIndex={-1} aria-hidden="true">
+            Save changes
+          </button>
+        </form>
+      </DialogContent>
+    </Dialog>
+  )
+}
+
+/* ---------------------------------------------------------------------------
+ * Gmail permissions
+ * ------------------------------------------------------------------------ */
+
+function GmailPermissionsDialog({ target, knownAddresses, onClose, onSaved }) {
+  const summary = gmailSummary(target)
+  const [maxAccounts, setMaxAccounts] = useState(() => String(summary.limit))
+  const [allowed, setAllowed] = useState(() => summary.allowed)
+  const [draft, setDraft] = useState('')
+  const [errors, setErrors] = useState({})
+  const [saving, setSaving] = useState(false)
+
+  const pickable = Array.from(new Set([...knownAddresses, ...summary.addresses])).sort()
+  const custom = allowed.filter((a) => !pickable.includes(a))
+
+  const toggle = (address) => {
+    setAllowed((list) =>
+      list.includes(address) ? list.filter((a) => a !== address) : [...list, address]
+    )
+  }
+
+  const addDraft = () => {
+    const value = draft.trim().toLowerCase()
+    if (!value) return
+    if (!EMAIL_RE.test(value)) {
+      setErrors((e) => ({ ...e, draft: 'Enter a valid email address.' }))
+      return
+    }
+    if (allowed.includes(value)) {
+      setErrors((e) => ({ ...e, draft: 'That address is already allow-listed.' }))
+      return
+    }
+    setAllowed((list) => [...list, value])
+    setDraft('')
+    setErrors((e) => ({ ...e, draft: undefined }))
+  }
+
+  const submit = async (e) => {
+    e.preventDefault()
+    const found = validatePermissionsForm({
+      maxConnectedAccounts: maxAccounts,
+      allowedGmailAccounts: allowed,
+    })
+    setErrors(found)
+    if (Object.keys(found).length > 0) return
+
+    setSaving(true)
+    try {
+      const res = await api.put(`/users/${target._id}`, {
+        maxConnectedAccounts: Number(maxAccounts),
+        allowedGmailAccounts: allowed,
+      })
+      toast.success(`Gmail permissions saved for ${target.name || target.email}.`)
+      // S-5: these are exactly the two fields the old response omitted.
+      onSaved(res.data)
+    } catch (err) {
+      toast.error('Could not save Gmail permissions', { description: getErrorMessage(err) })
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  return (
+    <Dialog open onOpenChange={(next) => !next && onClose()}>
+      <DialogContent
+        size="md"
+        title={`Gmail permissions — ${target.name || target.email}`}
+        description="Controls how many mailboxes this account may connect, and which addresses are permitted."
+        dismissable={!saving}
+        footer={
+          <>
+            <DialogClose asChild>
+              <Button variant="secondary" disabled={saving}>
+                Cancel
+              </Button>
+            </DialogClose>
+            <Button variant="primary" loading={saving} onClick={submit}>
+              Save permissions
+            </Button>
+          </>
+        }
+      >
+        <form className="flex flex-col gap-5" onSubmit={submit} noValidate>
+          <FormField
+            label="Maximum connected accounts"
+            required
+            hint={`Between 0 and ${MAX_ACCOUNTS_CEILING}. Set 0 to block new connections entirely.`}
+            error={errors.maxConnectedAccounts}
+          >
+            {(field) => (
+              <Input
+                {...field}
+                type="number"
+                inputMode="numeric"
+                min={0}
+                max={MAX_ACCOUNTS_CEILING}
+                step={1}
+                className="w-[140px]"
+                value={maxAccounts}
+                onChange={(e) => setMaxAccounts(e.target.value)}
+              />
+            )}
+          </FormField>
+
+          <fieldset className="flex flex-col gap-2">
+            <legend className="mb-1 text-xs font-medium text-fg-2">
+              Allowed Gmail addresses
+            </legend>
+            <p className="text-xs text-fg-3">
+              Leave the list empty to permit any address, up to the limit above. Adding entries
+              restricts this account to exactly those addresses.
             </p>
 
-            <div className="flex space-x-3 pt-4 border-t border-slate-100">
-              <button
-                type="button"
-                onClick={() => setIsDeleteOpen(false)}
-                className="w-1/2 py-3 px-4 border border-slate-200 hover:bg-slate-50 rounded-xl text-sm font-semibold text-slate-500 transition-colors"
-              >
-                Cancel
-              </button>
-              <button
-                type="button"
-                onClick={handleDeleteUser}
-                disabled={actionLoading}
-                className="w-1/2 py-3 px-4 bg-red-500 hover:bg-red-600 text-white rounded-xl text-sm font-semibold transition-colors disabled:opacity-50 flex items-center justify-center space-x-2 shadow-md hover:translate-y-[-2px] active:translate-y-0"
-              >
-                {actionLoading ? 'Deleting...' : 'Delete'}
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
+            {pickable.length > 0 ? (
+              <div className="flex max-h-40 flex-col gap-1.5 overflow-y-auto rounded-lg border border-line p-2">
+                {pickable.map((address) => (
+                  <Checkbox
+                    key={address}
+                    id={`allow-${target._id}-${address}`}
+                    size="sm"
+                    label={address}
+                    checked={allowed.includes(address)}
+                    onCheckedChange={() => toggle(address)}
+                  />
+                ))}
+              </div>
+            ) : (
+              <p className="rounded-lg border border-line bg-subtle px-3 py-2 text-xs text-fg-3">
+                No Gmail addresses are known to the system yet. Add one below.
+              </p>
+            )}
 
-      {/* Add Client Modal */}
-      {isAddClientOpen && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 backdrop-blur-[4px] p-4 overflow-y-auto">
-          <div className="bg-white border border-slate-200 rounded-2xl max-w-md w-full p-6 relative shadow-2xl animate-fade-in my-8 max-h-[90vh] overflow-y-auto select-none">
-            <div className="flex items-center justify-between mb-4">
-              <div>
-                <h3 className="text-lg font-bold text-slate-805">Add Client Account</h3>
-                <p className="text-slate-500 text-xs mt-0.5">Register a new client in the database</p>
-              </div>
-              <button onClick={() => setIsAddClientOpen(false)} className="p-1.5 hover:bg-slate-55 rounded-xl text-slate-400 hover:text-slate-600 transition-colors">
-                <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M6 18L18 6M6 6l12 12" />
-                </svg>
-              </button>
-            </div>
-            
-            <form onSubmit={handleAddClient} className="space-y-4">
-              <div>
-                <label className="block text-xs font-semibold text-slate-500 uppercase tracking-wider mb-1">Client Name</label>
-                <input
-                  type="text"
-                  required
-                  placeholder="e.g. Acme Corp"
-                  className="w-full px-4 py-3 bg-white border border-slate-200 rounded-xl text-slate-800 focus:outline-none focus:ring-2 focus:ring-indigo-150 focus:border-indigo-500 text-sm transition-all duration-200"
-                  value={newClientName}
-                  onChange={(e) => setNewClientName(e.target.value)}
-                />
-              </div>
+            {custom.length > 0 ? (
+              <ul className="flex flex-wrap gap-1.5">
+                {custom.map((address) => (
+                  <li key={address}>
+                    <Badge size="md" variant="outline">
+                      <span className="font-mono text-xs">{address}</span>
+                      <button
+                        type="button"
+                        aria-label={`Remove ${address} from the allow list`}
+                        className="ml-1 rounded-sm text-fg-3 hover:text-fg focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary-600"
+                        onClick={() => toggle(address)}
+                      >
+                        <X className="h-3 w-3" />
+                      </button>
+                    </Badge>
+                  </li>
+                ))}
+              </ul>
+            ) : null}
 
-              <div>
-                <label className="block text-xs font-semibold text-slate-500 uppercase tracking-wider mb-1">Associated Emails / Domains</label>
-                <textarea
-                  placeholder="e.g. acme.com, contact@acme.com (comma separated)"
-                  rows="3"
-                  className="w-full px-4 py-3 bg-white border border-slate-200 rounded-xl text-slate-800 focus:outline-none focus:ring-2 focus:ring-indigo-150 focus:border-indigo-500 text-sm transition-all duration-200 font-mono"
-                  value={newClientEmails}
-                  onChange={(e) => setNewClientEmails(e.target.value)}
-                />
-                <p className="text-[10px] text-slate-450 mt-1 leading-normal">
-                  Emails containing these values (case-insensitive) will be counted in client-wise reports. Use domains like <code>acme.com</code> to capture all emails from a domain.
-                </p>
-              </div>
+            <FormField label="Add another address" error={errors.draft || errors.allowedGmailAccounts}>
+              {(field) => (
+                <div className="flex gap-2">
+                  <Input
+                    {...field}
+                    type="email"
+                    placeholder="name@example.com"
+                    value={draft}
+                    onChange={(e) => setDraft(e.target.value)}
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter') {
+                        e.preventDefault()
+                        addDraft()
+                      }
+                    }}
+                  />
+                  <Button variant="secondary" onClick={addDraft} disabled={!draft.trim()}>
+                    Add
+                  </Button>
+                </div>
+              )}
+            </FormField>
 
-              <div className="flex space-x-3 pt-4 border-t border-slate-100 mt-6">
-                <button
-                  type="button"
-                  onClick={() => setIsAddClientOpen(false)}
-                  className="w-1/2 py-3 px-4 border border-slate-200 hover:bg-slate-50 rounded-xl text-sm font-semibold text-slate-500 transition-colors"
-                >
-                  Cancel
-                </button>
-                <button
-                  type="submit"
-                  disabled={actionLoading}
-                  className="w-1/2 py-3 px-4 bg-indigo-600 hover:bg-indigo-700 text-white rounded-xl text-sm font-semibold transition-colors disabled:opacity-50 flex items-center justify-center space-x-2 shadow-md hover:translate-y-[-2px] active:translate-y-0"
-                >
-                  {actionLoading ? 'Saving...' : 'Add Client'}
-                </button>
-              </div>
-            </form>
-          </div>
-        </div>
-      )}
-
-      {/* Edit Client Modal */}
-      {isEditClientOpen && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 backdrop-blur-[4px] p-4 overflow-y-auto">
-          <div className="bg-white border border-slate-200 rounded-2xl max-w-md w-full p-6 relative shadow-2xl animate-fade-in my-8 max-h-[90vh] overflow-y-auto select-none">
-            <div className="flex items-center justify-between mb-4">
-              <div>
-                <h3 className="text-lg font-bold text-slate-805">Modify Client Account</h3>
-                <p className="text-slate-500 text-xs mt-0.5">Edit name or associated email patterns</p>
-              </div>
-              <button onClick={() => { setIsEditClientOpen(false); setSelectedClient(null); }} className="p-1.5 hover:bg-slate-55 rounded-xl text-slate-400 hover:text-slate-600 transition-colors">
-                <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M6 18L18 6M6 6l12 12" />
-                </svg>
-              </button>
-            </div>
-            
-            <form onSubmit={handleEditClient} className="space-y-4">
-              <div>
-                <label className="block text-xs font-semibold text-slate-500 uppercase tracking-wider mb-1">Client Name</label>
-                <input
-                  type="text"
-                  required
-                  className="w-full px-4 py-3 bg-white border border-slate-200 rounded-xl text-slate-800 focus:outline-none focus:ring-2 focus:ring-indigo-150 focus:border-indigo-500 text-sm transition-all duration-200"
-                  value={editClientName}
-                  onChange={(e) => setEditClientName(e.target.value)}
-                />
-              </div>
-
-              <div>
-                <label className="block text-xs font-semibold text-slate-500 uppercase tracking-wider mb-1">Associated Emails / Domains</label>
-                <textarea
-                  placeholder="e.g. acme.com, contact@acme.com (comma separated)"
-                  rows="3"
-                  className="w-full px-4 py-3 bg-white border border-slate-200 rounded-xl text-slate-800 focus:outline-none focus:ring-2 focus:ring-indigo-150 focus:border-indigo-500 text-sm transition-all duration-200 font-mono"
-                  value={editClientEmails}
-                  onChange={(e) => setEditClientEmails(e.target.value)}
-                />
-                <p className="text-[10px] text-slate-455 mt-1 leading-normal font-sans">
-                  Comma-separated list of emails or domain names. E.g. <code>google.com</code> will match any mail from <code>user@google.com</code>.
-                </p>
-              </div>
-
-              <div className="flex space-x-3 pt-4 border-t border-slate-100 mt-6">
-                <button
-                  type="button"
-                  onClick={() => { setIsEditClientOpen(false); setSelectedClient(null); }}
-                  className="w-1/2 py-3 px-4 border border-slate-200 hover:bg-slate-50 rounded-xl text-sm font-semibold text-slate-500 transition-colors"
-                >
-                  Cancel
-                </button>
-                <button
-                  type="submit"
-                  disabled={actionLoading}
-                  className="w-1/2 py-3 px-4 bg-indigo-600 hover:bg-indigo-700 text-white rounded-xl text-sm font-semibold transition-colors disabled:opacity-50 flex items-center justify-center space-x-2 shadow-md hover:translate-y-[-2px] active:translate-y-0"
-                >
-                  {actionLoading ? 'Saving...' : 'Save Changes'}
-                </button>
-              </div>
-            </form>
-          </div>
-        </div>
-      )}
-    </main>
-  );
-};
-
-export default ManageUsers;
+            <p className="text-xs text-fg-3 tabular">
+              {allowed.length === 0
+                ? 'Any address permitted'
+                : `${formatNumber(allowed.length)} of ${MAX_ALLOWED_ADDRESSES} allow-listed`}
+            </p>
+          </fieldset>
+        </form>
+      </DialogContent>
+    </Dialog>
+  )
+}

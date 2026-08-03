@@ -1,0 +1,158 @@
+name: CI
+
+# The audit's root-cause #2 was "no lint or tests in CI" — a hard ReferenceError
+# on the app's primary screen was committed and survived. ESLint catches it in
+# under a second, so lint is a required, blocking job here.
+
+# Runs on EVERY pushed branch. An earlier revision listed
+# [main, "feat/**", "fix/**"], which silently skipped branches named after a
+# person (e.g. `darshan`) — the push succeeded and no run appeared, which reads
+# as "CI passed" when in fact CI never ran. A branch filter that quietly does
+# nothing is worse than no filter.
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  client:
+    name: Client — lint, test, build
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: client
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: client/package-lock.json
+
+      - run: npm ci
+
+      # Blocking. no-undef is what would have caught the TaskList crash.
+      - name: ESLint
+        run: npx eslint . --max-warnings=0
+
+      - name: Unit tests
+        run: npm run test -- --run
+
+      - name: Build
+        run: npm run build
+        env:
+          VITE_API_URL: http://localhost:5015/api
+          VITE_SOCKET_URL: http://localhost:5015
+
+      - name: Upload build output
+        uses: actions/upload-artifact@v4
+        with:
+          name: client-dist
+          path: client/dist
+          retention-days: 7
+
+  server:
+    name: Server — lint, test
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: server
+    services:
+      mongo:
+        image: mongo:7
+        ports: ["27017:27017"]
+        options: >-
+          --health-cmd "mongosh --quiet --eval 'db.adminCommand({ping:1}).ok'"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+      redis:
+        image: redis:7-alpine
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 3s
+          --health-retries 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: server/package-lock.json
+
+      - run: npm ci
+
+      - name: Syntax check every source file
+        run: npm run check:syntax
+
+      # Boots the real server against the mongo/redis services above and runs
+      # scripts/smokeTest.js against it: auth, the list/pagination envelope from
+      # API-LIST-CONTRACT.md, role boundaries, the ?days= clamp and the NoSQL
+      # key guard. These are the paths unit tests cannot reach.
+      - name: Integration smoke test
+        run: |
+          npm start > /tmp/server.log 2>&1 &
+          for i in $(seq 1 30); do
+            if curl -sf http://127.0.0.1:5015/api/health > /dev/null; then
+              echo "server ready after ${i}s"; break
+            fi
+            sleep 1
+          done
+          curl -sf http://127.0.0.1:5015/api/health > /dev/null || { echo "server failed to become healthy"; cat /tmp/server.log; exit 1; }
+          npm run test:smoke
+        env:
+          NODE_ENV: test
+          PORT: 5015
+          BASE_URL: http://127.0.0.1:5015
+          MONGO_URI: mongodb://localhost:27017/maildesk_test
+          REDIS_URL: redis://localhost:6379
+          # The suite makes 225 assertions across many requests and several
+          # logins, which exceeds both limiters' production defaults (10 auth /
+          # 300 general per 15 min per IP). Without these the run 429s partway
+          # through and every downstream assertion cascades into a false
+          # failure. Raised for the test run ONLY — the defaults are what ship.
+          RATE_LIMIT_AUTH_MAX: 500
+          RATE_LIMIT_GENERAL_MAX: 5000
+          JWT_SECRET: ci-test-secret-not-a-real-key
+          # 32 bytes hex — required by tokenCrypto's AES-256-GCM key derivation.
+          TOKEN_ENCRYPTION_KEY: 0000000000000000000000000000000000000000000000000000000000000000
+          OAUTH_STATE_SECRET: ci-test-oauth-state-secret
+          APP_TIMEZONE: Asia/Kolkata
+
+      - name: Server log on failure
+        if: failure()
+        run: cat /tmp/server.log || true
+
+  docker:
+    name: Docker images build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build server image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile.server
+          push: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Build client image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile.client
+          push: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

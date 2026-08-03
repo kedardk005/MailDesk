@@ -1,149 +1,201 @@
-import React, { useState } from 'react';
-import { useNavigate, Link } from 'react-router-dom';
-import api from '../api/axios';
+import { useState } from 'react'
+import { Link, Navigate, useNavigate, useSearchParams } from 'react-router-dom'
+import { Eye, EyeOff, Mail } from 'lucide-react'
 
-const Login = () => {
-  const [email, setEmail] = useState('');
-  const [password, setPassword] = useState('');
-  const [error, setError] = useState('');
-  const [loading, setLoading] = useState(false);
-  const navigate = useNavigate();
+import api, { getErrorMessage } from '../api/axios'
+import { useAuth } from '../components/AuthProvider'
+import { Alert, Button, FormField, Input } from '../components/ui'
 
-  const handleSubmit = async (e) => {
-    e.preventDefault();
-    setError('');
-    setLoading(true);
+/**
+ * Map the server's 400 validation payload onto per-field messages.
+ *
+ * `middleware/validate.js` now returns
+ *   { message, errors: [{ path: 'email', message: '…' }] }
+ * instead of the 500 that every validation failure used to produce.
+ */
+function fieldErrorsFrom(error) {
+  const issues = error?.response?.data?.errors
+  if (!Array.isArray(issues)) return {}
+  const out = {}
+  for (const issue of issues) {
+    const key = Array.isArray(issue?.path) ? issue.path.join('.') : issue?.path
+    if (key && !out[key]) out[key] = issue.message
+  }
+  return out
+}
 
+/**
+ * Only ever redirect to a path inside this app. `//evil.com` is a valid
+ * pathname to the browser but an open redirect to us.
+ */
+function safeNext(value) {
+  if (typeof value !== 'string') return null
+  if (!value.startsWith('/') || value.startsWith('//')) return null
+  return value
+}
+
+/** Shared chrome for the three unauthenticated screens. */
+function AuthShell({ heading, description, children, footer }) {
+  return (
+    <div className="flex min-h-screen flex-col bg-canvas">
+      <main className="flex flex-1 items-center justify-center px-6 py-12">
+        <div className="w-full max-w-[420px]">
+          <div className="flex items-center gap-2.5">
+            <span
+              aria-hidden="true"
+              className="flex h-9 w-9 items-center justify-center rounded-lg border border-primary-border bg-primary-subtle text-primary-text"
+            >
+              <Mail className="h-4 w-4" />
+            </span>
+            <span className="text-md font-semibold tracking-tight text-fg">K M KOTHARI</span>
+          </div>
+
+          <div className="mt-6 rounded-lg border border-line bg-surface p-6">
+            <h1 className="text-xl font-semibold text-fg">{heading}</h1>
+            {description ? <p className="mt-1.5 text-sm text-fg-2">{description}</p> : null}
+            {children}
+          </div>
+
+          {footer ? <div className="mt-4 text-sm text-fg-3">{footer}</div> : null}
+        </div>
+      </main>
+    </div>
+  )
+}
+
+export default function Login() {
+  const navigate = useNavigate()
+  const [searchParams] = useSearchParams()
+  const { isAuthenticated, login } = useAuth()
+
+  const [email, setEmail] = useState('')
+  const [password, setPassword] = useState('')
+  const [showPassword, setShowPassword] = useState(false)
+  const [errors, setErrors] = useState({})
+  const [formError, setFormError] = useState('')
+  const [submitting, setSubmitting] = useState(false)
+
+  const next = safeNext(searchParams.get('next')) || '/dashboard'
+
+  if (isAuthenticated) return <Navigate to={next} replace />
+
+  const validate = () => {
+    const found = {}
+    if (!email.trim()) found.email = 'Enter your work email address.'
+    else if (!/^\S+@\S+\.\S+$/.test(email.trim())) found.email = 'Enter a valid email address.'
+    if (!password) found.password = 'Enter your password.'
+    return found
+  }
+
+  const handleSubmit = async (event) => {
+    event.preventDefault()
+    setFormError('')
+
+    const found = validate()
+    setErrors(found)
+    if (Object.keys(found).length > 0) return
+
+    setSubmitting(true)
     try {
-      const response = await api.post('/auth/login', { email, password });
-      
-      // Save token and user to localStorage
-      localStorage.setItem('token', response.data.token);
-      localStorage.setItem('user', JSON.stringify(response.data.user));
-      
-      // Redirect to dashboard
-      navigate('/dashboard');
+      const res = await api.post('/auth/login', { email: email.trim(), password })
+      login({ token: res.data.token, user: res.data.user })
+      navigate(next, { replace: true })
     } catch (err) {
-      console.error('Login error:', err);
-      const message = err.response?.data?.message || 'Login failed. Please check your credentials and try again.';
-      setError(message);
-    } finally {
-      setLoading(false);
+      const fieldErrors = fieldErrorsFrom(err)
+      setErrors(fieldErrors)
+      // A 400 with per-field errors is already shown inline; only surface the
+      // summary when there is nothing field-specific to point at.
+      //
+      // B-4: a 403 is currently shown twice — once here, once as a toast raised
+      // by the axios response interceptor. The banner is the right affordance
+      // for a sign-in failure (it persists next to the form), so the fix
+      // belongs in `api/axios.js`: its 403 branch should exempt `/auth/*`
+      // exactly as its 401 branch already does. Suppressing the banner here
+      // instead would leave a sign-in failure reported only by a 4-second toast.
+      if (Object.keys(fieldErrors).length === 0) {
+        setFormError(getErrorMessage(err, 'Could not sign you in. Check your details and retry.'))
+      }
+      setSubmitting(false)
     }
-  };
+  }
 
   return (
-    <div className="min-h-screen flex bg-white font-sans overflow-hidden select-none relative">
-      {/* Left half: Decorative Indigo Gradient (hidden on mobile) */}
-      <div className="hidden lg:flex lg:w-1/2 bg-gradient-to-tr from-indigo-600 via-indigo-500 to-purple-600 relative items-center justify-center p-12 overflow-hidden">
-        {/* Floating animated blobs */}
-        <div className="absolute top-10 left-10 h-72 w-72 bg-white/10 rounded-full blur-2xl animate-pulse" />
-        <div className="absolute bottom-10 right-10 h-96 w-96 bg-white/5 rounded-full blur-3xl animate-pulse delay-1000" />
-        <div className="absolute top-1/2 left-1/3 h-56 w-56 bg-indigo-400/20 rounded-full blur-3xl pointer-events-none" />
+    <AuthShell
+      heading="Sign in"
+      description="Use the work account your administrator set up for you."
+      footer={
+        <>
+          No account yet?{' '}
+          <Link
+            to="/register"
+            className="rounded font-medium text-primary-text underline underline-offset-2 hover:text-primary-700 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary-600"
+          >
+            Request access
+          </Link>
+          .
+        </>
+      }
+    >
+      {formError ? (
+        <Alert variant="danger" title="Sign-in failed" className="mt-5">
+          {formError}
+        </Alert>
+      ) : null}
 
-        <div className="relative z-10 max-w-md text-white text-center space-y-6">
-          <div className="mx-auto h-16 w-16 rounded-2xl bg-white/10 backdrop-blur-md flex items-center justify-center shadow-2xl border border-white/20">
-            <svg className="h-8 w-8 text-white" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
-              <polyline points="22 12 16 12 14 15 10 15 8 12 2 12" />
-              <path d="M5.45 5.11L2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.45-6.89A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11z" />
-            </svg>
-          </div>
-          <h1 className="text-4xl font-black tracking-tight leading-none">K M KOTHARI</h1>
-          <p className="text-white/80 leading-relaxed text-base font-semibold">
-            Where Emails Meet Action.
-          </p>
-        </div>
-      </div>
-
-      {/* Right half: Form card (full screen on mobile) */}
-      <div className="w-full lg:w-1/2 flex items-center justify-center px-6 sm:px-12 lg:px-20 bg-slate-50/30">
-        <div className="max-w-md w-full space-y-8 bg-white p-8 sm:p-10 rounded-3xl shadow-xl border border-slate-100/80 relative">
-          <div>
-            <div className="mx-auto lg:mx-0 h-11 w-11 rounded-2xl bg-gradient-to-tr from-indigo-600 to-purple-600 flex items-center justify-center text-white shadow-md shadow-indigo-600/10 mb-6">
-              <svg className="h-5 w-5 text-white" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
-                <polyline points="22 12 16 12 14 15 10 15 8 12 2 12" />
-                <path d="M5.45 5.11L2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.45-6.89A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11z" />
-              </svg>
-            </div>
-            <h2 className="text-3xl font-black text-slate-900 tracking-tight leading-none">
-              Welcome back
-            </h2>
-            <p className="mt-2 text-xs text-slate-500 font-medium leading-relaxed">
-              Manage Mails. Assign Tasks. Stay Ahead.
-            </p>
-          </div>
-
-          {error && (
-            <div className="bg-red-50 border border-red-100 text-red-500 p-4 rounded-xl text-xs flex items-start space-x-2 animate-shake">
-              <svg className="h-4 w-4 shrink-0 mt-0.5 text-red-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" />
-              </svg>
-              <span>{error}</span>
-            </div>
+      <form className="mt-5 flex flex-col gap-4" onSubmit={handleSubmit} noValidate>
+        <FormField label="Email address" required error={errors.email}>
+          {(field) => (
+            <Input
+              {...field}
+              type="email"
+              name="email"
+              size="lg"
+              autoComplete="username"
+              placeholder="you@company.com"
+              value={email}
+              onChange={(e) => setEmail(e.target.value)}
+            />
           )}
+        </FormField>
 
-          <form className="mt-6 space-y-4" onSubmit={handleSubmit}>
-            <div>
-              <label htmlFor="email" className="block text-[10px] font-bold text-slate-400 uppercase tracking-wider mb-1">
-                Email Address
-              </label>
-              <input
-                id="email"
-                name="email"
-                type="email"
-                required
-                className="mt-1 block w-full px-4 py-3 bg-slate-50/50 hover:bg-slate-50/80 border border-slate-200/80 rounded-xl text-slate-900 placeholder-slate-400 focus:outline-none focus:ring-2 focus:ring-indigo-100 focus:border-indigo-500 transition-all duration-150 text-xs font-semibold focus:bg-white"
-                placeholder="you@example.com"
-                value={email}
-                onChange={(e) => setEmail(e.target.value)}
-              />
-            </div>
+        <FormField label="Password" required error={errors.password}>
+          {(field) => (
+            <Input
+              {...field}
+              type={showPassword ? 'text' : 'password'}
+              name="password"
+              size="lg"
+              autoComplete="current-password"
+              value={password}
+              onChange={(e) => setPassword(e.target.value)}
+              trailingIcon={
+                <button
+                  type="button"
+                  aria-label={showPassword ? 'Hide password' : 'Show password'}
+                  aria-pressed={showPassword}
+                  onClick={() => setShowPassword((v) => !v)}
+                  className="flex h-6 w-6 items-center justify-center rounded text-fg-3 hover:text-fg-2 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-primary-600"
+                >
+                  {showPassword ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
+                </button>
+              }
+            />
+          )}
+        </FormField>
 
-            <div>
-              <label htmlFor="password" className="block text-[10px] font-bold text-slate-400 uppercase tracking-wider mb-1">
-                Password
-              </label>
-              <input
-                id="password"
-                name="password"
-                type="password"
-                required
-                className="mt-1 block w-full px-4 py-3 bg-slate-50/50 hover:bg-slate-50/80 border border-slate-200/80 rounded-xl text-slate-900 placeholder-slate-400 focus:outline-none focus:ring-2 focus:ring-indigo-100 focus:border-indigo-500 transition-all duration-150 text-xs font-semibold focus:bg-white"
-                placeholder="••••••••"
-                value={password}
-                onChange={(e) => setPassword(e.target.value)}
-              />
-            </div>
-
-            <div className="flex items-center justify-end">
-              <Link to="/forgot-password" className="text-[10px] font-bold text-indigo-600 hover:text-indigo-700 transition-colors">
-                Forgot Password?
-              </Link>
-            </div>
-
-            <div className="pt-2">
-              <button
-                type="submit"
-                disabled={loading}
-                className="w-full flex justify-center py-3.5 px-4 text-xs font-bold rounded-xl text-white bg-gradient-to-r from-indigo-600 to-purple-600 hover:from-indigo-700 hover:to-purple-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-indigo-500 transition-all duration-150 disabled:opacity-50 disabled:cursor-not-allowed shadow-[0_4px_15px_rgba(99,102,241,0.3)] hover:shadow-[0_6px_20px_rgba(99,102,241,0.4)] active:scale-[0.98]"
-              >
-                {loading ? 'Signing In...' : 'Sign In'}
-              </button>
-            </div>
-          </form>
-
-          <div className="text-center mt-6">
-            <p className="text-xs text-slate-500 font-semibold">
-              Don't have an account?{' '}
-              <Link to="/register" className="font-bold text-indigo-600 hover:text-indigo-700 transition-colors">
-                Create an account
-              </Link>
-            </p>
-          </div>
+        <div className="flex justify-end">
+          <Link
+            to="/forgot-password"
+            className="rounded text-sm font-medium text-primary-text underline underline-offset-2 hover:text-primary-700 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary-600"
+          >
+            Forgot your password?
+          </Link>
         </div>
-      </div>
-    </div>
-  );
-};
 
-export default Login;
+        <Button type="submit" variant="primary" size="lg" fullWidth loading={submitting}>
+          Sign in
+        </Button>
+      </form>
+    </AuthShell>
+  )
+}

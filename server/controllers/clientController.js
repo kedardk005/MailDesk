@@ -1,46 +1,147 @@
 const Client = require('../models/Client');
 const Task = require('../models/Task');
 const Email = require('../models/Email');
+const cache = require('../utils/cache');
 const { escapeRegex } = require('../utils/regexHelper');
+const { parseListParams, listResponse, firstString } = require('../utils/paginate');
+const { listClients, CLIENT_SORT_FIELDS } = require('../utils/clientService');
+const { log } = require('../utils/logger');
 
+const logger = log('clients');
+
+const TIMELINE_DEFAULT_LIMIT = 20;
+const TIMELINE_MAX_LIMIT = 100;
 
 // @desc    Get all clients with mail and work (task) counts
 // @route   GET /api/clients
 // @access  Private (Admin, Head, Employee)
+//
+// Backed by utils/clientService, the single implementation shared with
+// GET /api/tasks/clients. See that module for what this replaced.
 const getClients = async (req, res) => {
   try {
-    const clients = await Client.find().sort({ createdAt: -1 });
-    const tasks = await Task.find({}, 'clientName status');
-    const emails = await Email.find({}, 'from');
-
-    const result = clients.map((client) => {
-      const clientObj = client.toObject();
-
-      // Count tasks associated with client name
-      const taskCount = tasks.filter((t) => t.clientName && t.clientName.toLowerCase() === client.name.toLowerCase()).length;
-
-      // Count emails associated with client email or associatedEmails
-      const allClientEmails = [client.email, ...(client.associatedEmails || [])]
-        .filter(Boolean)
-        .map((e) => e.toLowerCase().trim());
-
-      const mailCount = emails.filter((e) => {
-        if (!e.from) return false;
-        const sender = e.from.toLowerCase();
-        return allClientEmails.some((ce) => sender.includes(ce));
-      }).length;
-
-      return {
-        ...clientObj,
-        taskCount,
-        mailCount
-      };
+    const params = parseListParams(req, {
+      sortWhitelist: CLIENT_SORT_FIELDS,
+      defaultSort: '-createdAt'
     });
 
-    res.json({ success: true, count: result.length, data: result });
+    const { data, pagination } = await listClients(params);
+
+    // Client lists change rarely; let the browser revalidate instead of
+    // re-running the aggregation on every dashboard mount.
+    res.set('Cache-Control', 'private, max-age=30, stale-while-revalidate=60');
+
+    return listResponse(res, {
+      params,
+      data,
+      pagination,
+      // Legacy shape preserved exactly: { success, count, data }.
+      legacy: (rows) => ({ success: true, count: rows.length, data: rows })
+    });
   } catch (err) {
-    console.error('Error fetching clients:', err);
+    logger.error({ err: err.message, stack: err.stack }, 'getClients failed');
     res.status(500).json({ success: false, message: 'Server error fetching clients' });
+  }
+};
+
+// @desc    Recent activity (tasks + emails) for one client
+// @route   GET /api/clients/:id/timeline
+// @access  Private (Admin, Head, Employee)
+//
+// WAVE2 gap S-10. The detail drawer already renders `client.timeline[]` when it
+// is supplied and says so explicitly when it is not; this makes it real.
+//
+// Entry shape, matching what the drawer reads:
+//   { at: ISO-8601, label: String, type: 'task'|'email', id, status?, meta? }
+//
+// Tasks are matched by `clientName` (case-insensitive, the same rule the task
+// counters use) and emails by the denormalised `Email.clientId` written at
+// ingest — an indexed equality, not a regex scan.
+const getClientTimeline = async (req, res) => {
+  try {
+    const { id } = req.params;
+    if (!/^[0-9a-fA-F]{24}$/.test(String(id))) {
+      return res.status(400).json({ success: false, message: 'Invalid client ID' });
+    }
+
+    const client = await Client.findById(id).select('name createdAt').lean();
+    if (!client) {
+      return res.status(404).json({ success: false, message: 'Client not found' });
+    }
+
+    const requested = parseInt(firstString(req.query.limit, 10), 10);
+    const limit = Number.isFinite(requested) && requested >= 1
+      ? Math.min(requested, TIMELINE_MAX_LIMIT)
+      : TIMELINE_DEFAULT_LIMIT;
+
+    // Scope by role, exactly as the task and email list endpoints do, so this
+    // endpoint cannot become a side channel onto another user's work.
+    const taskFilter = { clientName: new RegExp(`^${escapeRegex(client.name || '')}$`, 'i') };
+    // F-1: outbound replies are persisted as Email rows now. This timeline has
+    // always meant "mail received from the client", so they are excluded here
+    // and the entry list keeps its existing meaning.
+    const emailFilter = { clientId: client._id, deletedAt: null, direction: { $ne: 'outbound' } };
+    if (req.user.role === 'Employee') {
+      taskFilter.assignedTo = req.user._id;
+      emailFilter.assignedTo = req.user._id;
+    } else if (req.user.role === 'Head') {
+      taskFilter.createdBy = req.user._id;
+      emailFilter.fetchedBy = req.user._id;
+    }
+
+    // Each side is over-fetched to `limit` and the merge trims back to `limit`,
+    // so a client with only emails still fills the timeline.
+    const [tasks, emails] = await Promise.all([
+      Task.find(taskFilter)
+        .select('_id title status priority deadline createdAt')
+        .sort({ createdAt: -1 })
+        .limit(limit)
+        .lean(),
+      // NEVER `body` — API-LIST-CONTRACT.md rule 1.
+      Email.find(emailFilter)
+        .select('_id subject from date fetchedAt status')
+        .sort({ date: -1 })
+        .limit(limit)
+        .lean()
+    ]);
+
+    const entries = [
+      ...tasks.map((t) => ({
+        type: 'task',
+        id: String(t._id),
+        at: t.createdAt,
+        label: `Task created: ${t.title || 'Untitled task'}`,
+        status: t.status,
+        meta: { priority: t.priority, deadline: t.deadline }
+      })),
+      ...emails.map((e) => ({
+        type: 'email',
+        id: String(e._id),
+        at: e.date || e.fetchedAt,
+        label: `Email received: ${e.subject || '(no subject)'}`,
+        status: e.status,
+        meta: { from: e.from }
+      }))
+    ]
+      .filter((entry) => entry.at)
+      .sort((a, b) => new Date(b.at) - new Date(a.at))
+      .slice(0, limit);
+
+    res.set('Cache-Control', 'private, max-age=30, stale-while-revalidate=60');
+
+    return res.json({
+      success: true,
+      data: {
+        _id: client._id,
+        name: client.name,
+        createdAt: client.createdAt,
+        timeline: entries,
+        counts: { tasks: tasks.length, emails: emails.length }
+      }
+    });
+  } catch (err) {
+    logger.error({ err: err.message }, 'getClientTimeline failed');
+    return res.status(500).json({ success: false, message: 'Server error fetching client timeline' });
   }
 };
 
@@ -77,14 +178,15 @@ const createClient = async (req, res) => {
     });
 
     await newClient.save();
+    await cache.invalidateClients();
 
     res.status(201).json({
       success: true,
       message: 'Client created successfully',
-      data: { ...newClient.toObject(), taskCount: 0, mailCount: 0 }
+      data: { ...newClient.toObject(), taskCount: 0, completedTaskCount: 0, openTaskCount: 0, mailCount: 0 }
     });
   } catch (err) {
-    console.error('Error creating client:', err);
+    logger.error({ err: err.message }, 'createClient failed');
     res.status(500).json({ success: false, message: err.message || 'Server error creating client' });
   }
 };
@@ -125,6 +227,7 @@ const updateClient = async (req, res) => {
     if (status !== undefined) client.status = status;
 
     await client.save();
+    await cache.invalidateClients();
 
     res.json({
       success: true,
@@ -132,7 +235,7 @@ const updateClient = async (req, res) => {
       data: client
     });
   } catch (err) {
-    console.error('Error updating client:', err);
+    logger.error({ err: err.message }, 'updateClient failed');
     res.status(500).json({ success: false, message: err.message || 'Server error updating client' });
   }
 };
@@ -147,16 +250,18 @@ const deleteClient = async (req, res) => {
     if (!client) {
       return res.status(404).json({ success: false, message: 'Client not found' });
     }
+    await cache.invalidateClients();
 
     res.json({ success: true, message: 'Client deleted successfully' });
   } catch (err) {
-    console.error('Error deleting client:', err);
+    logger.error({ err: err.message }, 'deleteClient failed');
     res.status(500).json({ success: false, message: 'Server error deleting client' });
   }
 };
 
 module.exports = {
   getClients,
+  getClientTimeline,
   createClient,
   updateClient,
   deleteClient

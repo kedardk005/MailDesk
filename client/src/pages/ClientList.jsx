@@ -1,859 +1,1012 @@
-import React, { useState, useEffect } from 'react';
-import api from '../api/axios';
+import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useSearchParams } from 'react-router-dom'
+import { Building2, Pencil, Plus, Search, Trash2, X } from 'lucide-react'
 
-const ClientList = () => {
-  const [clients, setClients] = useState(() => {
-    try {
-      const cached = localStorage.getItem('cached_clients_data');
-      return cached ? JSON.parse(cached) : [];
-    } catch {
-      return [];
+import api, { getErrorMessage, isCanceled } from '../api/axios'
+import { useAuth } from '../components/AuthProvider'
+import { useRegisterCommands } from '../components/CommandRegistry'
+import {
+  Alert,
+  Badge,
+  Button,
+  DataTable,
+  Dialog,
+  DialogClose,
+  DialogContent,
+  Drawer,
+  DrawerContent,
+  FormField,
+  Input,
+  PageBody,
+  PageHeader,
+  Select,
+  Textarea,
+  Toolbar,
+  toast,
+  useConfirm,
+} from '../components/ui'
+import { formatNumber } from '../lib/utils'
+
+const PAGE_SIZES = [25, 50, 100]
+const DEFAULT_LIMIT = 25
+
+/** Mirrors `CLIENT_SORT_FIELDS` in `server/utils/clientService.js`. A field the
+ *  server cannot sort on must not get a header that silently does nothing. */
+const SORT_FIELDS = ['name', 'createdAt', 'status', 'contactPerson']
+const DEFAULT_SORT = '-createdAt'
+
+const STATUS_OPTIONS = [
+  { value: 'All', label: 'All statuses' },
+  { value: 'Active', label: 'Active' },
+  { value: 'Inactive', label: 'Inactive' },
+]
+
+const EMPTY_FORM = {
+  name: '',
+  contactPerson: '',
+  email: '',
+  phone: '',
+  notes: '',
+  status: 'Active',
+}
+
+/** A client row can carry a null/blank name; `name.slice()` used to white-screen the page. */
+function clientName(client) {
+  const value = typeof client?.name === 'string' ? client.name.trim() : ''
+  return value || 'Unnamed client'
+}
+
+function formatDate(value) {
+  if (!value) return '—'
+  const d = new Date(value)
+  if (Number.isNaN(d.getTime())) return '—'
+  return d.toLocaleDateString(undefined, { day: 'numeric', month: 'short', year: 'numeric' })
+}
+
+function formatDateTime(value) {
+  if (!value) return '—'
+  const d = new Date(value)
+  if (Number.isNaN(d.getTime())) return '—'
+  return d.toLocaleString(undefined, {
+    day: 'numeric',
+    month: 'short',
+    year: 'numeric',
+    hour: '2-digit',
+    minute: '2-digit',
+  })
+}
+
+function isEmailish(value) {
+  return /^\S+@\S+\.\S+$/.test(String(value || '').trim())
+}
+
+function sortValue(client, key) {
+  if (key === 'name') return clientName(client)
+  if (key === 'status') return client?.status || 'Active'
+  return String(client?.[key] ?? '')
+}
+
+/** Local ordering used only while the server still answers in legacy mode. */
+function compareClients(sort) {
+  const desc = sort.startsWith('-')
+  const key = desc ? sort.slice(1) : sort
+  return (a, b) => {
+    let result
+    if (key === 'createdAt') {
+      result = new Date(a?.createdAt || 0).getTime() - new Date(b?.createdAt || 0).getTime()
+    } else {
+      result = sortValue(a, key).localeCompare(sortValue(b, key), undefined, {
+        sensitivity: 'base',
+      })
     }
-  });
-  const [loading, setLoading] = useState(() => {
-    try {
-      return !localStorage.getItem('cached_clients_data');
-    } catch {
-      return true;
-    }
-  });
-  const [error, setError] = useState(null);
-  const [searchQuery, setSearchQuery] = useState('');
-  const [statusFilter, setStatusFilter] = useState('All');
-  const [viewMode, setViewMode] = useState('list'); // 'list' or 'board'
+    return desc ? -result : result
+  }
+}
 
-  // Modals state
-  const [isAddOpen, setIsAddOpen] = useState(false);
-  const [isEditOpen, setIsEditOpen] = useState(false);
-  const [isDeleteOpen, setIsDeleteOpen] = useState(false);
-  const [selectedClient, setSelectedClient] = useState(null);
-  const [actionLoading, setActionLoading] = useState(false);
-  const [formError, setFormError] = useState('');
+function matchesQuery(client, needle) {
+  const haystack = [
+    clientName(client),
+    client?.email,
+    client?.contactPerson,
+    client?.phone,
+    ...(Array.isArray(client?.associatedEmails) ? client.associatedEmails : []),
+  ]
+  return haystack.filter(Boolean).some((value) => String(value).toLowerCase().includes(needle))
+}
 
-  // Form states
-  const [formData, setFormData] = useState({
-    name: '',
-    contactPerson: '',
-    email: '',
-    phone: '',
-    associatedEmails: '',
-    notes: '',
-    status: 'Active'
-  });
+/** Read-only detail row used by the drawer. */
+function DetailRow({ label, children }) {
+  return (
+    <div className="flex flex-wrap items-baseline justify-between gap-2 border-b border-line py-2 last:border-0">
+      <dt className="text-xs text-fg-3">{label}</dt>
+      <dd className="min-w-0 text-sm text-fg">{children}</dd>
+    </div>
+  )
+}
 
-  // Current user details
-  const [user, setUser] = useState(() => {
-    try {
-      const u = localStorage.getItem('user');
-      return u ? JSON.parse(u) : { role: 'Employee' };
-    } catch {
-      return { role: 'Employee' };
-    }
-  });
+/**
+ * Client directory.
+ *
+ * Uses `/api/clients` (the `{ success, data }` surface shared by Admin and
+ * Head) rather than the divergent `/api/tasks/clients` Admin-only bare array.
+ * It sends the pagination contract (`page`, `limit`, `sort`, `q`) and reads
+ * `pagination` from the response; while the server still answers in legacy
+ * mode — a capped array with no `pagination` block — the same filtering,
+ * sorting and paging is applied locally so the controls never lie about what
+ * is on screen.
+ */
+export default function ClientList() {
+  const { isAdmin, isHead } = useAuth()
+  const confirm = useConfirm()
+  const [searchParams, setSearchParams] = useSearchParams()
 
-  const isCanEdit = ['Admin', 'Head'].includes(user.role);
-  const isAdmin = user.role === 'Admin';
+  const canEdit = isAdmin || isHead
+  const canDelete = isAdmin
 
-  const fetchClients = async () => {
-    try {
-      setLoading(prev => clients.length === 0 ? true : false);
-      setError(null);
-      const res = await api.get('/clients');
-      if (res.data.success) {
-        setClients(res.data.data);
-        try {
-          localStorage.setItem('cached_clients_data', JSON.stringify(res.data.data));
-        } catch (e) {
-          console.error('Failed to update client cache:', e);
-        }
-      }
-    } catch (err) {
-      console.error('Error fetching clients:', err);
-      setError(err.response?.data?.message || 'Failed to load client directory');
-    } finally {
-      setLoading(false);
-    }
-  };
+  /* -- URL state --------------------------------------------------------- */
+  const page = Math.max(1, Number(searchParams.get('page')) || 1)
+  const limitParam = Number(searchParams.get('limit'))
+  const limit = PAGE_SIZES.includes(limitParam) ? limitParam : DEFAULT_LIMIT
+  const q = searchParams.get('q') || ''
+  const sortParam = searchParams.get('sort') || DEFAULT_SORT
+  const sortField = sortParam.startsWith('-') ? sortParam.slice(1) : sortParam
+  const sort = SORT_FIELDS.includes(sortField) ? sortParam : DEFAULT_SORT
+  const statusParam = searchParams.get('status') || 'All'
+  const status = STATUS_OPTIONS.some((o) => o.value === statusParam) ? statusParam : 'All'
+
+  const updateParams = useCallback(
+    (patch) => {
+      setSearchParams(
+        (prev) => {
+          const next = new URLSearchParams(prev)
+          for (const [key, value] of Object.entries(patch)) {
+            if (value === null || value === '' || value === undefined) next.delete(key)
+            else next.set(key, String(value))
+          }
+          if (!('page' in patch)) next.delete('page')
+          return next
+        },
+        { replace: true }
+      )
+    },
+    [setSearchParams]
+  )
+
+  /* Sort headers are driven straight off `?sort=`, so the view stays
+   * bookmarkable and the server remains the thing that actually orders rows. */
+  const sorting = useMemo(
+    () => [{ id: sort.startsWith('-') ? sort.slice(1) : sort, desc: sort.startsWith('-') }],
+    [sort]
+  )
+
+  const handleSortingChange = useCallback(
+    (next) => {
+      const [s] = next
+      updateParams({ sort: s ? `${s.desc ? '-' : ''}${s.id}` : null })
+    },
+    [updateParams]
+  )
+
+  /* -- data -------------------------------------------------------------- */
+  const [raw, setRaw] = useState([])
+  const [meta, setMeta] = useState(null)
+  const [error, setError] = useState('')
+  const [reloadToken, setReloadToken] = useState(0)
+
+  const reload = useCallback(() => setReloadToken((n) => n + 1), [])
+
+  // The skeleton shows whenever the view the user asked for is not the view
+  // that finished loading. Deriving it avoids a setState in the effect body.
+  const requestKey = `${page}|${limit}|${sort}|${q}|${status}|${reloadToken}`
+  const [loadedKey, setLoadedKey] = useState(null)
+  const loading = loadedKey !== requestKey
 
   useEffect(() => {
-    fetchClients();
-  }, []);
+    const controller = new AbortController()
+    let active = true
 
-  const handleOpenAdd = () => {
-    setFormData({
-      name: '',
-      contactPerson: '',
-      email: '',
-      phone: '',
-      associatedEmails: '',
-      notes: '',
-      status: 'Active'
-    });
-    setFormError('');
-    setIsAddOpen(true);
-  };
+    api
+      .get('/clients', {
+        signal: controller.signal,
+        params: {
+          page,
+          limit,
+          sort,
+          q: q || undefined,
+          status: status === 'All' ? undefined : status,
+        },
+      })
+      .then((res) => {
+        if (!active) return
+        const payload = res.data
+        const list = Array.isArray(payload)
+          ? payload
+          : Array.isArray(payload?.data)
+            ? payload.data
+            : []
+        setRaw(list)
+        setMeta(payload?.pagination || null)
+        setError('')
+      })
+      .catch((err) => {
+        if (!active || isCanceled(err)) return
+        setRaw([])
+        setMeta(null)
+        setError(getErrorMessage(err, 'Could not load the client directory.'))
+      })
+      .finally(() => {
+        if (active) setLoadedKey(requestKey)
+      })
 
-  const handleOpenEdit = (client) => {
-    setSelectedClient(client);
-    setFormData({
-      name: client.name || '',
-      contactPerson: client.contactPerson || '',
-      email: client.email || '',
-      phone: client.phone || '',
-      associatedEmails: (client.associatedEmails || []).join(', '),
-      notes: client.notes || '',
-      status: client.status || 'Active'
-    });
-    setFormError('');
-    setIsEditOpen(true);
-  };
-
-  const handleOpenDelete = (client) => {
-    setSelectedClient(client);
-    setIsDeleteOpen(true);
-  };
-
-  const handleCreateClient = async (e) => {
-    e.preventDefault();
-    setFormError('');
-    if (!formData.name.trim()) {
-      setFormError('Client name is required');
-      return;
+    return () => {
+      active = false
+      controller.abort()
     }
+  }, [page, limit, sort, q, status, reloadToken, requestKey])
+
+  const serverPaged = Boolean(meta)
+
+  const { rows, total } = useMemo(() => {
+    if (serverPaged) {
+      return { rows: raw, total: Number(meta?.total) || raw.length }
+    }
+    const needle = q.trim().toLowerCase()
+    let list = raw
+    if (status !== 'All') list = list.filter((c) => (c?.status || 'Active') === status)
+    if (needle) list = list.filter((c) => matchesQuery(c, needle))
+    list = [...list].sort(compareClients(sort))
+    const start = (page - 1) * limit
+    return { rows: list.slice(start, start + limit), total: list.length }
+  }, [serverPaged, meta, raw, q, status, sort, page, limit])
+
+  /* -- search box (debounced into the URL) ------------------------------- */
+  const [searchInput, setSearchInput] = useState(q)
+  const [syncedQuery, setSyncedQuery] = useState(q)
+
+  // Adjusting state during render is the documented way to follow a prop-like
+  // value; an effect here would cause a second render pass on every keystroke.
+  if (syncedQuery !== q) {
+    setSyncedQuery(q)
+    setSearchInput(q)
+  }
+
+  useEffect(() => {
+    if (searchInput === q) return undefined
+    const timer = setTimeout(() => updateParams({ q: searchInput.trim() || null }), 300)
+    return () => clearTimeout(timer)
+  }, [searchInput, q, updateParams])
+
+  /* -- drawer ------------------------------------------------------------ */
+  const [detail, setDetail] = useState(null)
+
+  /* S-10: `GET /api/clients/:id/timeline` is real now — recent tasks and
+   * emails for one client, role-scoped server-side. Fetched when the drawer
+   * opens rather than with the list, because it is one request per client. */
+  const [timelineToken, setTimelineToken] = useState(0)
+  const [timelineResult, setTimelineResult] = useState({ key: null, entries: [], error: '' })
+  const detailId = detail?._id
+  const timelineKey = detailId ? `${detailId}|${timelineToken}` : null
+
+  // Derived, not stored: the panel is "loading" whenever the client on screen
+  // is not the client the last response was for. Same pattern as the list.
+  const timelineLoading = Boolean(timelineKey) && timelineResult.key !== timelineKey
+  const timelineSettled = timelineResult.key === timelineKey ? timelineResult : null
+
+  useEffect(() => {
+    if (!timelineKey) return undefined
+
+    const controller = new AbortController()
+    api
+      .get(`/clients/${detailId}/timeline`, { signal: controller.signal })
+      .then((res) => {
+        const entries = res.data?.data?.timeline
+        setTimelineResult({
+          key: timelineKey,
+          entries: Array.isArray(entries) ? entries : [],
+          error: '',
+        })
+      })
+      .catch((err) => {
+        if (isCanceled(err)) return
+        setTimelineResult({
+          key: timelineKey,
+          entries: [],
+          error: getErrorMessage(err, 'Could not load this client’s activity.'),
+        })
+      })
+
+    return () => controller.abort()
+  }, [detailId, timelineKey])
+
+  /* -- create / edit dialog ---------------------------------------------- */
+  const [dialogOpen, setDialogOpen] = useState(false)
+  const [editing, setEditing] = useState(null)
+  const [form, setForm] = useState(EMPTY_FORM)
+  const [emails, setEmails] = useState([])
+  const [emailDraft, setEmailDraft] = useState('')
+  const [formErrors, setFormErrors] = useState({})
+  const [formError, setFormError] = useState('')
+  const [saving, setSaving] = useState(false)
+
+  /* Stable identity: it is a dependency of the command registration below, and
+   * a new function every render would re-register on every render. */
+  const openCreate = useCallback(() => {
+    setEditing(null)
+    setForm(EMPTY_FORM)
+    setEmails([])
+    setEmailDraft('')
+    setFormErrors({})
+    setFormError('')
+    setDialogOpen(true)
+  }, [])
+
+  useRegisterCommands(
+    canEdit
+      ? [
+          {
+            id: 'clients-new',
+            label: 'New client',
+            group: 'Clients',
+            icon: <Plus className="h-4 w-4" />,
+            keywords: ['add', 'create', 'customer'],
+            onSelect: openCreate,
+          },
+        ]
+      : [],
+    [canEdit, openCreate]
+  )
+
+  const openEdit = (client) => {
+    setEditing(client)
+    setForm({
+      name: typeof client?.name === 'string' ? client.name : '',
+      contactPerson: client?.contactPerson || '',
+      email: client?.email || '',
+      phone: client?.phone || '',
+      notes: client?.notes || '',
+      status: client?.status || 'Active',
+    })
+    setEmails(Array.isArray(client?.associatedEmails) ? [...client.associatedEmails] : [])
+    setEmailDraft('')
+    setFormErrors({})
+    setFormError('')
+    setDialogOpen(true)
+  }
+
+  const addEmail = () => {
+    const value = emailDraft.trim().toLowerCase()
+    if (!value) return
+    if (!isEmailish(value)) {
+      setFormErrors((prev) => ({ ...prev, associatedEmails: 'Enter a valid email address.' }))
+      return
+    }
+    if (emails.some((e) => e.toLowerCase() === value)) {
+      setFormErrors((prev) => ({ ...prev, associatedEmails: 'That address is already listed.' }))
+      return
+    }
+    setEmails((prev) => [...prev, value])
+    setEmailDraft('')
+    setFormErrors((prev) => ({ ...prev, associatedEmails: undefined }))
+  }
+
+  const removeEmail = (value) => {
+    setEmails((prev) => prev.filter((e) => e !== value))
+  }
+
+  const submitClient = async (event) => {
+    event.preventDefault()
+    setFormError('')
+
+    const found = {}
+    if (!form.name.trim()) found.name = 'Enter the client name.'
+    if (form.email.trim() && !isEmailish(form.email)) found.email = 'Enter a valid email address.'
+    setFormErrors(found)
+    if (Object.keys(found).length > 0) return
+
+    const body = {
+      name: form.name.trim(),
+      contactPerson: form.contactPerson.trim(),
+      email: form.email.trim(),
+      phone: form.phone.trim(),
+      notes: form.notes.trim(),
+      status: form.status,
+      associatedEmails: emails,
+    }
+
+    setSaving(true)
+    try {
+      if (editing) {
+        await api.put(`/clients/${editing._id}`, body)
+        toast.success('Client updated')
+      } else {
+        await api.post('/clients', body)
+        toast.success('Client created')
+      }
+      setDialogOpen(false)
+      setDetail(null)
+      reload()
+    } catch (err) {
+      setFormError(getErrorMessage(err, 'Could not save the client.'))
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  const deleteClient = async (client) => {
+    const ok = await confirm({
+      title: `Delete “${clientName(client)}”?`,
+      description:
+        'The client record and its email-routing addresses are removed permanently. Tasks and emails already linked to this client keep their own records.',
+      confirmLabel: 'Delete client',
+      cancelLabel: 'Keep client',
+      tone: 'danger',
+    })
+    if (!ok) return
 
     try {
-      setActionLoading(true);
-      await api.post('/clients', {
-        ...formData,
-        associatedEmails: formData.associatedEmails
-      });
-      setIsAddOpen(false);
-      fetchClients();
+      await api.delete(`/clients/${client._id}`)
+      setDetail((current) => (current?._id === client._id ? null : current))
+      toast.success('Client deleted')
+      reload()
     } catch (err) {
-      console.error('Error creating client:', err);
-      setFormError(err.response?.data?.message || 'Failed to create client');
-    } finally {
-      setActionLoading(false);
+      toast.error('Could not delete the client', { description: getErrorMessage(err) })
     }
-  };
+  }
 
-  const handleUpdateClient = async (e) => {
-    e.preventDefault();
-    setFormError('');
-    if (!formData.name.trim()) {
-      setFormError('Client name is required');
-      return;
-    }
+  /* -- columns ----------------------------------------------------------- */
+  /* Deliberately not memoized: the action cells close over `openEdit` and
+   * `deleteClient`, which are re-created every render, so a memo keyed on
+   * anything less would hand the table stale callbacks. */
+  const columns = (() => {
+    const defs = [
+      {
+        accessorKey: 'name',
+        header: 'Client',
+        meta: { primary: true },
+        cell: ({ row }) => {
+          const client = row.original
+          const contact = client?.contactPerson
+          return (
+            <div className="min-w-0">
+              <span className="block truncate">{clientName(client)}</span>
+              {contact ? (
+                <span className="block truncate text-xs text-fg-3">{contact}</span>
+              ) : null}
+            </div>
+          )
+        },
+      },
+      {
+        accessorKey: 'email',
+        header: 'Primary email',
+        enableSorting: false,
+        meta: { width: '220px' },
+        cell: ({ row }) =>
+          row.original?.email ? (
+            <span className="font-mono text-xs">{row.original.email}</span>
+          ) : (
+            <span className="text-fg-3">—</span>
+          ),
+      },
+      {
+        id: 'associatedEmails',
+        header: 'Addresses',
+        enableSorting: false,
+        meta: { numeric: true, width: '104px' },
+        cell: ({ row }) =>
+          formatNumber(
+            Array.isArray(row.original?.associatedEmails) ? row.original.associatedEmails.length : 0
+          ),
+      },
+      {
+        // S-9: clients carry `openTaskCount` alongside `taskCount`, so the
+        // column no longer has to hide behind the ambiguous label "Tasks".
+        id: 'openTaskCount',
+        header: 'Open tasks',
+        enableSorting: false,
+        meta: { numeric: true, width: '100px' },
+        cell: ({ row }) => formatNumber(row.original?.openTaskCount ?? 0),
+      },
+      {
+        id: 'taskCount',
+        header: 'Total tasks',
+        enableSorting: false,
+        meta: { numeric: true, width: '100px' },
+        cell: ({ row }) => formatNumber(row.original?.taskCount || 0),
+      },
+      {
+        id: 'mailCount',
+        header: 'Emails',
+        enableSorting: false,
+        meta: { numeric: true, width: '96px' },
+        cell: ({ row }) => formatNumber(row.original?.mailCount || 0),
+      },
+      {
+        accessorKey: 'status',
+        header: 'Status',
+        meta: { width: '110px' },
+        cell: ({ row }) => (
+          <Badge variant={(row.original?.status || 'Active') === 'Active' ? 'success' : 'neutral'}>
+            {row.original?.status || 'Active'}
+          </Badge>
+        ),
+      },
+      {
+        accessorKey: 'createdAt',
+        header: 'Created',
+        meta: { width: '130px' },
+        cell: ({ row }) => <span className="tabular">{formatDate(row.original?.createdAt)}</span>,
+      },
+    ]
 
-    try {
-      setActionLoading(true);
-      await api.put(`/clients/${selectedClient._id}`, {
-        ...formData,
-        associatedEmails: formData.associatedEmails
-      });
-      setIsEditOpen(false);
-      fetchClients();
-    } catch (err) {
-      console.error('Error updating client:', err);
-      setFormError(err.response?.data?.message || 'Failed to update client');
-    } finally {
-      setActionLoading(false);
-    }
-  };
+    if (!canEdit) return defs
 
-  const handleDeleteClient = async () => {
-    try {
-      setActionLoading(true);
-      await api.delete(`/clients/${selectedClient._id}`);
-      setIsDeleteOpen(false);
-      fetchClients();
-    } catch (err) {
-      console.error('Error deleting client:', err);
-      alert(err.response?.data?.message || 'Failed to delete client');
-    } finally {
-      setActionLoading(false);
-    }
-  };
+    defs.push({
+      id: 'actions',
+      // A visually empty <th> is an axe `empty-table-header` violation: a
+      // screen reader announces the cells under it with no column name.
+      header: () => <span className="sr-only">Actions</span>,
+      enableSorting: false,
+      meta: { width: '88px', truncate: false },
+      cell: ({ row }) => (
+        <div className="flex items-center justify-end gap-1">
+          <Button
+            variant="ghost"
+            size="sm"
+            iconOnly
+            aria-label={`Edit ${clientName(row.original)}`}
+            onClick={(event) => {
+              event.stopPropagation()
+              openEdit(row.original)
+            }}
+          >
+            <Pencil className="h-4 w-4" />
+          </Button>
+          {canDelete ? (
+            <Button
+              variant="danger-ghost"
+              size="sm"
+              iconOnly
+              aria-label={`Delete ${clientName(row.original)}`}
+              onClick={(event) => {
+                event.stopPropagation()
+                deleteClient(row.original)
+              }}
+            >
+              <Trash2 className="h-4 w-4" />
+            </Button>
+          ) : null}
+        </div>
+      ),
+    })
 
-  // Filter clients
-  const filteredClients = clients.filter((c) => {
-    const matchesSearch =
-      c.name.toLowerCase().includes(searchQuery.toLowerCase()) ||
-      (c.contactPerson && c.contactPerson.toLowerCase().includes(searchQuery.toLowerCase())) ||
-      (c.email && c.email.toLowerCase().includes(searchQuery.toLowerCase()));
-    
-    const matchesStatus = statusFilter === 'All' || c.status === statusFilter;
+    return defs
+  })()
 
-    return matchesSearch && matchesStatus;
-  });
+  const filtersActive = Boolean(q) || status !== 'All'
 
   return (
-    <div className="p-6 max-w-7xl mx-auto space-y-6">
-      {/* Header */}
-      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
-        <div>
-          <h1 className="text-2xl font-black text-slate-800 tracking-tight flex items-center gap-2.5">
-            <div className="w-9 h-9 rounded-xl bg-indigo-600/10 text-indigo-600 flex items-center justify-center">
-              <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M19 21V5a2 2 0 00-2-2H7a2 2 0 00-2 2v16m14 0h2m-2 0h-5m-9 0H3m2 0h5m0 0h4m-4 0a2 2 0 01-2-2V7a2 2 0 012-2h4a2 2 0 012 2v12a2 2 0 01-2 2m-6 0h6" />
-              </svg>
-            </div>
-            Clients Directory
-          </h1>
-          <p className="text-slate-500 text-xs mt-1">
-            Manage organization clients, track emails received and tasks assigned per client.
-          </p>
-        </div>
+    <>
+      <PageHeader
+        title="Clients"
+        description="Client records, their email routing addresses and the work booked against them."
+        actions={
+          canEdit ? (
+            <Button variant="primary" leftIcon={<Plus className="h-4 w-4" />} onClick={openCreate}>
+              New client
+            </Button>
+          ) : null
+        }
+      />
 
-        {isCanEdit && (
-          <button
-            onClick={handleOpenAdd}
-            className="px-4 py-2.5 bg-indigo-600 hover:bg-indigo-700 active:scale-95 text-white rounded-xl text-xs font-bold transition-all shadow-md shadow-indigo-600/20 flex items-center justify-center gap-2"
+      <Toolbar
+        left={
+          <>
+            <label className="sr-only" htmlFor="client-status">
+              Filter by status
+            </label>
+            <div className="w-40">
+              <Select
+                id="client-status"
+                size="sm"
+                value={status}
+                options={STATUS_OPTIONS}
+                onChange={(e) =>
+                  updateParams({ status: e.target.value === 'All' ? null : e.target.value })
+                }
+              />
+            </div>
+          </>
+        }
+        right={
+          <div className="w-64">
+            <label className="sr-only" htmlFor="client-search">
+              Search clients
+            </label>
+            <Input
+              id="client-search"
+              size="sm"
+              type="search"
+              placeholder="Search name, contact or email"
+              leadingIcon={<Search />}
+              value={searchInput}
+              onChange={(e) => setSearchInput(e.target.value)}
+            />
+          </div>
+        }
+      />
+
+      <PageBody>
+        {error ? (
+          <Alert
+            variant="danger"
+            title="Could not load clients"
+            className="mb-4"
+            action={
+              <Button size="sm" variant="secondary" onClick={reload}>
+                Retry
+              </Button>
+            }
           >
-            <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M12 4v16m8-8H4" />
-            </svg>
-            <span>Add Client</span>
-          </button>
-        )}
-      </div>
+            {error}
+          </Alert>
+        ) : null}
 
-      {/* Filters and Search Bar */}
-      <div className="bg-white p-4 rounded-2xl border border-slate-200 shadow-sm flex flex-col md:flex-row items-center justify-between gap-4">
-        <div className="relative w-full md:w-80">
-          <svg className="w-4 h-4 text-slate-400 absolute left-3.5 top-1/2 -translate-y-1/2" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z" />
-          </svg>
-          <input
-            type="text"
-            placeholder="Search by name, contact, or email..."
-            value={searchQuery}
-            onChange={(e) => setSearchQuery(e.target.value)}
-            className="w-full pl-10 pr-4 py-2.5 bg-slate-50 border border-slate-200 rounded-xl text-xs text-slate-700 placeholder-slate-400 focus:outline-none focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500 transition-all"
-          />
-        </div>
+        <DataTable
+          ariaLabel="Clients"
+          data={rows}
+          columns={columns}
+          loading={loading}
+          density="compact"
+          getRowId={(row) => row._id}
+          onRowClick={(row) => setDetail(row)}
+          rowActivation="row"
+          sorting={sorting}
+          onSortingChange={handleSortingChange}
+          pagination={{
+            page,
+            pageSize: limit,
+            total,
+            itemLabel: 'clients',
+            pageSizeOptions: PAGE_SIZES,
+            onPageChange: (next) => updateParams({ page: next }),
+            onPageSizeChange: (size) => updateParams({ limit: size, page: 1 }),
+          }}
+          emptyState={
+            filtersActive
+              ? {
+                  icon: Search,
+                  title: 'No clients match these filters',
+                  description: 'Try a different search term or clear the filters.',
+                  secondaryAction: {
+                    label: 'Clear filters',
+                    onClick: () => updateParams({ q: null, status: null }),
+                  },
+                }
+              : {
+                  icon: Building2,
+                  title: 'No clients yet',
+                  description: canEdit
+                    ? 'Add a client to route their email and track the work booked against them.'
+                    : 'An administrator or head has not added any clients yet.',
+                  action: canEdit ? { label: 'New client', onClick: openCreate } : undefined,
+                }
+          }
+        />
+      </PageBody>
 
-        <div className="flex flex-col sm:flex-row items-center gap-3 w-full md:w-auto justify-between md:justify-end">
-          {/* Status Filter */}
-          <div className="flex items-center gap-1.5 w-full sm:w-auto justify-start">
-            <span className="text-xs font-bold text-slate-400 uppercase tracking-wider hidden sm:inline">Status:</span>
-            {['All', 'Active', 'Inactive'].map((status) => (
-              <button
-                key={status}
-                onClick={() => setStatusFilter(status)}
-                className={`px-3 py-1.5 rounded-lg text-xs font-bold transition-all ${
-                  statusFilter === status
-                    ? 'bg-indigo-600 text-white shadow-sm'
-                    : 'bg-slate-100 text-slate-600 hover:bg-slate-200'
-                }`}
-              >
-                {status}
-              </button>
-            ))}
-          </div>
+      {/* ------------------------------------------------------------------ */}
+      {/* Detail drawer                                                      */}
+      {/* ------------------------------------------------------------------ */}
+      <Drawer open={Boolean(detail)} onOpenChange={(open) => !open && setDetail(null)}>
+        {detail ? (
+          <DrawerContent
+            size="md"
+            title={clientName(detail)}
+            description={detail.email || 'No primary email address'}
+            headerActions={
+              canEdit ? (
+                <Button
+                  size="sm"
+                  variant="secondary"
+                  leftIcon={<Pencil className="h-4 w-4" />}
+                  onClick={() => {
+                    // Never stack the edit dialog on top of the drawer.
+                    openEdit(detail)
+                    setDetail(null)
+                  }}
+                >
+                  Edit
+                </Button>
+              ) : null
+            }
+          >
+            <div className="flex flex-col gap-6">
+              <section>
+                <h3 className="text-xs font-semibold uppercase tracking-wide text-fg-3">Overview</h3>
+                <dl className="mt-2">
+                  <DetailRow label="Status">
+                    <Badge variant={(detail.status || 'Active') === 'Active' ? 'success' : 'neutral'}>
+                      {detail.status || 'Active'}
+                    </Badge>
+                  </DetailRow>
+                  <DetailRow label="Contact person">{detail.contactPerson || '—'}</DetailRow>
+                  <DetailRow label="Primary email">
+                    <span className="break-all font-mono">{detail.email || '—'}</span>
+                  </DetailRow>
+                  <DetailRow label="Phone">{detail.phone || '—'}</DetailRow>
+                  <DetailRow label="Open tasks">
+                    <span className="tabular">{formatNumber(detail.openTaskCount ?? 0)}</span>
+                  </DetailRow>
+                  <DetailRow label="Tasks booked (all time)">
+                    <span className="tabular">{formatNumber(detail.taskCount || 0)}</span>
+                  </DetailRow>
+                  <DetailRow label="Emails matched">
+                    <span className="tabular">{formatNumber(detail.mailCount || 0)}</span>
+                  </DetailRow>
+                </dl>
+              </section>
 
-          {/* View Switcher: Board vs List */}
-          <div className="flex items-center bg-slate-100 p-1 rounded-xl border border-slate-200 shrink-0">
-            <button
-              onClick={() => setViewMode('board')}
-              className={`flex items-center gap-1.5 px-3 py-1 rounded-lg text-xs font-bold transition-all ${
-                viewMode === 'board'
-                  ? 'bg-white text-indigo-600 shadow-sm'
-                  : 'text-slate-500 hover:text-slate-700'
-              }`}
-              title="Board View"
-            >
-              <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M4 6a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2H6a2 2 0 01-2-2V6zM14 6a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2h-2a2 2 0 01-2-2V6zM4 16a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2H6a2 2 0 01-2-2v-2zM14 16a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2h-2a2 2 0 01-2-2v-2z" />
-              </svg>
-              <span>Board</span>
-            </button>
-            <button
-              onClick={() => setViewMode('list')}
-              className={`flex items-center gap-1.5 px-3 py-1 rounded-lg text-xs font-bold transition-all ${
-                viewMode === 'list'
-                  ? 'bg-white text-indigo-600 shadow-sm'
-                  : 'text-slate-500 hover:text-slate-700'
-              }`}
-              title="List View"
-            >
-              <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M4 6h16M4 10h16M4 14h16M4 18h16" />
-              </svg>
-              <span>List</span>
-            </button>
-          </div>
-        </div>
-      </div>
-
-      {/* Loading state */}
-      {loading && (
-        <div className="flex flex-col items-center justify-center py-16 bg-white border border-slate-100 rounded-2xl shadow-sm">
-          <div className="w-10 h-10 border-4 border-indigo-600 border-t-transparent rounded-full animate-spin mb-4" />
-          <p className="text-slate-500 text-xs font-medium">Loading clients data...</p>
-        </div>
-      )}
-
-      {/* Error state */}
-      {error && !loading && (
-        <div className="p-4 bg-red-50 border border-red-200 text-red-700 rounded-xl text-xs">
-          {error}
-        </div>
-      )}
-
-      {/* Client List Content */}
-      {!loading && !error && (
-        <>
-          {filteredClients.length === 0 ? (
-            <div className="text-center py-16 bg-white border border-slate-200 rounded-2xl shadow-sm">
-              <div className="w-12 h-12 mx-auto bg-slate-100 rounded-full flex items-center justify-center text-slate-400 mb-3">
-                <svg className="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M19 21V5a2 2 0 00-2-2H7a2 2 0 00-2 2v16m14 0h2m-2 0h-5m-9 0H3m2 0h5m0 0h4m-4 0a2 2 0 01-2-2V7a2 2 0 012-2h4a2 2 0 012 2v12a2 2 0 01-2 2m-6 0h6" />
-                </svg>
-              </div>
-              <h3 className="text-sm font-bold text-slate-700">No Clients Found</h3>
-              <p className="text-slate-400 text-xs mt-1">Try adjusting your search query or filters.</p>
-            </div>
-          ) : viewMode === 'list' ? (
-            /* Table List View */
-            <div className="bg-white border border-slate-200 rounded-2xl shadow-sm overflow-hidden animate-fade-in">
-              <div className="overflow-x-auto">
-                <table className="w-full text-left border-collapse">
-                  <thead>
-                    <tr className="bg-slate-50/80 text-slate-500 text-[11px] font-bold uppercase tracking-wider border-b border-slate-200/80">
-                      <th className="py-3.5 px-5">Client Name</th>
-                      <th className="py-3.5 px-5">Contact Person</th>
-                      <th className="py-3.5 px-5">Email & Phone</th>
-                      <th className="py-3.5 px-5 text-center">Work Given</th>
-                      <th className="py-3.5 px-5 text-center">Mails Recv.</th>
-                      <th className="py-3.5 px-5">Status</th>
-                      {isCanEdit && <th className="py-3.5 px-5 text-right">Actions</th>}
-                    </tr>
-                  </thead>
-                  <tbody className="divide-y divide-slate-100 text-xs">
-                    {filteredClients.map((client) => (
-                      <tr key={client._id} className="hover:bg-slate-50/70 transition-colors group">
-                        <td className="py-4 px-5">
-                          <div className="flex items-center gap-3">
-                            <div className="w-9 h-9 rounded-xl bg-gradient-to-tr from-indigo-600 to-purple-600 text-white font-bold text-xs flex items-center justify-center shrink-0 shadow-sm">
-                              {client.name.slice(0, 2).toUpperCase()}
-                            </div>
-                            <div>
-                              <span className="font-bold text-slate-800 text-sm block">{client.name}</span>
-                              {client.associatedEmails && client.associatedEmails.length > 0 && (
-                                <span className="text-[10px] text-slate-400 font-mono block truncate max-w-xs">
-                                  {client.associatedEmails.join(', ')}
-                                </span>
-                              )}
-                            </div>
-                          </div>
-                        </td>
-
-                        <td className="py-4 px-5 text-slate-700 font-medium">
-                          {client.contactPerson ? (
-                            <span>{client.contactPerson}</span>
-                          ) : (
-                            <span className="text-slate-300 italic">—</span>
-                          )}
-                        </td>
-
-                        <td className="py-4 px-5 text-slate-600 space-y-0.5">
-                          {client.email && <div className="truncate font-mono text-[11px]">{client.email}</div>}
-                          {client.phone && <div className="text-[11px] text-slate-500">{client.phone}</div>}
-                          {!client.email && !client.phone && <span className="text-slate-300 italic">—</span>}
-                        </td>
-
-                        <td className="py-4 px-5 text-center">
-                          <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-indigo-50 text-indigo-700 font-extrabold text-xs border border-indigo-100">
-                            <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2" />
-                            </svg>
-                            {client.taskCount || 0}
-                          </span>
-                        </td>
-
-                        <td className="py-4 px-5 text-center">
-                          <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-purple-50 text-purple-700 font-extrabold text-xs border border-purple-100">
-                            <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M3 8l7.89 5.26a2 2 0 002.22 0L21 8M5 19h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v10a2 2 0 002 2z" />
-                            </svg>
-                            {client.mailCount || 0}
-                          </span>
-                        </td>
-
-                        <td className="py-4 px-5">
-                          <span
-                            className={`text-[10px] font-extrabold uppercase tracking-wider px-2.5 py-1 rounded-full border ${
-                              client.status === 'Active'
-                                ? 'bg-emerald-50 text-emerald-600 border-emerald-200'
-                                : 'bg-slate-100 text-slate-500 border-slate-200'
-                            }`}
-                          >
-                            {client.status || 'Active'}
-                          </span>
-                        </td>
-
-                        {isCanEdit && (
-                          <td className="py-4 px-5 text-right">
-                            <div className="flex items-center justify-end gap-2">
-                              <button
-                                onClick={() => handleOpenEdit(client)}
-                                className="p-1.5 hover:bg-slate-100 text-slate-600 hover:text-indigo-600 rounded-lg transition-colors"
-                                title="Edit Client"
-                              >
-                                <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z" />
-                                </svg>
-                              </button>
-                              {isAdmin && (
-                                <button
-                                  onClick={() => handleOpenDelete(client)}
-                                  className="p-1.5 hover:bg-red-50 text-slate-400 hover:text-red-600 rounded-lg transition-colors"
-                                  title="Delete Client"
-                                >
-                                  <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
-                                  </svg>
-                                </button>
-                              )}
-                            </div>
-                          </td>
-                        )}
-                      </tr>
+              <section>
+                <h3 className="text-xs font-semibold uppercase tracking-wide text-fg-3">
+                  Email routing addresses
+                </h3>
+                {Array.isArray(detail.associatedEmails) && detail.associatedEmails.length > 0 ? (
+                  <ul className="mt-2 flex flex-col gap-1.5">
+                    {detail.associatedEmails.map((address) => (
+                      <li
+                        key={address}
+                        className="break-all rounded border border-line bg-subtle px-2.5 py-1.5 font-mono text-xs text-fg-2"
+                      >
+                        {address}
+                      </li>
                     ))}
-                  </tbody>
-                </table>
-              </div>
-            </div>
-          ) : (
-            /* Board Grid View */
-            <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-5 animate-fade-in">
-              {filteredClients.map((client) => (
-                <div
-                  key={client._id}
-                  className="bg-white border border-slate-200 rounded-2xl p-5 shadow-sm hover:shadow-md transition-all flex flex-col justify-between relative group"
-                >
-                  <div>
-                    {/* Header line */}
-                    <div className="flex items-start justify-between gap-3 mb-3">
-                      <div>
-                        <h2 className="text-base font-bold text-slate-800 tracking-tight">{client.name}</h2>
-                        {client.contactPerson && (
-                          <p className="text-xs text-slate-500 mt-0.5 flex items-center gap-1.5">
-                            <svg className="w-3.5 h-3.5 text-slate-400 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M16 7a4 4 0 11-8 0 4 4 0 018 0zM12 14a7 7 0 00-7 7h14a7 7 0 00-7-7z" />
-                            </svg>
-                            {client.contactPerson}
-                          </p>
-                        )}
-                      </div>
+                  </ul>
+                ) : (
+                  <p className="mt-2 text-sm text-fg-3">
+                    No addresses configured. Mail from this client will not be matched automatically.
+                  </p>
+                )}
+              </section>
 
+              {detail.notes ? (
+                <section>
+                  <h3 className="text-xs font-semibold uppercase tracking-wide text-fg-3">Notes</h3>
+                  <p className="mt-2 whitespace-pre-wrap text-sm text-fg-2">{detail.notes}</p>
+                </section>
+              ) : null}
+
+              <section>
+                <h3 className="text-xs font-semibold uppercase tracking-wide text-fg-3">Timeline</h3>
+
+                {timelineSettled?.error ? (
+                  <Alert
+                    variant="warning"
+                    title="Activity unavailable"
+                    className="mt-2"
+                    action={
+                      <Button
+                        size="sm"
+                        variant="secondary"
+                        onClick={() => setTimelineToken((n) => n + 1)}
+                      >
+                        Retry
+                      </Button>
+                    }
+                  >
+                    {timelineSettled.error}
+                  </Alert>
+                ) : null}
+
+                <ol className="mt-2 flex flex-col gap-3 border-l border-line pl-4">
+                  {(timelineSettled?.entries || []).map((entry) => (
+                    <li key={`${entry.type}-${entry.id}`} className="relative">
                       <span
-                        className={`text-[10px] font-extrabold uppercase tracking-wider px-2.5 py-1 rounded-full border ${
-                          client.status === 'Active'
-                            ? 'bg-emerald-50 text-emerald-600 border-emerald-200'
-                            : 'bg-slate-100 text-slate-500 border-slate-200'
-                        }`}
-                      >
-                        {client.status || 'Active'}
-                      </span>
-                    </div>
-
-                    {/* Contact Details */}
-                    <div className="space-y-1.5 text-xs text-slate-600 bg-slate-50/60 p-3 rounded-xl border border-slate-100 mb-4">
-                      {client.email && (
-                        <div className="flex items-center gap-2 truncate">
-                          <svg className="w-3.5 h-3.5 text-slate-400 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M3 8l7.89 5.26a2 2 0 002.22 0L21 8M5 19h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v10a2 2 0 002 2z" />
-                          </svg>
-                          <span className="truncate">{client.email}</span>
-                        </div>
-                      )}
-                      {client.phone && (
-                        <div className="flex items-center gap-2">
-                          <svg className="w-3.5 h-3.5 text-slate-400 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M3 5a2 2 0 012-2h3.28a1 1 0 01.948.684l1.498 4.493a1 1 0 01-.502 1.21l-2.257 1.13a11.042 11.042 0 005.516 5.516l1.13-2.257a1 1 0 011.21-.502l4.493 1.498a1 1 0 01.684.949V19a2 2 0 01-2 2h-1C9.716 21 3 14.284 3 6V5z" />
-                          </svg>
-                          <span>{client.phone}</span>
-                        </div>
-                      )}
-                      {client.associatedEmails && client.associatedEmails.length > 0 && (
-                        <div className="text-[11px] text-slate-500 pt-1 border-t border-slate-200/60 truncate">
-                          <span className="font-semibold text-slate-700">Associated Emails: </span>
-                          {client.associatedEmails.join(', ')}
-                        </div>
-                      )}
-                    </div>
-
-                    {/* Metrics Section: Work Given & Mails */}
-                    <div className="grid grid-cols-2 gap-2 mb-4">
-                      <div className="bg-indigo-50/70 border border-indigo-100 rounded-xl p-3 text-center">
-                        <div className="flex items-center justify-center gap-1.5 text-indigo-600 text-xs font-bold mb-0.5">
-                          <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2" />
-                          </svg>
-                          <span>Work Given</span>
-                        </div>
-                        <span className="text-xl font-black text-indigo-900">{client.taskCount || 0}</span>
-                        <span className="text-[10px] text-indigo-500 block">Tasks Created</span>
-                      </div>
-
-                      <div className="bg-purple-50/70 border border-purple-100 rounded-xl p-3 text-center">
-                        <div className="flex items-center justify-center gap-1.5 text-purple-600 text-xs font-bold mb-0.5">
-                          <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M3 8l7.89 5.26a2 2 0 002.22 0L21 8M5 19h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v10a2 2 0 002 2z" />
-                          </svg>
-                          <span>Mails Recv.</span>
-                        </div>
-                        <span className="text-xl font-black text-purple-900">{client.mailCount || 0}</span>
-                        <span className="text-[10px] text-purple-500 block">Total Emails</span>
-                      </div>
-                    </div>
-
-                    {client.notes && (
-                      <p className="text-xs text-slate-500 line-clamp-2 italic mb-4">
-                        "{client.notes}"
+                        aria-hidden="true"
+                        className="absolute -left-[21px] top-1.5 h-2 w-2 rounded-full bg-line-strong"
+                      />
+                      <p className="text-sm text-fg">{entry.label}</p>
+                      <p className="text-xs text-fg-3">
+                        {formatDateTime(entry.at)}
+                        {entry.status ? ` · ${entry.status}` : ''}
                       </p>
-                    )}
-                  </div>
+                    </li>
+                  ))}
+                  <li className="relative">
+                    <span
+                      aria-hidden="true"
+                      className="absolute -left-[21px] top-1.5 h-2 w-2 rounded-full bg-primary-600"
+                    />
+                    <p className="text-sm text-fg">Client record created</p>
+                    <p className="text-xs text-fg-3">{formatDateTime(detail.createdAt)}</p>
+                  </li>
+                </ol>
 
-                  {/* Actions Footer */}
-                  {isCanEdit && (
-                    <div className="pt-3 border-t border-slate-100 flex items-center justify-end gap-2">
-                      <button
-                        onClick={() => handleOpenEdit(client)}
-                        className="px-3 py-1.5 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-lg text-xs font-semibold transition-all flex items-center gap-1"
-                      >
-                        <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z" />
-                        </svg>
-                        Edit
-                      </button>
+                {timelineLoading ? (
+                  <p className="mt-3 text-xs text-fg-3">Loading recent tasks and emails…</p>
+                ) : null}
+                {timelineSettled && !timelineSettled.error && timelineSettled.entries.length === 0 ? (
+                  <p className="mt-3 text-xs text-fg-3">
+                    No tasks or emails recorded against this client yet.
+                  </p>
+                ) : null}
+                {timelineSettled && timelineSettled.entries.length > 0 ? (
+                  <p className="mt-3 text-xs text-fg-3">
+                    The most recent activity you have access to. Employees see their own tasks and
+                    mail; a head sees what they created.
+                  </p>
+                ) : null}
+              </section>
 
-                      {isAdmin && (
-                        <button
-                          onClick={() => handleOpenDelete(client)}
-                          className="px-3 py-1.5 bg-red-50 hover:bg-red-100 text-red-600 rounded-lg text-xs font-semibold transition-all flex items-center gap-1"
-                        >
-                          <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
-                          </svg>
-                          Delete
-                        </button>
-                      )}
-                    </div>
-                  )}
-                </div>
-              ))}
-            </div>
-          )}
-        </>
-      )}
-
-      {/* Add Client Modal */}
-      {isAddOpen && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 backdrop-blur-[4px] p-4 overflow-y-auto">
-          <div className="bg-white border border-slate-200 rounded-2xl max-w-lg w-full p-6 relative shadow-2xl animate-fade-in my-8 max-h-[90vh] overflow-y-auto">
-            <div className="flex items-center justify-between mb-4">
-              <h3 className="text-lg font-bold text-slate-800">Add New Client</h3>
-              <button onClick={() => setIsAddOpen(false)} className="p-1 text-slate-400 hover:text-slate-600 rounded-lg">
-                <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M6 18L18 6M6 6l12 12" />
-                </svg>
-              </button>
-            </div>
-
-            {formError && (
-              <div className="mb-4 p-3 bg-red-50 border border-red-200 text-red-600 rounded-xl text-xs">
-                {formError}
-              </div>
-            )}
-
-            <form onSubmit={handleCreateClient} className="space-y-4">
-              <div>
-                <label className="block text-xs font-bold text-slate-700 uppercase tracking-wider mb-1">
-                  Client Name <span className="text-red-500">*</span>
-                </label>
-                <input
-                  type="text"
-                  required
-                  placeholder="e.g. Reliance Industries"
-                  value={formData.name}
-                  onChange={(e) => setFormData({ ...formData, name: e.target.value })}
-                  className="w-full px-3.5 py-2.5 border border-slate-200 rounded-xl text-xs focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500 outline-none"
-                />
-              </div>
-
-              <div className="grid grid-cols-2 gap-3">
-                <div>
-                  <label className="block text-xs font-bold text-slate-700 uppercase tracking-wider mb-1">
-                    Contact Person
-                  </label>
-                  <input
-                    type="text"
-                    placeholder="e.g. John Doe"
-                    value={formData.contactPerson}
-                    onChange={(e) => setFormData({ ...formData, contactPerson: e.target.value })}
-                    className="w-full px-3.5 py-2.5 border border-slate-200 rounded-xl text-xs focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500 outline-none"
-                  />
-                </div>
-                <div>
-                  <label className="block text-xs font-bold text-slate-700 uppercase tracking-wider mb-1">
-                    Status
-                  </label>
-                  <select
-                    value={formData.status}
-                    onChange={(e) => setFormData({ ...formData, status: e.target.value })}
-                    className="w-full px-3.5 py-2.5 border border-slate-200 rounded-xl text-xs focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500 outline-none"
+              {canDelete ? (
+                <section className="border-t border-line pt-4">
+                  <Button
+                    variant="danger-ghost"
+                    leftIcon={<Trash2 className="h-4 w-4" />}
+                    onClick={() => deleteClient(detail)}
                   >
-                    <option value="Active">Active</option>
-                    <option value="Inactive">Inactive</option>
-                  </select>
-                </div>
-              </div>
+                    Delete client
+                  </Button>
+                </section>
+              ) : null}
+            </div>
+          </DrawerContent>
+        ) : null}
+      </Drawer>
 
-              <div className="grid grid-cols-2 gap-3">
-                <div>
-                  <label className="block text-xs font-bold text-slate-700 uppercase tracking-wider mb-1">
-                    Email Address
-                  </label>
-                  <input
-                    type="email"
-                    placeholder="client@company.com"
-                    value={formData.email}
-                    onChange={(e) => setFormData({ ...formData, email: e.target.value })}
-                    className="w-full px-3.5 py-2.5 border border-slate-200 rounded-xl text-xs focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500 outline-none"
+      {/* ------------------------------------------------------------------ */}
+      {/* Create / edit dialog                                               */}
+      {/* ------------------------------------------------------------------ */}
+      <Dialog open={dialogOpen} onOpenChange={(open) => !saving && setDialogOpen(open)}>
+        <DialogContent
+          size="lg"
+          title={editing ? `Edit ${clientName(editing)}` : 'New client'}
+          description="Email received from any listed address is attributed to this client."
+          dismissable={!saving}
+          footer={
+            <>
+              <DialogClose asChild>
+                <Button variant="secondary" disabled={saving}>
+                  Cancel
+                </Button>
+              </DialogClose>
+              <Button type="submit" form="client-form" variant="primary" loading={saving}>
+                {editing ? 'Save changes' : 'Create client'}
+              </Button>
+            </>
+          }
+        >
+          <form id="client-form" onSubmit={submitClient} className="flex flex-col gap-4" noValidate>
+            {formError ? (
+              <Alert variant="danger" title="Could not save">
+                {formError}
+              </Alert>
+            ) : null}
+
+            <FormField label="Client name" required error={formErrors.name}>
+              {(field) => (
+                <Input
+                  {...field}
+                  placeholder="Reliance Industries"
+                  value={form.name}
+                  onChange={(e) => setForm((p) => ({ ...p, name: e.target.value }))}
+                />
+              )}
+            </FormField>
+
+            <div className="grid gap-4 sm:grid-cols-2">
+              <FormField label="Contact person" optionalText="(optional)">
+                {(field) => (
+                  <Input
+                    {...field}
+                    value={form.contactPerson}
+                    onChange={(e) => setForm((p) => ({ ...p, contactPerson: e.target.value }))}
                   />
-                </div>
-                <div>
-                  <label className="block text-xs font-bold text-slate-700 uppercase tracking-wider mb-1">
-                    Phone Number
-                  </label>
-                  <input
-                    type="text"
+                )}
+              </FormField>
+
+              <FormField label="Status">
+                {(field) => (
+                  <Select
+                    {...field}
+                    value={form.status}
+                    options={[
+                      { value: 'Active', label: 'Active' },
+                      { value: 'Inactive', label: 'Inactive' },
+                    ]}
+                    onChange={(e) => setForm((p) => ({ ...p, status: e.target.value }))}
+                  />
+                )}
+              </FormField>
+            </div>
+
+            <div className="grid gap-4 sm:grid-cols-2">
+              <FormField label="Primary email" optionalText="(optional)" error={formErrors.email}>
+                {(field) => (
+                  <Input
+                    {...field}
+                    type="email"
+                    placeholder="accounts@company.com"
+                    value={form.email}
+                    onChange={(e) => setForm((p) => ({ ...p, email: e.target.value }))}
+                  />
+                )}
+              </FormField>
+
+              <FormField label="Phone" optionalText="(optional)">
+                {(field) => (
+                  <Input
+                    {...field}
+                    type="tel"
                     placeholder="+91 98765 43210"
-                    value={formData.phone}
-                    onChange={(e) => setFormData({ ...formData, phone: e.target.value })}
-                    className="w-full px-3.5 py-2.5 border border-slate-200 rounded-xl text-xs focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500 outline-none"
+                    value={form.phone}
+                    onChange={(e) => setForm((p) => ({ ...p, phone: e.target.value }))}
                   />
-                </div>
-              </div>
-
-              <div>
-                <label className="block text-xs font-bold text-slate-700 uppercase tracking-wider mb-1">
-                  Associated Emails (comma separated)
-                </label>
-                <input
-                  type="text"
-                  placeholder="billing@company.com, support@company.com"
-                  value={formData.associatedEmails}
-                  onChange={(e) => setFormData({ ...formData, associatedEmails: e.target.value })}
-                  className="w-full px-3.5 py-2.5 border border-slate-200 rounded-xl text-xs focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500 outline-none"
-                />
-                <span className="text-[10px] text-slate-400 mt-1 block">
-                  Emails from these domain addresses will automatically count towards this client's mail metric.
-                </span>
-              </div>
-
-              <div>
-                <label className="block text-xs font-bold text-slate-700 uppercase tracking-wider mb-1">
-                  Notes
-                </label>
-                <textarea
-                  rows="3"
-                  placeholder="Additional client details or notes..."
-                  value={formData.notes}
-                  onChange={(e) => setFormData({ ...formData, notes: e.target.value })}
-                  className="w-full px-3.5 py-2.5 border border-slate-200 rounded-xl text-xs focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500 outline-none resize-none"
-                />
-              </div>
-
-              <div className="flex space-x-3 pt-4 border-t border-slate-100">
-                <button
-                  type="button"
-                  onClick={() => setIsAddOpen(false)}
-                  className="w-1/2 py-2.5 px-4 border border-slate-200 hover:bg-slate-50 rounded-xl text-xs font-semibold text-slate-600 transition-colors"
-                >
-                  Cancel
-                </button>
-                <button
-                  type="submit"
-                  disabled={actionLoading}
-                  className="w-1/2 py-2.5 px-4 bg-indigo-600 hover:bg-indigo-700 text-white rounded-xl text-xs font-semibold transition-colors disabled:opacity-50"
-                >
-                  {actionLoading ? 'Creating...' : 'Create Client'}
-                </button>
-              </div>
-            </form>
-          </div>
-        </div>
-      )}
-
-      {/* Edit Client Modal */}
-      {isEditOpen && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 backdrop-blur-[4px] p-4 overflow-y-auto">
-          <div className="bg-white border border-slate-200 rounded-2xl max-w-lg w-full p-6 relative shadow-2xl animate-fade-in my-8 max-h-[90vh] overflow-y-auto">
-            <div className="flex items-center justify-between mb-4">
-              <h3 className="text-lg font-bold text-slate-800">Edit Client</h3>
-              <button onClick={() => setIsEditOpen(false)} className="p-1 text-slate-400 hover:text-slate-600 rounded-lg">
-                <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M6 18L18 6M6 6l12 12" />
-                </svg>
-              </button>
+                )}
+              </FormField>
             </div>
 
-            {formError && (
-              <div className="mb-4 p-3 bg-red-50 border border-red-200 text-red-600 rounded-xl text-xs">
-                {formError}
-              </div>
-            )}
-
-            <form onSubmit={handleUpdateClient} className="space-y-4">
-              <div>
-                <label className="block text-xs font-bold text-slate-700 uppercase tracking-wider mb-1">
-                  Client Name <span className="text-red-500">*</span>
-                </label>
-                <input
-                  type="text"
-                  required
-                  value={formData.name}
-                  onChange={(e) => setFormData({ ...formData, name: e.target.value })}
-                  className="w-full px-3.5 py-2.5 border border-slate-200 rounded-xl text-xs focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500 outline-none"
-                />
-              </div>
-
-              <div className="grid grid-cols-2 gap-3">
-                <div>
-                  <label className="block text-xs font-bold text-slate-700 uppercase tracking-wider mb-1">
-                    Contact Person
-                  </label>
-                  <input
-                    type="text"
-                    value={formData.contactPerson}
-                    onChange={(e) => setFormData({ ...formData, contactPerson: e.target.value })}
-                    className="w-full px-3.5 py-2.5 border border-slate-200 rounded-xl text-xs focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500 outline-none"
-                  />
-                </div>
-                <div>
-                  <label className="block text-xs font-bold text-slate-700 uppercase tracking-wider mb-1">
-                    Status
-                  </label>
-                  <select
-                    value={formData.status}
-                    onChange={(e) => setFormData({ ...formData, status: e.target.value })}
-                    className="w-full px-3.5 py-2.5 border border-slate-200 rounded-xl text-xs focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500 outline-none"
-                  >
-                    <option value="Active">Active</option>
-                    <option value="Inactive">Inactive</option>
-                  </select>
-                </div>
-              </div>
-
-              <div className="grid grid-cols-2 gap-3">
-                <div>
-                  <label className="block text-xs font-bold text-slate-700 uppercase tracking-wider mb-1">
-                    Email Address
-                  </label>
-                  <input
+            <FormField
+              label="Additional email addresses"
+              error={formErrors.associatedEmails}
+              hint="Mail from any of these addresses counts towards this client."
+            >
+              {(field) => (
+                <div className="flex gap-2">
+                  <Input
+                    {...field}
                     type="email"
-                    value={formData.email}
-                    onChange={(e) => setFormData({ ...formData, email: e.target.value })}
-                    className="w-full px-3.5 py-2.5 border border-slate-200 rounded-xl text-xs focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500 outline-none"
+                    placeholder="billing@company.com"
+                    value={emailDraft}
+                    onChange={(e) => setEmailDraft(e.target.value)}
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter') {
+                        e.preventDefault()
+                        addEmail()
+                      }
+                    }}
                   />
+                  <Button variant="secondary" onClick={addEmail} className="shrink-0">
+                    Add
+                  </Button>
                 </div>
-                <div>
-                  <label className="block text-xs font-bold text-slate-700 uppercase tracking-wider mb-1">
-                    Phone Number
-                  </label>
-                  <input
-                    type="text"
-                    value={formData.phone}
-                    onChange={(e) => setFormData({ ...formData, phone: e.target.value })}
-                    className="w-full px-3.5 py-2.5 border border-slate-200 rounded-xl text-xs focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500 outline-none"
-                  />
-                </div>
-              </div>
+              )}
+            </FormField>
 
-              <div>
-                <label className="block text-xs font-bold text-slate-700 uppercase tracking-wider mb-1">
-                  Associated Emails (comma separated)
-                </label>
-                <input
-                  type="text"
-                  value={formData.associatedEmails}
-                  onChange={(e) => setFormData({ ...formData, associatedEmails: e.target.value })}
-                  className="w-full px-3.5 py-2.5 border border-slate-200 rounded-xl text-xs focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500 outline-none"
+            {emails.length > 0 ? (
+              <ul className="-mt-2 flex flex-wrap gap-1.5">
+                {emails.map((address) => (
+                  <li
+                    key={address}
+                    className="flex items-center gap-1 rounded-sm border border-line bg-subtle py-1 pl-2 pr-1 font-mono text-xs text-fg-2"
+                  >
+                    <span className="break-all">{address}</span>
+                    <button
+                      type="button"
+                      aria-label={`Remove ${address}`}
+                      onClick={() => removeEmail(address)}
+                      className="flex h-4 w-4 items-center justify-center rounded-sm text-fg-3 hover:text-danger-text focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-primary-600"
+                    >
+                      <X className="h-3 w-3" />
+                    </button>
+                  </li>
+                ))}
+              </ul>
+            ) : null}
+
+            <FormField label="Notes" optionalText="(optional)">
+              {(field) => (
+                <Textarea
+                  {...field}
+                  rows={3}
+                  value={form.notes}
+                  onChange={(e) => setForm((p) => ({ ...p, notes: e.target.value }))}
                 />
-              </div>
-
-              <div>
-                <label className="block text-xs font-bold text-slate-700 uppercase tracking-wider mb-1">
-                  Notes
-                </label>
-                <textarea
-                  rows="3"
-                  value={formData.notes}
-                  onChange={(e) => setFormData({ ...formData, notes: e.target.value })}
-                  className="w-full px-3.5 py-2.5 border border-slate-200 rounded-xl text-xs focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500 outline-none resize-none"
-                />
-              </div>
-
-              <div className="flex space-x-3 pt-4 border-t border-slate-100">
-                <button
-                  type="button"
-                  onClick={() => setIsEditOpen(false)}
-                  className="w-1/2 py-2.5 px-4 border border-slate-200 hover:bg-slate-50 rounded-xl text-xs font-semibold text-slate-600 transition-colors"
-                >
-                  Cancel
-                </button>
-                <button
-                  type="submit"
-                  disabled={actionLoading}
-                  className="w-1/2 py-2.5 px-4 bg-indigo-600 hover:bg-indigo-700 text-white rounded-xl text-xs font-semibold transition-colors disabled:opacity-50"
-                >
-                  {actionLoading ? 'Saving...' : 'Save Changes'}
-                </button>
-              </div>
-            </form>
-          </div>
-        </div>
-      )}
-
-      {/* Delete Confirmation Modal */}
-      {isDeleteOpen && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 backdrop-blur-[4px] p-4">
-          <div className="bg-white border border-slate-200 rounded-2xl max-w-sm w-full p-6 relative shadow-2xl animate-fade-in text-center">
-            <div className="w-12 h-12 mx-auto bg-red-50 border border-red-100 rounded-full flex items-center justify-center mb-4">
-              <svg className="w-6 h-6 text-red-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" />
-              </svg>
-            </div>
-            <h3 className="text-lg font-bold text-slate-800 mb-1">Delete Client</h3>
-            <p className="text-xs text-slate-500 mb-6">
-              Are you sure you want to delete <span className="font-bold text-slate-700">{selectedClient?.name}</span>? This action cannot be undone.
-            </p>
-            <div className="flex space-x-3">
-              <button
-                type="button"
-                onClick={() => setIsDeleteOpen(false)}
-                className="w-1/2 py-2.5 px-4 border border-slate-200 hover:bg-slate-50 rounded-xl text-xs font-semibold text-slate-600 transition-colors"
-              >
-                Cancel
-              </button>
-              <button
-                type="button"
-                onClick={handleDeleteClient}
-                disabled={actionLoading}
-                className="w-1/2 py-2.5 px-4 bg-red-500 hover:bg-red-600 text-white rounded-xl text-xs font-semibold transition-colors disabled:opacity-50"
-              >
-                {actionLoading ? 'Deleting...' : 'Delete'}
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
-    </div>
-  );
-};
-
-export default ClientList;
+              )}
+            </FormField>
+          </form>
+        </DialogContent>
+      </Dialog>
+    </>
+  )
+}

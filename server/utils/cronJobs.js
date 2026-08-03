@@ -1,109 +1,206 @@
 const cron = require('node-cron');
 const Task = require('../models/Task');
 const User = require('../models/User');
-const { createNotification } = require('./notificationHelper');
+const { createNotifications } = require('./notificationHelper');
+const { withLock } = require('./lock');
+const queue = require('./queue');
+const cache = require('./cache');
+const { log } = require('./logger');
+
+const logger = log('cron');
+
+const scheduled = [];
+
+// A one-minute overdue SLA is not a product requirement, and the job used to
+// run every 60 seconds forever, logging a line on each tick.
+const OVERDUE_PATTERN = process.env.CRON_OVERDUE_PATTERN || '*/5 * * * *';
+const SYNC_PATTERN = process.env.CRON_SYNC_PATTERN || '*/10 * * * *';
+const OVERDUE_BATCH = Number(process.env.CRON_OVERDUE_BATCH || 1000);
 
 /**
- * Initializes cron jobs for task deadline tracking
- * @param {Object} io - Socket.io server instance
+ * Flip newly overdue tasks to Late and notify once.
+ * @param {Object} io - socket.io server
+ * @returns {Promise<void>}
  */
-const startCronJobs = (io) => {
-  console.log('[CRON] Initializing workspace cron scheduler...');
+const runOverdueScan = async (io) => {
+  const now = new Date();
 
-  // Schedule to run every minute
-  cron.schedule('* * * * *', async () => {
-    try {
-      console.log('[CRON] Checking for pending tasks past their deadline...');
+  // Only tasks that have NOT already been notified about. `overdueNotifiedAt`
+  // makes the notification fire exactly once per task; it is re-armed by
+  // updateTask when the deadline moves or the task leaves the Late state.
+  //
+  // Bounded and projected: an overnight backlog of thousands of tasks must not
+  // materialise as thousands of full documents in one tick. The
+  // { status, overdueNotifiedAt, deadline } index covers this exact shape.
+  const overdueTasks = await Task.find({
+    status: 'Pending',
+    deadline: { $ne: null, $lt: now },
+    overdueNotifiedAt: null
+  })
+    .select('_id title assignedTo')
+    .limit(OVERDUE_BATCH)
+    .populate('assignedTo', 'name')
+    .lean();
 
-      const now = new Date();
-      // Find all tasks where status is 'Pending' AND deadline is in the past
-      const overdueTasks = await Task.find({
-        status: 'Pending',
-        deadline: { $lt: now }
-      }).populate('assignedTo', 'name');
+  if (overdueTasks.length === 0) {
+    // Still flip any already-notified stragglers to Late without notifying.
+    await Task.updateMany(
+      { status: 'Pending', deadline: { $ne: null, $lt: now } },
+      { $set: { status: 'Late' } }
+    );
+    return;
+  }
 
-      if (overdueTasks.length === 0) {
-        console.log('[CRON] No overdue tasks found.');
-        return;
-      }
+  logger.info({ count: overdueTasks.length }, 'flipping newly overdue tasks to Late');
 
-      console.log(`[CRON] Found ${overdueTasks.length} overdue tasks. Updating statuses to 'Late'...`);
+  // The supervisor list is cached: this query ran EVERY MINUTE against an
+  // unindexed `role` field, i.e. a full collection scan per tick. `role` is now
+  // indexed as well.
+  const supervisorIds = await cache.wrap('cron:supervisors', 300, async () => {
+    const supervisors = await User.find({
+      role: { $in: ['Admin', 'Head'] },
+      deletedAt: null,
+      status: 'Approved'
+    })
+      .select('_id')
+      .lean();
+    return supervisors.map((s) => String(s._id));
+  });
 
-      // Fetch all Head and Admin users to notify them
-      const supervisors = await User.find({
-        role: { $in: ['Admin', 'Head'] }
+  // One write for the whole batch instead of one save() per task.
+  await Task.updateMany(
+    { _id: { $in: overdueTasks.map((t) => t._id) } },
+    { $set: { status: 'Late', overdueNotifiedAt: now } }
+  );
+
+  // Build every notification up front, then insert them in ONE write.
+  const notifications = [];
+
+  for (const task of overdueTasks) {
+    if (task.assignedTo) {
+      notifications.push({
+        userId: task.assignedTo._id,
+        message: `Your task is overdue: ${task.title}`,
+        taskId: task._id
       });
-
-      let updatedCount = 0;
-
-      for (const task of overdueTasks) {
-        // Update task status
-        task.status = 'Late';
-        await task.save();
-        updatedCount++;
-
-        // 1. Notify the assigned employee
-        if (task.assignedTo) {
-          await createNotification(
-            task.assignedTo._id,
-            `Your task is overdue: ${task.title}`,
-            io
-          );
-        }
-
-        // 2. Notify all Admins and Department Heads
-        const employeeName = task.assignedTo ? task.assignedTo.name : 'Unassigned';
-        const staffAlertMessage = `Task overdue: ${task.title} assigned to ${employeeName}`;
-
-        for (const supervisor of supervisors) {
-          await createNotification(
-            supervisor._id,
-            staffAlertMessage,
-            io
-          );
-        }
-      }
-
-      console.log(`[CRON SUCCESS] Processed and marked ${updatedCount} tasks as 'Late'.`);
-    } catch (error) {
-      console.error('[CRON ERROR] Overdue task evaluation failed:', error);
     }
-  });
+  }
 
-  // Schedule to run every 10 minutes
-  cron.schedule('*/10 * * * *', async () => {
-    try {
-      console.log('[CRON] Starting automatic email synchronization for connected users...');
-      
-      // Find all users who have a connected Gmail account
-      const users = await User.find({
-        $or: [
-          { gmailAccessToken: { $ne: null, $exists: true, $ne: "" } },
-          { 'linkedGmailAccounts.0': { $exists: true } }
-        ]
-      }).select('+gmailAccessToken +gmailRefreshToken +linkedGmailAccounts');
+  // Notify each Admin/Head ONCE with a digest, rather than once per task. The
+  // original nested loop was O(tasks x supervisors) SEQUENTIAL writes: 500
+  // overdue tasks and 10 supervisors meant 5,000 individual notification saves
+  // and 5,500 socket emits inside a single tick.
+  const digestLines = overdueTasks
+    .map((t) => `"${t.title}" (${t.assignedTo ? t.assignedTo.name : 'Unassigned'})`)
+    .slice(0, 10)
+    .join(', ');
+  const extra = overdueTasks.length > 10 ? ` and ${overdueTasks.length - 10} more` : '';
+  const digestMessage =
+    overdueTasks.length === 1
+      ? `Task overdue: ${digestLines}`
+      : `${overdueTasks.length} tasks are overdue: ${digestLines}${extra}`;
 
-      if (users.length === 0) {
-        console.log('[CRON] No users with connected Gmail accounts found for auto-sync.');
-        return;
-      }
+  for (const supervisorId of supervisorIds) {
+    notifications.push({
+      userId: supervisorId,
+      message: digestMessage,
+      taskId: overdueTasks.length === 1 ? overdueTasks[0]._id : null,
+      // S-12: typed so a supervisor can mute the overdue digest specifically.
+      type: 'task_overdue'
+    });
+  }
 
-      // Dynamic import to avoid circular dependency/load order issues
-      const { syncUserEmails } = require('../controllers/gmailController');
+  await createNotifications(notifications, io);
+  await cache.invalidateStats();
 
-      for (const user of users) {
-        try {
-          console.log(`[CRON] Auto-syncing emails for user: ${user.email}`);
-          const count = await syncUserEmails(user, false);
-          console.log(`[CRON] Auto-sync complete. ${count} new emails fetched for user ${user.email}.`);
-        } catch (syncError) {
-          console.error(`[CRON ERROR] Failed to auto-sync emails for user ${user.email}:`, syncError);
-        }
-      }
-    } catch (error) {
-      console.error('[CRON ERROR] Automatic email sync cron job failed:', error);
-    }
-  });
+  logger.info({ tasks: overdueTasks.length, notifications: notifications.length }, 'overdue scan complete');
 };
 
-module.exports = { startCronJobs };
+/**
+ * Queue an automatic sync for every mailbox-owning user.
+ * @returns {Promise<Number>} number of jobs enqueued
+ */
+const runAutoSyncScan = async () => {
+  const users = await User.find({
+    // Do not keep syncing mailboxes for deleted or deactivated accounts.
+    deletedAt: null,
+    status: 'Approved',
+    $or: [
+      { gmailAccessToken: { $exists: true, $nin: [null, ''] } },
+      { 'linkedGmailAccounts.0': { $exists: true } }
+    ]
+  })
+    .select('_id email')
+    .lean();
+
+  if (users.length === 0) return 0;
+
+  // ENQUEUE rather than run. The cron tick used to call syncUserEmails inline
+  // and sequentially for every user — about 30 s per mailbox — inside a timer
+  // that does not skip overlapping executions, so the next tick fired while the
+  // previous one was still running.
+  for (const user of users) {
+    await queue.enqueueUnique(
+      queue.QUEUES.GMAIL_SYNC,
+      String(user._id),
+      { userId: String(user._id), isManual: false },
+      { attempts: Number(process.env.GMAIL_JOB_ATTEMPTS || 3), backoffMs: 10000 }
+    );
+  }
+
+  logger.info({ users: users.length }, 'auto-sync jobs queued');
+  return users.length;
+};
+
+/**
+ * Start the schedulers.
+ *
+ * Every job body runs under a distributed lock. `node-cron` is an in-process
+ * timer with no coordination, so with three replicas the overdue job fired
+ * three times per interval (three sets of duplicate notification rows) and
+ * three workers raced to insert the same Gmail messageId. With Redis the lock
+ * is cluster-wide; without it, it still prevents a slow tick from overlapping
+ * the next one — which the old code did not do either.
+ *
+ * @param {Object} io - Socket.io server instance
+ * @returns {void}
+ */
+const startCronJobs = (io) => {
+  logger.info({ overdue: OVERDUE_PATTERN, sync: SYNC_PATTERN }, 'starting cron scheduler');
+
+  scheduled.push(
+    cron.schedule(OVERDUE_PATTERN, async () => {
+      try {
+        // The lease is slightly shorter than the interval so a crashed holder
+        // does not block the next tick for long.
+        await withLock('cron:overdue', 4 * 60 * 1000, () => runOverdueScan(io));
+      } catch (error) {
+        logger.error({ err: error.message, stack: error.stack }, 'overdue task evaluation failed');
+      }
+    })
+  );
+
+  scheduled.push(
+    cron.schedule(SYNC_PATTERN, async () => {
+      try {
+        await withLock('cron:gmail-sync', 9 * 60 * 1000, () => runAutoSyncScan());
+      } catch (error) {
+        logger.error({ err: error.message, stack: error.stack }, 'automatic email sync scheduling failed');
+      }
+    })
+  );
+};
+
+/**
+ * Stop every scheduled job, so a tick cannot fire while the process is
+ * draining.
+ * @returns {void}
+ */
+const stopCronJobs = () => {
+  for (const job of scheduled) {
+    if (job && typeof job.stop === 'function') job.stop();
+  }
+  scheduled.length = 0;
+};
+
+module.exports = { startCronJobs, stopCronJobs, runOverdueScan, runAutoSyncScan };

@@ -1,0 +1,86 @@
+# Local / single-host deployment stack.
+#
+# The audit found the app could not run on more than one instance: an in-memory
+# rate limiter, no Socket.io adapter, and unguarded node-cron. Redis here is what
+# makes horizontal scaling possible — the server treats it as optional and falls
+# back to in-memory when REDIS_URL is unset, so this file is also a working
+# single-instance setup.
+
+services:
+  mongo:
+    image: mongo:7
+    restart: unless-stopped
+    environment:
+      MONGO_INITDB_DATABASE: maildesk
+    volumes:
+      - mongo-data:/data/db
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping').ok"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  server:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.server
+    restart: unless-stopped
+    depends_on:
+      mongo:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      NODE_ENV: production
+      PORT: 5015
+      MONGO_URI: mongodb://mongo:27017/maildesk
+      REDIS_URL: redis://redis:6379
+      FRONTEND_URL: http://localhost:8080
+      # Secrets are NOT defaulted here on purpose — supply them via a root .env
+      # file or your orchestrator's secret store. The server refuses to boot
+      # without JWT_SECRET and TOKEN_ENCRYPTION_KEY.
+      JWT_SECRET: ${JWT_SECRET:?JWT_SECRET is required}
+      TOKEN_ENCRYPTION_KEY: ${TOKEN_ENCRYPTION_KEY:?TOKEN_ENCRYPTION_KEY is required}
+      OAUTH_STATE_SECRET: ${OAUTH_STATE_SECRET:?OAUTH_STATE_SECRET is required}
+      GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID:-}
+      GOOGLE_CLIENT_SECRET: ${GOOGLE_CLIENT_SECRET:-}
+      GOOGLE_REDIRECT_URI: ${GOOGLE_REDIRECT_URI:-http://localhost:5015/api/gmail/oauth-callback}
+      SENDER_EMAIL: ${SENDER_EMAIL:-}
+      SENDER_APP_PASSWORD: ${SENDER_APP_PASSWORD:-}
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      APP_TIMEZONE: ${APP_TIMEZONE:-Asia/Kolkata}
+    ports:
+      - "5015:5015"
+
+  client:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.client
+      args:
+        # Same-origin in production would be better (proxy /api through nginx),
+        # but this keeps the compose stack honest about the two-origin setup
+        # the app currently assumes.
+        VITE_API_URL: ${VITE_API_URL:-http://localhost:5015/api}
+        VITE_SOCKET_URL: ${VITE_SOCKET_URL:-http://localhost:5015}
+    restart: unless-stopped
+    depends_on:
+      - server
+    ports:
+      - "8080:80"
+
+volumes:
+  mongo-data:
+  redis-data:

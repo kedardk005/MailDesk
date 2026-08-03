@@ -38,4 +38,11 @@ const ClientSchema = new mongoose.Schema({
   }
 });
 
+ClientSchema.index({ createdAt: -1 });
+ClientSchema.index({ status: 1, name: 1 });
+// The sender -> client matcher looks up by address; keeping it indexed means a
+// future direct lookup does not need the whole collection in memory.
+ClientSchema.index({ associatedEmails: 1 });
+ClientSchema.index({ email: 1 });
+
 module.exports = mongoose.model('Client', ClientSchema);

@@ -53,17 +53,30 @@ const seedClients = async () => {
   ];
 
   try {
-    for (const item of sampleClients) {
-      const exists = await Client.findOne({ name: item.name });
-      if (!exists) {
-        const client = new Client(item);
-        await client.save();
-        console.log(`Seeded client: ${item.name}`);
-      }
+    // Seeding is opt-in and first-run only.
+    //
+    // This previously ran on EVERY boot. Combined with taskHelper's
+    // `clients[0].name` fallback it meant every unmatched email was attributed
+    // to a seeded demo client ("Reliance Industries"), silently corrupting
+    // per-client task and mail counts in reports.
+    if (process.env.SEED_CLIENTS !== 'true') {
+      return;
     }
-    console.log("Client seeding checks completed successfully.");
+
+    const existingCount = await Client.countDocuments({});
+    if (existingCount > 0) {
+      console.log('[SEED] Client collection is not empty — skipping client seeding.');
+      return;
+    }
+
+    for (const item of sampleClients) {
+      const client = new Client(item);
+      await client.save();
+      console.log(`Seeded client: ${item.name}`);
+    }
+    console.log('[SEED] Client seeding completed successfully.');
   } catch (error) {
-    console.error("Error seeding clients:", error);
+    console.error('Error seeding clients:', error);
   }
 };
 

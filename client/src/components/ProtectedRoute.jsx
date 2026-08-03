@@ -1,18 +1,18 @@
-import React from 'react';
-import { Navigate } from 'react-router-dom';
+import { Navigate, useLocation } from 'react-router-dom'
+import { useAuth } from './AuthProvider'
 
 /**
- * Route protection wrapper component
- * If token doesn't exist, redirects user to /login
+ * Requires a session. Preserves the attempted URL so login can bounce back.
  */
-const ProtectedRoute = ({ children }) => {
-  const token = localStorage.getItem('token');
+export function ProtectedRoute({ children }) {
+  const { isAuthenticated } = useAuth()
+  const location = useLocation()
 
-  if (!token) {
-    return <Navigate to="/login" replace />;
+  if (!isAuthenticated) {
+    return <Navigate to="/login" replace state={{ from: location }} />
   }
 
-  return children;
-};
+  return children
+}
 
-export default ProtectedRoute;
+export default ProtectedRoute

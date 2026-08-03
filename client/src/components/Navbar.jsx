@@ -1,101 +1,151 @@
-import React, { useState, useEffect } from 'react';
-import { useNavigate, NavLink } from 'react-router-dom';
-import NotificationBell from './NotificationBell';
+import { useNavigate } from 'react-router-dom'
+import { LogOut, Menu, Moon, PanelLeft, Search, Sun, User } from 'lucide-react'
+import { cn } from '../lib/utils'
+import { useAuth } from './AuthProvider'
+import { useTheme } from './ThemeProvider'
+import NotificationBell from './NotificationBell'
+import { Avatar } from './ui/Avatar'
+import { Badge } from './ui/Badge'
+import { Button } from './ui/Button'
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuLabel,
+  DropdownMenuSeparator,
+  DropdownMenuShortcut,
+  DropdownMenuTrigger,
+} from './ui/DropdownMenu'
+import { Tooltip } from './ui/Tooltip'
 
-const Navbar = ({ onToggleSidebar }) => {
-  const navigate = useNavigate();
-  const [isScrolled, setIsScrolled] = useState(false);
+/** Role badge tone. Danger is reserved for destructive states — never a role. */
+const ROLE_VARIANT = { Admin: 'warning', Head: 'info', Employee: 'neutral' }
 
-  useEffect(() => {
-    const handleScroll = () => {
-      setIsScrolled(window.scrollY > 10);
-    };
-    window.addEventListener('scroll', handleScroll);
-    return () => window.removeEventListener('scroll', handleScroll);
-  }, []);
-
-  // Load user details
-  const userString = localStorage.getItem('user');
-  let user = { name: 'Guest', role: 'Employee' };
-  try {
-    if (userString) {
-      user = JSON.parse(userString);
-    }
-  } catch (err) {
-    console.error('Error parsing user details for Navbar rendering:', err);
-  }
+/**
+ * Fixed 48px top bar. No scroll listener, no backdrop blur, no gradient avatar
+ * ring — the shell is chrome, not a marketing header.
+ *
+ * @param {() => void} onToggleSidebar - mobile drawer
+ * @param {() => void} [onToggleCollapsed] - desktop rail
+ * @param {() => void} [onOpenCommandPalette]
+ */
+export function Navbar({ onToggleSidebar, onToggleCollapsed, onOpenCommandPalette }) {
+  const navigate = useNavigate()
+  const { user, displayName, role, logout } = useAuth()
+  const { theme, toggleTheme } = useTheme()
 
   const handleLogout = () => {
-    localStorage.removeItem('token');
-    localStorage.removeItem('user');
-    navigate('/login');
-  };
-
-  const getInitials = (name) => {
-    if (!name) return 'U';
-    return name
-      .split(' ')
-      .map((n) => n[0])
-      .join('')
-      .toUpperCase()
-      .slice(0, 2);
-  };
+    logout()
+    navigate('/login', { replace: true })
+  }
 
   return (
-    <header
-      className={`fixed top-0 left-0 right-0 h-16 bg-white/95 backdrop-blur-xl border-b border-slate-100 z-50 flex items-center transition-all duration-300 ${
-        isScrolled ? 'shadow-[0_4px_20px_rgba(99,102,241,0.05)] border-slate-200/50' : 'border-slate-100'
-      }`}
-    >
-      <div className="w-full px-4 sm:px-6 lg:px-8 flex items-center justify-between">
-        
-        {/* Left: Hamburger & Brand */}
-        <div className="flex items-center gap-2">
-          {/* Mobile hamburger menu */}
-          <button
-            onClick={onToggleSidebar}
-            className="p-2 text-slate-500 hover:bg-slate-50 rounded-xl lg:hidden focus:outline-none transition-colors"
+    <header className="flex h-topbar shrink-0 items-center justify-between gap-3 border-b border-line bg-surface px-3">
+      <div className="flex min-w-0 items-center gap-1.5">
+        <Button
+          variant="ghost"
+          size="sm"
+          iconOnly
+          aria-label="Open navigation"
+          className="lg:hidden"
+          onClick={onToggleSidebar}
+        >
+          <Menu className="h-4 w-4" />
+        </Button>
+
+        {onToggleCollapsed ? (
+          <Button
+            variant="ghost"
+            size="sm"
+            iconOnly
+            aria-label="Toggle navigation width"
+            className="hidden lg:inline-flex"
+            onClick={onToggleCollapsed}
           >
-            <svg className="h-5 w-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M4 6h16M4 12h16M4 18h16" />
-            </svg>
-          </button>
+            <PanelLeft className="h-4 w-4" />
+          </Button>
+        ) : null}
 
-          <div className="flex items-center gap-2.5">
-            <div className="h-9 w-9 rounded-xl bg-gradient-to-tr from-indigo-600 to-purple-600 flex items-center justify-center text-white shadow-md shadow-indigo-600/10 shrink-0">
-              <svg className="h-5 w-5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
-                <polyline points="22 12 16 12 14 15 10 15 8 12 2 12" />
-                <path d="M5.45 5.11L2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.45-6.89A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11z" />
-              </svg>
-            </div>
-            <span className="font-extrabold text-sm text-slate-900 tracking-tight leading-none">
-              K M KOTHARI
-            </span>
-          </div>
-        </div>
+        <span className="truncate text-sm font-semibold tracking-tight text-fg">K M KOTHARI</span>
+      </div>
 
-        {/* Right: Notifications, Avatar */}
-        <div className="flex items-center gap-4">
-          <NotificationBell />
+      <div className="flex shrink-0 items-center gap-1.5">
+        {onOpenCommandPalette ? (
+          <Button
+            variant="secondary"
+            size="sm"
+            className="hidden gap-2 text-fg-3 md:inline-flex"
+            onClick={onOpenCommandPalette}
+            leftIcon={<Search className="h-3.5 w-3.5" />}
+          >
+            Search
+            <kbd className="ml-1 rounded border border-line bg-subtle px-1 text-2xs text-fg-3">
+              ⌘K
+            </kbd>
+          </Button>
+        ) : null}
 
-          {/* User profile initials circle & details */}
-          <div className="hidden sm:flex items-center space-x-2.5">
-            <div className="p-[2px] bg-gradient-to-tr from-indigo-500 via-purple-500 to-pink-500 rounded-full shadow-sm shrink-0">
-              <div className="h-7 w-7 rounded-full bg-white flex items-center justify-center text-indigo-600 font-extrabold text-[10px]">
-                {getInitials(user.name)}
-              </div>
-            </div>
-            <div className="flex flex-col text-left">
-              <span className="text-xs font-bold text-slate-800 leading-none">{user.name}</span>
-              <span className="text-[9px] font-bold text-slate-400 mt-1.5 uppercase font-mono tracking-wider bg-slate-50 border border-slate-100 px-1.5 py-0.5 rounded">
-                {user.role}
+        <Tooltip content={theme === 'dark' ? 'Switch to light theme' : 'Switch to dark theme'}>
+          <Button
+            variant="ghost"
+            size="sm"
+            iconOnly
+            aria-label={theme === 'dark' ? 'Switch to light theme' : 'Switch to dark theme'}
+            onClick={toggleTheme}
+          >
+            {theme === 'dark' ? <Sun className="h-4 w-4" /> : <Moon className="h-4 w-4" />}
+          </Button>
+        </Tooltip>
+
+        <NotificationBell />
+
+        <DropdownMenu>
+          <DropdownMenuTrigger asChild>
+            <button
+              type="button"
+              aria-label="Account menu"
+              className={cn(
+                'flex h-8 items-center gap-2 rounded px-1.5 text-left',
+                'transition-colors duration-100 hover:bg-subtle',
+                'focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary-600'
+              )}
+            >
+              <Avatar name={displayName} id={user?._id || user?.email} size="sm" />
+              <span className="hidden max-w-[140px] truncate text-xs font-medium text-fg-2 sm:inline">
+                {displayName}
               </span>
+            </button>
+          </DropdownMenuTrigger>
+
+          <DropdownMenuContent align="end" className="min-w-[220px]">
+            <DropdownMenuLabel>Signed in</DropdownMenuLabel>
+            <div className="px-2 pb-2">
+              <p className="truncate text-sm font-medium text-fg">{displayName}</p>
+              {user?.email ? (
+                <p className="truncate text-xs text-fg-3">{user.email}</p>
+              ) : null}
+              {role ? (
+                <Badge variant={ROLE_VARIANT[role] || 'neutral'} className="mt-1.5">
+                  {role}
+                </Badge>
+              ) : null}
             </div>
-          </div>
-        </div>
+            <DropdownMenuSeparator />
+            <DropdownMenuItem onSelect={() => navigate('/profile')}>
+              <User className="h-4 w-4" />
+              My profile
+            </DropdownMenuItem>
+            <DropdownMenuSeparator />
+            <DropdownMenuItem destructive onSelect={handleLogout}>
+              <LogOut className="h-4 w-4" />
+              Sign out
+              <DropdownMenuShortcut />
+            </DropdownMenuItem>
+          </DropdownMenuContent>
+        </DropdownMenu>
       </div>
     </header>
-  );
-};
+  )
+}
 
-export default Navbar;
+export default Navbar

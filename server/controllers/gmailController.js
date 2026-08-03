@@ -1,12 +1,233 @@
 const { google } = require('googleapis');
+const pLimit = require('p-limit');
 const User = require('../models/User');
 const Email = require('../models/Email');
 const Task = require('../models/Task');
 const { logActivity } = require('../utils/activityLogger');
-const { encrypt, decrypt } = require('../utils/tokenCrypto');
+const { encrypt, decrypt, tryDecrypt } = require('../utils/tokenCrypto');
 const { escapeRegex } = require('../utils/regexHelper');
 const KeywordRule = require('../models/KeywordRule');
-const { ensureTaskForEmail } = require('../utils/taskHelper');
+const { ensureTasksForEmails, getClientMatcher, resolveClientForSender } = require('../utils/taskHelper');
+const { sanitizeEmailHtml, sanitizeEmailDoc } = require('../utils/sanitizeEmailHtml');
+const { makeSnippet } = require('../utils/snippet');
+const cache = require('../utils/cache');
+// `firstString` is aliased because getEmails already destructures a local
+// `firstString` inside its own block; a same-name top-level import would sit in
+// that block's temporal dead zone.
+const {
+  parseListParams,
+  paginate,
+  listResponse,
+  buildPagination,
+  firstString: firstStringOf
+} = require('../utils/paginate');
+const {
+  parseReferences,
+  resyncThreadPositions,
+  threadScopeFilter,
+  threadGroupStage,
+  projectThreadStage,
+  THREAD_SORT_FIELDS,
+  THREAD_MESSAGE_CAP
+} = require('../utils/threadHelper');
+const { callResilient } = require('../utils/resilience');
+const queue = require('../utils/queue');
+// One definition of "may this user read this email", shared with F-3 (AI
+// extraction) and F-4 (socket presence).
+const emailAccess = require('../utils/emailAccess');
+const { log } = require('../utils/logger');
+
+const logger = log('gmail');
+
+// Every read path must exclude soft-deleted emails.
+const NOT_DELETED = { deletedAt: null };
+
+// Projection for every LIST response. `body` and `bodyRaw` are `select: false`
+// on the schema, but the projection is spelled out so a future edit cannot
+// reintroduce them by accident. `snippet` replaces the body in list views.
+const EMAIL_LIST_FIELDS = [
+  'messageId',
+  'subject',
+  'snippet',
+  'from',
+  'date',
+  'status',
+  'assignedTo',
+  'fetchedBy',
+  'fetchedAt',
+  'toEmail',
+  'labelIds',
+  'attachments',
+  'matchedKeyword',
+  'suggestedAssignedTo',
+  'approvalStatus',
+  'clientId',
+  // S-16: needed to derive `isRead` for the requesting user. It is user ids and
+  // timestamps only — no secrets — and is returned as-is.
+  'readBy',
+  // F-1. Purely ADDITIVE: every field the inbox already read is untouched, so
+  // the finished client page keeps working unchanged.
+  'threadId',
+  'direction',
+  'threadPosition',
+  'rfcMessageId',
+  'inReplyTo',
+  'sentBy',
+  'sentAt'
+].join(' ');
+
+// Sortable fields for GET /api/gmail/emails (API-LIST-CONTRACT.md).
+const EMAIL_SORT_FIELDS = ['date', 'fetchedAt', 'subject', 'from', 'status', 'approvalStatus'];
+
+// Bulk operation ceiling, matching bulkAssignEmailsSchema's 200.
+const EMAIL_BULK_MAX = Number(process.env.EMAIL_BULK_MAX || 200);
+
+const OBJECT_ID_RE = /^[0-9a-fA-F]{24}$/;
+
+/**
+ * Attach `isRead` for the REQUESTING user (WAVE2 gap S-16).
+ *
+ * Read state is per-user because this is a shared mailbox: an email fetched by
+ * a Head and assigned to an Employee is read independently by each of them. The
+ * inbox previously faked "unread emphasis" from `status === 'unassigned'`,
+ * which meant assigning an email marked it read for everyone.
+ *
+ * @param {Object} email - a LEAN email object
+ * @param {String} userId
+ * @returns {Object} the same object plus `isRead` and `readAt`
+ */
+const deriveIsRead = (email, userId) => {
+  if (!email) return email;
+  const id = String(userId);
+  const entry = (email.readBy || []).find((r) => String(r?.user) === id);
+  return { ...email, isRead: Boolean(entry), readAt: entry?.readAt || null };
+};
+
+/**
+ * Validate and de-duplicate a caller-supplied array of email ids.
+ * @param {*} raw
+ * @returns {{ids: String[], error: String|null}}
+ */
+const parseEmailIds = (raw) => {
+  if (!Array.isArray(raw) || raw.length === 0) {
+    return { ids: [], error: 'An "ids" array with at least one email ID is required.' };
+  }
+  if (raw.length > EMAIL_BULK_MAX) {
+    return { ids: [], error: `Cannot act on more than ${EMAIL_BULK_MAX} emails at once.` };
+  }
+  const ids = [...new Set(raw.map((v) => String(v)))];
+  const invalid = ids.filter((id) => !OBJECT_ID_RE.test(id));
+  if (invalid.length > 0) {
+    return { ids: [], error: `Invalid email ID: ${invalid[0]}.` };
+  }
+  return { ids, error: null };
+};
+
+const GMAIL_TIMEOUT_MS = Number(process.env.GMAIL_TIMEOUT_MS || 20000);
+const GMAIL_MESSAGE_CONCURRENCY = Number(process.env.GMAIL_SYNC_CONCURRENCY || 10);
+const GMAIL_ATTACHMENT_CONCURRENCY = Number(process.env.GMAIL_ATTACHMENT_CONCURRENCY || 5);
+const GMAIL_MAX_RESULTS = Number(process.env.GMAIL_MAX_RESULTS || 150);
+
+/**
+ * Every outbound Gmail call goes through here: a hard timeout (gaxios has NONE
+ * by default and will wait on a hung socket forever), bounded retries with
+ * exponential backoff for 429/5xx, and a circuit breaker so a Gmail outage
+ * fails in microseconds instead of piling up 20-second hangs.
+ *
+ * @param {Function} fn - async () => gaxios response
+ * @param {String} [label]
+ * @returns {Promise<*>}
+ */
+const gmailCall = (fn, label = 'gmail') =>
+  callResilient('gmail', fn, {
+    timeoutMs: GMAIL_TIMEOUT_MS,
+    attempts: Number(process.env.GMAIL_RETRY_ATTEMPTS || 3),
+    baseDelayMs: 1000,
+    failureThreshold: 8,
+    resetTimeoutMs: 30000,
+    label
+  });
+
+// Per-request options handed to googleapis so the SOCKET is released too, not
+// just the caller's promise.
+const GMAIL_REQUEST_OPTIONS = { timeout: GMAIL_TIMEOUT_MS };
+
+/**
+ * Active keyword rules, hoisted out of the per-message loop and cached.
+ *
+ * `KeywordRule.find({ isActive: true })` used to run once PER GMAIL MESSAGE:
+ * 150 messages x N accounts every 10 minutes, plus 150 `new RegExp()`
+ * compilations per sync, against an unindexed field.
+ *
+ * @returns {Promise<Array<{keyword: String, assignedTo: *, autoApprove: Boolean, re: RegExp}>>}
+ */
+const getActiveKeywordRules = async () => {
+  const rules = await cache.wrap(cache.KEYS.activeRules(), cache.TTL.activeRules, () =>
+    KeywordRule.find({ isActive: true }).select('keyword assignedTo autoApprove').lean()
+  );
+
+  return (rules || []).map((rule) => ({
+    keyword: rule.keyword,
+    assignedTo: rule.assignedTo,
+    autoApprove: rule.autoApprove,
+    re: new RegExp(`\\b${escapeRegex(rule.keyword)}\\b`, 'i')
+  }));
+};
+
+/**
+ * Resolve the Gmail credentials for `inboxEmail` from a SINGLE user document.
+ *
+ * There is deliberately no cross-user fallback. The previous implementation, on
+ * failing to find the inbox on the calling user, searched every Admin and
+ * borrowed their OAuth tokens — which let any Head send mail from the Admin's
+ * real mailbox.
+ *
+ * @param {Object} user - User document selected with token fields
+ * @param {String} inboxEmail
+ * @returns {{ accessToken: String|null, refreshToken: String|null }}
+ */
+const resolveInboxCredentials = (user, inboxEmail) => {
+  if (!user || !inboxEmail) return { accessToken: null, refreshToken: null };
+
+  if (user.gmailEmail === inboxEmail) {
+    return { accessToken: user.gmailAccessToken, refreshToken: user.gmailRefreshToken };
+  }
+
+  const linked = (user.linkedGmailAccounts || []).find((a) => a.gmailEmail === inboxEmail);
+  if (linked) {
+    return { accessToken: linked.gmailAccessToken, refreshToken: linked.gmailRefreshToken };
+  }
+
+  return { accessToken: null, refreshToken: null };
+};
+
+/**
+ * Object-level authorization for a single Email.
+ *
+ * Admin may act on any email. Everyone else must own the mailbox it arrived on
+ * (they fetched it). Employees additionally qualify when it is assigned to them.
+ *
+ * Behaviour is unchanged; the implementation moved to `utils/emailAccess.js` so
+ * that F-3 (AI extraction) and F-4 (socket presence) enforce the SAME rule
+ * rather than a second, separately maintained copy of it.
+ *
+ * `fetchedBy` / `assignedTo` may arrive as an ObjectId, as a string, or — since
+ * the read paths now populate them — as a hydrated user object; the shared
+ * helper resolves all three.
+ *
+ * @param {Object} email - Email document
+ * @param {Object} user - req.user
+ * @returns {Boolean}
+ */
+const canAccessEmail = (email, user) => emailAccess.canAccessEmail(email, user);
+
+/**
+ * Strip CR/LF from a value before it is interpolated into an RFC-2822 header,
+ * so an attacker-controlled subject or address cannot inject extra headers.
+ * @param {String} value
+ * @returns {String}
+ */
+const sanitizeHeaderValue = (value) => String(value || '').replace(/[\r\n]+/g, ' ').trim();
 
 
 
@@ -55,6 +276,35 @@ const getBodyText = (payload) => {
   }
 
   return '';
+};
+
+/**
+ * Find the data of the first part with `mimeType`. Used to pull the text/plain
+ * alternative, which is what the snippet is generated from where available —
+ * the HTML alternative is the one carrying megabytes of inlined base64.
+ *
+ * @param {Object} payload - Gmail message payload
+ * @param {String} mimeType
+ * @returns {String} base64url data, or ''
+ */
+const findPartData = (payload, mimeType) => {
+  if (!payload) return '';
+  if (payload.mimeType === mimeType && payload.body && payload.body.data) return payload.body.data;
+  for (const part of payload.parts || []) {
+    const found = findPartData(part, mimeType);
+    if (found) return found;
+  }
+  return '';
+};
+
+/**
+ * Decode a Gmail base64url payload.
+ * @param {String} data
+ * @returns {String}
+ */
+const decodeBase64Url = (data) => {
+  if (!data) return '';
+  return Buffer.from(String(data).replace(/-/g, '+').replace(/_/g, '/'), 'base64').toString('utf-8');
 };
 
 // Recursive helper to find all inline image parts within message payload
@@ -161,7 +411,7 @@ exports.getAuthUrl = async (req, res) => {
 
     return res.status(200).json({ authUrl });
   } catch (error) {
-    console.error('Error generating Google auth URL:', error);
+    logger.error({ err: error.message }, 'failed to generate Google auth URL');
     return res.status(500).json({ message: error.message || 'Server error. Failed to generate auth URL.' });
   }
 };
@@ -186,7 +436,7 @@ exports.handleOAuthCallback = async (req, res) => {
       userId = decoded.userId;
       mode = decoded.mode;
     } catch (err) {
-      console.error('OAuth callback state validation failed:', err.message);
+      logger.warn({ err: err.message }, 'OAuth callback state validation failed');
       return res.status(400).send('Authorization failed. Invalid or expired state parameter.');
     }
 
@@ -194,8 +444,9 @@ exports.handleOAuthCallback = async (req, res) => {
 
     const oauth2Client = getOAuth2Client();
 
-    // Exchange code for access and refresh tokens
-    const { tokens } = await oauth2Client.getToken(code);
+    // Exchange code for access and refresh tokens. Wrapped so a hung Google
+    // token endpoint cannot pin the callback request indefinitely.
+    const { tokens } = await gmailCall(() => oauth2Client.getToken(code), 'oauth.getToken');
     oauth2Client.setCredentials(tokens);
     
     // Find user using Mongoose ID passed via OAuth 'state'
@@ -218,10 +469,13 @@ exports.handleOAuthCallback = async (req, res) => {
     let gmailAddress = "";
     try {
       const gmail = google.gmail({ version: 'v1', auth: oauth2Client });
-      const profile = await gmail.users.getProfile({ userId: 'me' });
+      const profile = await gmailCall(
+        () => gmail.users.getProfile({ userId: 'me' }, GMAIL_REQUEST_OPTIONS),
+        'users.getProfile'
+      );
       gmailAddress = profile.data.emailAddress || "";
     } catch (apiErr) {
-      console.error('Error fetching Gmail profile during OAuth:', apiErr);
+      logger.error({ err: apiErr.message }, 'failed to fetch Gmail profile during OAuth');
     }
 
     if (!gmailAddress) {
@@ -244,6 +498,24 @@ exports.handleOAuthCallback = async (req, res) => {
       }
     }
 
+    // Enforce uniqueness AT THE SOURCE rather than destroying tokens later.
+    // Two users connecting the same shared mailbox is what made the old
+    // deduplicateConnections() sweep silently disconnect one of them.
+    const claimedByOther = await User.findOne({
+      _id: { $ne: user._id },
+      deletedAt: null,
+      $or: [{ gmailEmail: gmailAddress }, { 'linkedGmailAccounts.gmailEmail': gmailAddress }]
+    }).select('name email');
+
+    if (claimedByOther) {
+      return res
+        .status(409)
+        .send(
+          `This Gmail account (${gmailAddress}) is already connected by another user (${claimedByOther.name}). ` +
+            `Ask an administrator to disconnect it there first.`
+        );
+    }
+
     if (isExtra) {
       // Store as a linked (extra) account — do not overwrite primary tokens
       const alreadyLinked = user.linkedGmailAccounts.some(a => a.gmailEmail === gmailAddress);
@@ -255,7 +527,7 @@ exports.handleOAuthCallback = async (req, res) => {
         });
         user.markModified('linkedGmailAccounts');
         await user.save();
-        console.log(`[GMAIL] Linked extra account ${gmailAddress} to user ${user.email}`);
+        logger.info({ gmailAddress, userId: String(user._id) }, 'linked extra Gmail account');
         await logActivity(user._id, 'Gmail Link Extra', `Linked extra Gmail account: ${gmailAddress}`);
       } else {
         // Update tokens if account already exists
@@ -266,7 +538,7 @@ exports.handleOAuthCallback = async (req, res) => {
         }
         user.markModified('linkedGmailAccounts');
         await user.save();
-        console.log(`[GMAIL] Refreshed tokens for linked account ${gmailAddress}`);
+        logger.info({ gmailAddress }, 'refreshed tokens for linked account');
       }
     } else {
       // Save as primary Gmail account
@@ -276,309 +548,1098 @@ exports.handleOAuthCallback = async (req, res) => {
       }
       user.gmailEmail = gmailAddress;
       await user.save();
-      console.log(`Successfully saved primary Google credentials for user: ${user.email}`);
+      logger.info({ userId: String(user._id) }, 'saved primary Google credentials');
       await logActivity(user._id, 'Gmail Connection', `Connected Gmail account: ${gmailAddress}`);
     }
 
-    // Run deduplication to clean up duplicates workspace-wide
-    await deduplicateConnections();
+    // No workspace-wide de-duplication sweep here: the uniqueness check above
+    // prevents the duplicate from being created in the first place, and the
+    // sweep is now an explicit Admin action (POST /api/gmail/deduplicate).
 
     // Redirect to inbox so user sees the new account immediately
     const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:5173';
     return res.redirect(`${frontendUrl}/inbox?gmail=connected`);
   } catch (error) {
-    console.error('OAuth callback exchange error:', error);
+    logger.error({ err: error.message }, 'OAuth callback exchange failed');
     return res.status(500).send('Failed to complete Google authentication. Please try again.');
   }
 };
 
-// Low-level helper: sync a single Gmail credential set (access/refresh tokens + inboxEmail)
-const syncAccountEmails = async (user, accessToken, refreshToken, inboxEmail, isManual = false) => {
+/**
+ * Persist tokens produced by a silent refresh, ATOMICALLY.
+ *
+ * The old `oauth2Client.on('tokens')` handler mutated the shared `user`
+ * document and called `await user.save()` from inside an async event listener.
+ * The listener was registered once per account inside a loop over that same
+ * document, so N listeners accumulated and concurrent refreshes raced into
+ * Mongoose's `ParallelSaveError` — and each save rewrote the ENTIRE user
+ * document including every linked account.
+ *
+ * A targeted `updateOne` touches exactly the one field that changed.
+ *
+ * @param {String} userId
+ * @param {String} inboxEmail
+ * @param {Boolean} isPrimary
+ * @param {Object} newTokens
+ * @returns {Promise<void>}
+ */
+const persistRefreshedTokens = async (userId, inboxEmail, isPrimary, newTokens) => {
+  if (!newTokens || !newTokens.access_token) return;
+
+  const set = {};
+  if (isPrimary) {
+    set.gmailAccessToken = encrypt(newTokens.access_token);
+    if (newTokens.refresh_token) set.gmailRefreshToken = encrypt(newTokens.refresh_token);
+    await User.updateOne({ _id: userId }, { $set: set });
+  } else {
+    set['linkedGmailAccounts.$.gmailAccessToken'] = encrypt(newTokens.access_token);
+    if (newTokens.refresh_token) {
+      set['linkedGmailAccounts.$.gmailRefreshToken'] = encrypt(newTokens.refresh_token);
+    }
+    await User.updateOne({ _id: userId, 'linkedGmailAccounts.gmailEmail': inboxEmail }, { $set: set });
+  }
+
+  // Cache the live access token until just before it expires, so repeated syncs
+  // in the same window skip the database entirely. Stored ENCRYPTED: a cache is
+  // not a place to keep a bearer token in the clear.
+  const expiry = Number(newTokens.expiry_date || 0);
+  const ttlSeconds = expiry ? Math.floor((expiry - Date.now()) / 1000) - 60 : 0;
+  if (ttlSeconds > 30) {
+    await cache.set(
+      cache.KEYS.gmailToken(String(userId), inboxEmail),
+      { accessToken: encrypt(newTokens.access_token), expiry },
+      ttlSeconds
+    );
+  }
+};
+
+/**
+ * Build an authenticated Gmail client for one mailbox.
+ * @param {Object} params
+ * @returns {{gmail: Object, oauth2Client: Object}}
+ */
+const buildGmailClient = ({ userId, accessToken, refreshToken, inboxEmail, isPrimary }) => {
   const oauth2Client = getOAuth2Client();
   oauth2Client.setCredentials({ access_token: accessToken, refresh_token: refreshToken });
 
-  // Auto-save refreshed tokens
-  oauth2Client.on('tokens', async (newTokens) => {
-    if (inboxEmail === user.gmailEmail) {
-      // Primary account
-      if (newTokens.access_token) user.gmailAccessToken = encrypt(newTokens.access_token);
-      if (newTokens.refresh_token) user.gmailRefreshToken = encrypt(newTokens.refresh_token);
-    } else {
-      // Linked account
-      const acct = user.linkedGmailAccounts.find(a => a.gmailEmail === inboxEmail);
-      if (acct) {
-        if (newTokens.access_token) acct.gmailAccessToken = encrypt(newTokens.access_token);
-        if (newTokens.refresh_token) acct.gmailRefreshToken = encrypt(newTokens.refresh_token);
-      }
-      user.markModified('linkedGmailAccounts');
-    }
-    await user.save();
+  // Listener registered once per client (not once per account on a shared
+  // document) and never awaited inside the event handler.
+  oauth2Client.on('tokens', (newTokens) => {
+    persistRefreshedTokens(userId, inboxEmail, isPrimary, newTokens).catch((err) =>
+      logger.warn({ err: err.message, inboxEmail }, 'failed to persist refreshed Gmail tokens')
+    );
   });
 
-  const gmail = google.gmail({ version: 'v1', auth: oauth2Client });
-
-  const listRes = await gmail.users.messages.list({
-    userId: 'me',
-    maxResults: 150,
-    includeSpamTrash: true
-  });
-
-  const messages = listRes.data.messages || [];
-  console.log(`[GMAIL SYNC] ${inboxEmail}: ${messages.length} messages found.`);
-
-  // Batch check which messages already exist in our DB (avoids N+1)
-  const messageIds = messages.map(m => m.id);
-  const existingEmails = await Email.find({ messageId: { $in: messageIds } }, 'messageId');
-  const existingIds = new Set(existingEmails.map(e => e.messageId));
-
-  let newCount = 0;
-
-  for (const message of messages) {
-    if (existingIds.has(message.id)) continue;
-
-    const msgDetails = await gmail.users.messages.get({ userId: 'me', id: message.id });
-    const payload = msgDetails.data.payload;
-    const headers = payload.headers;
-    const labelIds = msgDetails.data.labelIds || [];
-
-    const subject = getHeader(headers, 'subject') || '(No Subject)';
-    const from = getHeader(headers, 'from') || 'Unknown Sender';
-    const dateStr = getHeader(headers, 'date');
-    const date = dateStr ? new Date(dateStr) : new Date();
-
-    const rawBody = getBodyText(payload);
-    let decodedBody = '';
-    if (rawBody) {
-      const base64Body = rawBody.replace(/-/g, '+').replace(/_/g, '/');
-      decodedBody = Buffer.from(base64Body, 'base64').toString('utf-8');
-    }
-
-    const inlineImages = getInlineImages(payload);
-    if (inlineImages.length > 0 && decodedBody) {
-      for (const img of inlineImages) {
-        let base64Data = '';
-        if (img.data) {
-          base64Data = img.data;
-        } else if (img.attachmentId) {
-          try {
-            const attachRes = await gmail.users.messages.attachments.get({
-              userId: 'me',
-              messageId: message.id,
-              id: img.attachmentId
-            });
-            base64Data = attachRes.data.data || '';
-          } catch (attachErr) {
-            console.error(`[GMAIL SYNC] Failed to fetch attachment ${img.contentId}:`, attachErr);
-          }
-        }
-        if (base64Data) {
-          const standardBase64 = base64Data.replace(/-/g, '+').replace(/_/g, '/');
-          const dataUrl = `data:${img.mimeType};base64,${standardBase64}`;
-          const escapedCid = img.contentId.replace(/[-\/\\^$*+?.()|[\]{}]/g, '\\$&');
-          const regex = new RegExp(`cid:<?${escapedCid}>?`, 'gi');
-          decodedBody = decodedBody.replace(regex, dataUrl);
-        }
-      }
-    }
-
-    const attachments = getAttachmentsList(payload);
-
-    // Evaluate active keyword rules against email subject and body
-    let matchedKeyword = null;
-    let suggestedAssignedTo = null;
-    let approvalStatus = 'none';
-    let assignedTo = null;
-    let status = 'unassigned';
-
-    try {
-      const activeRules = await KeywordRule.find({ isActive: true });
-      if (activeRules.length > 0) {
-        const textToSearch = `${subject} ${decodedBody}`;
-        for (const rule of activeRules) {
-          const regex = new RegExp(`\\b${escapeRegex(rule.keyword)}\\b`, 'i');
-          if (regex.test(textToSearch)) {
-            matchedKeyword = rule.keyword;
-            suggestedAssignedTo = rule.assignedTo;
-            if (rule.autoApprove) {
-              assignedTo = rule.assignedTo;
-              status = 'assigned';
-              approvalStatus = 'approved';
-            } else {
-              approvalStatus = 'pending';
-            }
-            console.log(`[KEYWORD MATCH] Email "${subject}" matched keyword "${rule.keyword}"`);
-            break;
-          }
-        }
-      }
-    } catch (ruleErr) {
-      console.error('[KEYWORD EVAL ERROR]', ruleErr);
-    }
-
-    const emailRecord = new Email({
-      messageId: message.id,
-      subject,
-      from,
-      date,
-      body: decodedBody,
-      status,
-      assignedTo,
-      fetchedBy: user._id,
-      labelIds,
-      toEmail: inboxEmail,
-      attachments,
-      matchedKeyword,
-      suggestedAssignedTo,
-      approvalStatus
-    });
-
-    await emailRecord.save();
-    if (emailRecord.status === 'assigned' && emailRecord.assignedTo) {
-      await ensureTaskForEmail(emailRecord, emailRecord.assignedTo, user._id);
-    }
-    console.log(`[GMAIL SYNC] Saved: "${subject}" to ${inboxEmail}`);
-    newCount++;
-  }
-
-  return newCount;
+  return { oauth2Client, gmail: google.gmail({ version: 'v1', auth: oauth2Client }) };
 };
 
-// High-level helper: sync ALL accounts (primary + linked) for a user
-const syncUserEmails = async (user, isManual = false) => {
-  if (!user) throw new Error('Invalid user.');
+/**
+ * Turn one Gmail message into an Email document body.
+ *
+ * Pure apart from the inline-image fetches, which are bounded by their own
+ * concurrency limiter.
+ *
+ * @param {Object} args
+ * @returns {Promise<Object>} an Email document body
+ */
+const buildEmailDocument = async ({ gmail, message, inboxEmail, userId, rules, clientMatcher, attachmentLimit }) => {
+  const msgDetails = await gmailCall(
+    () => gmail.users.messages.get({ userId: 'me', id: message.id }, GMAIL_REQUEST_OPTIONS),
+    'messages.get'
+  );
 
-  let totalNew = 0;
+  const payload = msgDetails.data.payload || {};
+  const headers = payload.headers;
+  const labelIds = msgDetails.data.labelIds || [];
 
-  // 1. Sync primary account (if connected)
-  if (user.gmailAccessToken) {
-    console.log(`[GMAIL SYNC] Syncing primary account: ${user.gmailEmail}`);
-    const decryptedAccessToken = decrypt(user.gmailAccessToken);
-    const decryptedRefreshToken = decrypt(user.gmailRefreshToken);
-    const count = await syncAccountEmails(
-      user, decryptedAccessToken, decryptedRefreshToken, user.gmailEmail, isManual
+  const subject = getHeader(headers, 'subject') || '(No Subject)';
+  const from = getHeader(headers, 'from') || 'Unknown Sender';
+  const dateStr = getHeader(headers, 'date');
+  const date = dateStr ? new Date(dateStr) : new Date();
+
+  // F-1: the threading headers. `threadId` in particular was already available
+  // on every message and was simply discarded, which is why a conversation
+  // rendered as N unrelated rows.
+  const threadId = msgDetails.data.threadId || message.threadId || null;
+  const rfcMessageId = getHeader(headers, 'message-id') || null;
+  const inReplyTo = getHeader(headers, 'in-reply-to') || null;
+  const references = parseReferences(getHeader(headers, 'references'));
+
+  let decodedBody = decodeBase64Url(getBodyText(payload));
+  // The text/plain alternative is the cheap, image-free source for the snippet.
+  const plainText = decodeBase64Url(findPartData(payload, 'text/plain'));
+
+  // Inline images: fetched in parallel (bounded) rather than one blocking round
+  // trip after another.
+  const inlineImages = getInlineImages(payload);
+  if (inlineImages.length > 0 && decodedBody) {
+    const fetched = await Promise.all(
+      inlineImages.map((img) =>
+        attachmentLimit(async () => {
+          if (img.data) return { img, data: img.data };
+          if (!img.attachmentId) return { img, data: '' };
+          try {
+            const attachRes = await gmailCall(
+              () =>
+                gmail.users.messages.attachments.get(
+                  { userId: 'me', messageId: message.id, id: img.attachmentId },
+                  GMAIL_REQUEST_OPTIONS
+                ),
+              'attachments.get'
+            );
+            return { img, data: attachRes.data.data || '' };
+          } catch (err) {
+            logger.warn({ err: err.message, contentId: img.contentId }, 'failed to fetch inline image');
+            return { img, data: '' };
+          }
+        })
+      )
     );
-    totalNew += count;
-  }
 
-  // 2. Sync all linked (extra) accounts
-  for (const acct of (user.linkedGmailAccounts || [])) {
-    if (acct.gmailAccessToken) {
-      console.log(`[GMAIL SYNC] Syncing linked account: ${acct.gmailEmail}`);
-      try {
-        const decryptedAccessToken = decrypt(acct.gmailAccessToken);
-        const decryptedRefreshToken = decrypt(acct.gmailRefreshToken);
-        const count = await syncAccountEmails(
-          user, decryptedAccessToken, decryptedRefreshToken, acct.gmailEmail, isManual
-        );
-        totalNew += count;
-      } catch (err) {
-        console.error(`[GMAIL SYNC] Failed for linked account ${acct.gmailEmail}:`, err.message);
-      }
+    for (const { img, data } of fetched) {
+      if (!data) continue;
+      const dataUrl = `data:${img.mimeType};base64,${String(data).replace(/-/g, '+').replace(/_/g, '/')}`;
+      const escapedCid = img.contentId.replace(/[-\/\\^$*+?.()|[\]{}]/g, '\\$&');
+      decodedBody = decodedBody.replace(new RegExp(`cid:<?${escapedCid}>?`, 'gi'), dataUrl);
     }
   }
 
-  console.log(`[GMAIL SYNC] Total new emails this sync: ${totalNew}`);
+  const attachments = getAttachmentsList(payload);
 
-  const activityType = isManual ? 'Gmail Fetch' : 'Gmail Fetch Auto';
-  const activityDesc = isManual
-    ? `Manually fetched Gmail emails (Found ${totalNew} new emails)`
-    : `Automatically fetched Gmail emails (Found ${totalNew} new emails)`;
-  await logActivity(user._id, activityType, activityDesc);
+  // Keyword rules: pre-compiled and hoisted; no query, no RegExp construction
+  // inside the loop.
+  let matchedKeyword = null;
+  let suggestedAssignedTo = null;
+  let approvalStatus = 'none';
+  let assignedTo = null;
+  let status = 'unassigned';
+
+  if (rules.length > 0) {
+    const textToSearch = `${subject} ${decodedBody}`;
+    for (const rule of rules) {
+      if (!rule.re.test(textToSearch)) continue;
+      matchedKeyword = rule.keyword;
+      suggestedAssignedTo = rule.assignedTo;
+      if (rule.autoApprove) {
+        assignedTo = rule.assignedTo;
+        status = 'assigned';
+        approvalStatus = 'approved';
+      } else {
+        approvalStatus = 'pending';
+      }
+      break;
+    }
+  }
+
+  // Inbound Gmail HTML is fully attacker controlled and was previously stored
+  // and served verbatim, giving anyone on the internet a stored-XSS primitive
+  // against every Admin/Head/Employee who opened the mail. Sanitize BEFORE it
+  // is persisted; keep the original only in `bodyRaw`, which is `select:false`
+  // and therefore never returned by any query that does not ask for it.
+  const safeBody = sanitizeEmailHtml(decodedBody);
+  const { clientId } = await resolveClientForSender(from, clientMatcher);
+
+  return {
+    messageId: message.id,
+    threadId,
+    rfcMessageId,
+    inReplyTo,
+    references,
+    // Everything the sync ingests arrived in one of our mailboxes. Outbound
+    // rows are written only by replyToEmail.
+    direction: 'inbound',
+    subject,
+    from,
+    date,
+    body: safeBody,
+    bodyRaw: decodedBody,
+    // Generated once, here, so no list response ever needs the body.
+    snippet: makeSnippet(safeBody, plainText),
+    status,
+    assignedTo,
+    fetchedBy: userId,
+    labelIds,
+    toEmail: inboxEmail,
+    attachments,
+    matchedKeyword,
+    suggestedAssignedTo,
+    approvalStatus,
+    clientId,
+    fetchedAt: new Date()
+  };
+};
+
+/**
+ * Sync one mailbox.
+ *
+ * Was: 150 SEQUENTIAL `messages.get` calls at ~200 ms each (about 30 s per
+ * account), one `KeywordRule.find` per message, one `Client.find({})` per
+ * assigned message, and one `save()` per email — with no per-message try/catch,
+ * so a single poisoned message aborted the rest of the account.
+ *
+ * Now: bounded-concurrency fetches, hoisted rules and client matcher, one
+ * `insertMany({ ordered: false })`, one bulk task upsert, and per-message
+ * isolation.
+ *
+ * @param {Object} params
+ * @returns {Promise<{inbox: String, newCount: Number, failed: Number, scanned: Number}>}
+ */
+const syncAccountEmails = async ({ userId, accessToken, refreshToken, inboxEmail, isPrimary, onProgress }) => {
+  const { gmail } = buildGmailClient({ userId, accessToken, refreshToken, inboxEmail, isPrimary });
+
+  const listRes = await gmailCall(
+    () =>
+      gmail.users.messages.list(
+        { userId: 'me', maxResults: GMAIL_MAX_RESULTS, includeSpamTrash: true },
+        GMAIL_REQUEST_OPTIONS
+      ),
+    'messages.list'
+  );
+
+  const messages = listRes.data.messages || [];
+  if (messages.length === 0) return { inbox: inboxEmail, newCount: 0, failed: 0, scanned: 0 };
+
+  // One indexed query instead of a per-message existence check.
+  const messageIds = messages.map((m) => m.id);
+  const existingIds = new Set(await Email.distinct('messageId', { messageId: { $in: messageIds } }));
+  const pending = messages.filter((m) => !existingIds.has(m.id));
+
+  logger.info({ inbox: inboxEmail, listed: messages.length, new: pending.length }, 'gmail sync starting');
+  if (pending.length === 0) return { inbox: inboxEmail, newCount: 0, failed: 0, scanned: messages.length };
+
+  const [rules, clientMatcher] = await Promise.all([getActiveKeywordRules(), getClientMatcher()]);
+
+  const messageLimit = pLimit(GMAIL_MESSAGE_CONCURRENCY);
+  const attachmentLimit = pLimit(GMAIL_ATTACHMENT_CONCURRENCY);
+
+  let processed = 0;
+  let failed = 0;
+
+  const settled = await Promise.all(
+    pending.map((message) =>
+      messageLimit(async () => {
+        try {
+          const doc = await buildEmailDocument({
+            gmail,
+            message,
+            inboxEmail,
+            userId,
+            rules,
+            clientMatcher,
+            attachmentLimit
+          });
+          return doc;
+        } catch (err) {
+          // Per-message isolation: one bad message must not kill the batch.
+          failed += 1;
+          logger.warn({ err: err.message, messageId: message.id, inbox: inboxEmail }, 'skipping message');
+          return null;
+        } finally {
+          processed += 1;
+          if (onProgress && processed % 10 === 0) {
+            onProgress({ inbox: inboxEmail, processed, total: pending.length });
+          }
+        }
+      })
+    )
+  );
+
+  const docs = settled.filter(Boolean);
+  if (docs.length === 0) return { inbox: inboxEmail, newCount: 0, failed, scanned: messages.length };
+
+  // `ordered: false` makes a duplicate messageId (two syncs racing, or two
+  // replicas on the same cron tick) SKIP rather than abort the whole batch.
+  let inserted = 0;
+  try {
+    const result = await Email.insertMany(docs, { ordered: false, rawResult: true });
+    inserted = result.insertedCount ?? docs.length;
+  } catch (err) {
+    inserted = err.result?.insertedCount ?? err.insertedDocs?.length ?? 0;
+    if (err.code !== 11000 && !err.writeErrors) {
+      logger.error({ err: err.message, inbox: inboxEmail }, 'insertMany failed');
+    }
+  }
+
+  // F-1: `threadPosition` cannot be assigned inside the batch (Gmail does not
+  // hand us a conversation in date order, and two replicas can insert into the
+  // same thread at once), so it is derived from `date` immediately after the
+  // write. Idempotent, and bounded to the threads this batch actually touched.
+  try {
+    await resyncThreadPositions(docs.map((d) => d.threadId));
+  } catch (err) {
+    logger.warn({ err: err.message, inbox: inboxEmail }, 'thread position resync failed');
+  }
+
+  // Tasks for auto-approved assignments, in ONE bulkWrite. Re-queried so the
+  // ids are correct even when part of the insert was skipped as a duplicate.
+  const assignedMessageIds = docs.filter((d) => d.status === 'assigned' && d.assignedTo).map((d) => d.messageId);
+  if (assignedMessageIds.length > 0) {
+    const saved = await Email.find({ messageId: { $in: assignedMessageIds } })
+      .select('_id from subject snippet matchedKeyword fetchedBy assignedTo')
+      .lean();
+    await ensureTasksForEmails(
+      saved
+        .filter((e) => e.assignedTo)
+        .map((e) => ({ email: e, assignedUserId: e.assignedTo, createdById: userId }))
+    );
+  }
+
+  logger.info({ inbox: inboxEmail, inserted, failed }, 'gmail sync finished');
+  return { inbox: inboxEmail, newCount: inserted, failed, scanned: messages.length };
+};
+
+/**
+ * Resolve the credential set for every mailbox on a user document.
+ * @param {Object} user - selected with token fields
+ * @returns {Array<{inboxEmail: String, accessToken: String, refreshToken: String, isPrimary: Boolean}>}
+ */
+const collectMailboxes = (user) => {
+  const mailboxes = [];
+
+  if (user.gmailAccessToken && user.gmailEmail) {
+    // tryDecrypt, not decrypt: one unreadable token must not abort every other
+    // mailbox in the workspace.
+    const accessToken = tryDecrypt(user.gmailAccessToken);
+    if (accessToken) {
+      mailboxes.push({
+        inboxEmail: user.gmailEmail,
+        accessToken,
+        refreshToken: tryDecrypt(user.gmailRefreshToken),
+        isPrimary: true
+      });
+    } else {
+      logger.error({ userId: String(user._id), inbox: user.gmailEmail }, 'primary Gmail token could not be decrypted');
+    }
+  }
+
+  for (const acct of user.linkedGmailAccounts || []) {
+    if (!acct.gmailAccessToken) continue;
+    const accessToken = tryDecrypt(acct.gmailAccessToken);
+    if (!accessToken) {
+      logger.error({ userId: String(user._id), inbox: acct.gmailEmail }, 'linked Gmail token could not be decrypted');
+      continue;
+    }
+    mailboxes.push({
+      inboxEmail: acct.gmailEmail,
+      accessToken,
+      refreshToken: tryDecrypt(acct.gmailRefreshToken),
+      isPrimary: false
+    });
+  }
+
+  return mailboxes;
+};
+
+/**
+ * Sync every mailbox for one user. Runs inside a queue worker, never inside an
+ * HTTP request.
+ *
+ * @param {Object} user - user document selected with token fields
+ * @param {Boolean} [isManual]
+ * @param {Function} [onProgress]
+ * @returns {Promise<Number>} number of new emails
+ */
+const syncUserEmails = async (user, isManual = false, onProgress = null) => {
+  if (!user) throw new Error('Invalid user.');
+
+  const mailboxes = collectMailboxes(user);
+  if (mailboxes.length === 0) return 0;
+
+  // Accounts are independent, so they run concurrently — but bounded, because
+  // each one is already issuing up to GMAIL_SYNC_CONCURRENCY requests.
+  const accountLimit = pLimit(Number(process.env.GMAIL_ACCOUNT_CONCURRENCY || 2));
+
+  const results = await Promise.all(
+    mailboxes.map((mailbox) =>
+      accountLimit(async () => {
+        try {
+          return await syncAccountEmails({ userId: user._id, ...mailbox, onProgress });
+        } catch (err) {
+          logger.error({ err: err.message, inbox: mailbox.inboxEmail }, 'mailbox sync failed');
+          return { inbox: mailbox.inboxEmail, newCount: 0, failed: 0, scanned: 0, error: err.message };
+        }
+      })
+    )
+  );
+
+  const totalNew = results.reduce((sum, r) => sum + r.newCount, 0);
+
+  if (totalNew > 0) {
+    // New mail invalidates every dashboard and report aggregate.
+    await cache.invalidateStats();
+  }
+
+  await logActivity(
+    user._id,
+    isManual ? 'Gmail Fetch' : 'Gmail Fetch Auto',
+    `${isManual ? 'Manually' : 'Automatically'} fetched Gmail emails (Found ${totalNew} new emails)`
+  );
 
   return totalNew;
 };
 
-// Export syncUserEmails for cron job usage
+// Export for the queue worker and the cron job.
 exports.syncUserEmails = syncUserEmails;
 
-// @desc    Manually fetch emails from all connected accounts
+/**
+ * The unit of work the `gmail-sync` queue processes.
+ *
+ * @param {{userId: String, isManual: Boolean}} data
+ * @param {Object} [context] - queue job context
+ * @returns {Promise<{userId: String, newCount: Number}>}
+ */
+exports.runGmailSyncJob = async (data, context) => {
+  const user = await User.findOne({ _id: data.userId, deletedAt: null }).select(
+    '+gmailAccessToken +gmailRefreshToken +linkedGmailAccounts'
+  );
+  if (!user) throw new Error(`User ${data.userId} not found for Gmail sync.`);
+
+  const onProgress = context?.updateProgress
+    ? ({ processed, total }) => {
+        context.updateProgress(total > 0 ? Math.round((processed / total) * 100) : 0);
+      }
+    : null;
+
+  const newCount = await syncUserEmails(user, Boolean(data.isManual), onProgress);
+  return { userId: String(user._id), email: user.email, newCount };
+};
+
+// @desc    Queue a Gmail sync for the caller's connected accounts
 // @route   POST /api/gmail/fetch
-// @access  Private
+// @access  Private (Admin, Head)
+// @returns 202 { message, jobId, jobIds, accepted, status }
 exports.fetchEmails = async (req, res) => {
   try {
-    let totalCount = 0;
+    // The sync no longer runs inline. Sequentially syncing an Admin's ten
+    // connected accounts took four to six minutes inside one HTTP request —
+    // long past every reverse-proxy read timeout (nginx 60s, ALB 60s, Heroku
+    // 30s), so the client saw a 502 while the work carried on server-side.
+    let targets = [];
 
     if (req.user.role === 'Admin') {
-      // Find all users who have a connected Gmail account
-      const users = await User.find({
-        gmailAccessToken: { $ne: null, $ne: "" }
-      }).select('+gmailAccessToken +gmailRefreshToken +linkedGmailAccounts');
-
-      if (users.length > 0) {
-        for (const u of users) {
-          try {
-            console.log(`[MANUAL SYNC] Syncing emails for user: ${u.email}`);
-            const count = await syncUserEmails(u, true);
-            totalCount += count;
-          } catch (syncError) {
-            console.error(`[MANUAL SYNC ERROR] Failed to sync for user ${u.email}:`, syncError);
-          }
-        }
-      }
-    } else if (req.user.role === 'Head') {
-      // Sync only the current Head's own emails
-      const user = await User.findById(req.user._id).select('+gmailAccessToken +gmailRefreshToken +linkedGmailAccounts');
-      if (!user || !user.gmailAccessToken) {
-        return res.status(400).json({ message: 'Gmail account not connected. Please authenticate first.' });
-      }
-      totalCount = await syncUserEmails(user, true);
+      targets = await User.find({
+        deletedAt: null,
+        $or: [
+          { gmailAccessToken: { $exists: true, $nin: [null, ''] } },
+          { 'linkedGmailAccounts.0': { $exists: true } }
+        ]
+      })
+        .select('_id email')
+        .lean();
     } else {
-      const user = await User.findById(req.user._id).select('+gmailAccessToken +gmailRefreshToken +linkedGmailAccounts');
-      if (!user || !user.gmailAccessToken) {
-        console.log('Fetch abort: user or gmailAccessToken missing in DB.');
+      const user = await User.findOne({ _id: req.user._id, deletedAt: null })
+        .select('_id email gmailAccessToken +linkedGmailAccounts')
+        .lean();
+      if (!user || (!user.gmailAccessToken && !(user.linkedGmailAccounts || []).length)) {
         return res.status(400).json({ message: 'Gmail account not connected. Please authenticate first.' });
       }
-      totalCount = await syncUserEmails(user, true);
+      targets = [user];
     }
 
-    return res.status(200).json({
-      message: 'Emails fetched successfully from all connected accounts',
-      count: totalCount
+    if (targets.length === 0) {
+      return res.status(400).json({ message: 'No connected Gmail accounts found to synchronise.' });
+    }
+
+    // enqueueUnique makes a double-clicked "Fetch" idempotent: the second click
+    // gets the id of the job the first one started instead of racing it.
+    const jobs = [];
+    for (const target of targets) {
+      jobs.push(
+        await queue.enqueueUnique(
+          queue.QUEUES.GMAIL_SYNC,
+          String(target._id),
+          { userId: String(target._id), isManual: true, requestedBy: String(req.user._id) },
+          { attempts: Number(process.env.GMAIL_JOB_ATTEMPTS || 3), backoffMs: 10000 }
+        )
+      );
+    }
+
+    return res.status(202).json({
+      message: `Gmail sync queued for ${jobs.length} account holder(s). Poll GET /api/gmail/sync/:jobId for progress.`,
+      status: 'queued',
+      accepted: jobs.length,
+      jobId: jobs[0].jobId,
+      jobIds: jobs.map((j) => j.jobId),
+      deduped: jobs.every((j) => j.deduped)
     });
   } catch (error) {
-    console.error('Error in fetchEmails:', error);
-    return res.status(500).json({ message: 'Server error. Failed to retrieve emails.' });
+    logger.error({ err: error.message, stack: error.stack }, 'failed to queue Gmail sync');
+    return res.status(500).json({ message: 'Server error. Failed to queue the email sync.' });
   }
 };
 
+// @desc    Poll the status of a queued Gmail sync
+// @route   GET /api/gmail/sync/:jobId
+// @access  Private (Admin, Head)
+exports.getSyncJobStatus = async (req, res) => {
+  try {
+    const status = await queue.getJobStatus(req.params.jobId);
+    if (!status) {
+      return res.status(404).json({ message: 'Sync job not found or expired.' });
+    }
+
+    return res.status(200).json({
+      jobId: status.jobId,
+      // 'queued' | 'active' | 'completed' | 'failed'
+      status: status.state,
+      progress: status.progress || 0,
+      attempts: status.attemptsMade,
+      // Present only once state === 'completed'.
+      newEmails: status.result?.newCount ?? null,
+      error: status.error || null,
+      createdAt: status.createdAt,
+      finishedAt: status.finishedAt
+    });
+  } catch (error) {
+    logger.error({ err: error.message }, 'failed to read sync job status');
+    return res.status(500).json({ message: 'Server error. Failed to read sync status.' });
+  }
+};
+
+// @desc    List emails (paginated per docs/audits/API-LIST-CONTRACT.md)
+// @route   GET /api/gmail/emails
+// @access  Private (Admin, Head)
 exports.getEmails = async (req, res) => {
   try {
-    const { q } = req.query;
-    let query = {};
+    // F-1: conversation mode is OPT-IN. `?group=thread` delegates to the thread
+    // list; anything else keeps the exact message-level response the rebuilt
+    // inbox already consumes.
+    if (firstStringOf(req.query.group, 20).toLowerCase() === 'thread') {
+      return exports.getThreads(req, res);
+    }
+
+    const params = parseListParams(req, {
+      sortWhitelist: EMAIL_SORT_FIELDS,
+      defaultSort: '-date',
+      tiebreaker: '_id'
+    });
+
+    const filter = { ...NOT_DELETED };
+
+    // F-1: replies we sent are now persisted as Email rows. They must NOT
+    // appear in the message list by default — before F-1 the collection held
+    // inbound mail only, and the inbox is finished work. `?direction=outbound`
+    // or `?direction=all` opts in.
+    const direction = firstStringOf(req.query.direction, 20).toLowerCase();
+    if (direction === 'inbound' || direction === 'outbound') filter.direction = direction;
+    else if (direction !== 'all') filter.direction = { $ne: 'outbound' };
 
     if (req.user.role === 'Employee') {
-      query.assignedTo = req.user._id;
+      filter.assignedTo = req.user._id;
     } else if (req.user.role === 'Head') {
-      query.fetchedBy = req.user._id;
+      filter.fetchedBy = req.user._id;
     }
 
-    // If search query provided, add text search across subject and from fields
-    if (q && q.trim()) {
-      const searchRegex = new RegExp(escapeRegex(q.trim()), 'i');
-      const searchConditions = [
-        { subject: searchRegex },
-        { from: searchRegex }
-      ];
-      // Merge with existing role filter
-      if (query.assignedTo) {
-        query = { assignedTo: query.assignedTo, $or: searchConditions };
-      } else if (query.fetchedBy) {
-        query = { fetchedBy: query.fetchedBy, $or: searchConditions };
-      } else {
-        query.$or = searchConditions;
-      }
+    // Additive, endpoint-specific filters.
+    const { firstString } = require('../utils/paginate');
+    const status = firstString(req.query.status, 20);
+    if (status === 'assigned' || status === 'unassigned') filter.status = status;
+
+    const approvalStatus = firstString(req.query.approvalStatus, 20);
+    if (['none', 'pending', 'approved', 'rejected'].includes(approvalStatus)) {
+      filter.approvalStatus = approvalStatus;
     }
 
-    const emails = await Email.find(query)
-      .populate('assignedTo', 'name email')
-      .populate('fetchedBy', 'name email gmailEmail')
-      .sort({ date: -1 });
+    const accountEmail = firstString(req.query.accountEmail, 254);
+    if (accountEmail) filter.toEmail = accountEmail;
 
-    return res.status(200).json(emails);
+    // S-16: real read/unread filter. `?read=false` is the unread inbox.
+    // Served by the {deletedAt, 'readBy.user', date} compound index.
+    const read = firstString(req.query.read, 10).toLowerCase();
+    if (read === 'true') filter['readBy.user'] = req.user._id;
+    else if (read === 'false') filter['readBy.user'] = { $ne: req.user._id };
+
+    // Date range. `dateFrom`/`dateTo` is the contract (API-LIST-CONTRACT.md):
+    // on THIS endpoint `from` means the SENDER, so it cannot also mean a date.
+    // The legacy `from`/`to` date spelling is still accepted as a fallback, but
+    // only when it parses as a date and no `dateFrom`/`dateTo` was supplied.
+    const dateFrom = firstString(req.query.dateFrom, 40);
+    const dateTo = firstString(req.query.dateTo, 40);
+    const legacyFrom = firstString(req.query.from, 60);
+    const legacyTo = firstString(req.query.to, 60);
+
+    const range = {};
+    const lower = dateFrom || (legacyFrom && !Number.isNaN(Date.parse(legacyFrom)) ? legacyFrom : '');
+    const upper = dateTo || (legacyTo && !Number.isNaN(Date.parse(legacyTo)) ? legacyTo : '');
+    if (lower && !Number.isNaN(Date.parse(lower))) range.$gte = new Date(lower);
+    if (upper && !Number.isNaN(Date.parse(upper))) range.$lte = new Date(upper);
+    if (Object.keys(range).length > 0) filter.date = range;
+
+    // `from` as SENDER — the contract's meaning on this endpoint. Only applied
+    // when it is not a date, so the legacy spelling above keeps working.
+    if (legacyFrom && Number.isNaN(Date.parse(legacyFrom))) {
+      filter.from = new RegExp(escapeRegex(legacyFrom), 'i');
+    }
+
+    // Free-text search over subject and sender. Deliberately still a regex
+    // rather than a $text index: `$text` matches whole words only, and the
+    // current UI contract is substring search. The cost is now bounded because
+    // the projection no longer drags every multi-megabyte body along.
+    if (params.q) {
+      const searchRegex = new RegExp(escapeRegex(params.q), 'i');
+      filter.$and = [{ $or: [{ subject: searchRegex }, { from: searchRegex }] }];
+    }
+
+    const { data, pagination } = await paginate(Email, filter, params, {
+      // NEVER `body`. See API-LIST-CONTRACT.md rule 1.
+      select: EMAIL_LIST_FIELDS,
+      populate: [
+        { path: 'assignedTo', select: 'name email' },
+        { path: 'fetchedBy', select: 'name email gmailEmail' },
+        { path: 'suggestedAssignedTo', select: 'name email role' }
+      ]
+    });
+
+    // S-16: `isRead` is derived per-request for the CALLER, never stored as a
+    // flat flag on the document.
+    return listResponse(res, {
+      params,
+      data: data.map((email) => deriveIsRead(email, req.user._id)),
+      pagination
+    });
   } catch (error) {
-    console.error('Error in getEmails:', error);
+    logger.error({ err: error.message, stack: error.stack }, 'getEmails failed');
     return res.status(500).json({ message: 'Server error. Failed to query emails.' });
   }
+};
+
+// Ceiling on the thread-id set resolved by a message-level narrowing filter
+// (`q` / date range). Beyond this the count is reported as the cap; the
+// alternative is an unbounded `$in`.
+const THREAD_MATCH_CAP = Number(process.env.THREAD_MATCH_CAP || 2000);
+
+/**
+ * Resolve the thread ids whose MESSAGES match a narrowing filter.
+ *
+ * `q` and the date range select messages, but the response is one row per
+ * THREAD. Applying them straight into the grouping pipeline would silently
+ * redefine `messageCount` as "messages that matched your search", so they are
+ * resolved to a thread-id set first and the counters are then computed over the
+ * whole conversation.
+ *
+ * @param {Object} baseMatch
+ * @param {Object} narrowing
+ * @returns {Promise<String[]>}
+ */
+const resolveMatchingThreadIds = async (baseMatch, narrowing) => {
+  const rows = await Email.aggregate([
+    { $match: { ...baseMatch, ...narrowing } },
+    { $group: { _id: '$threadId' } },
+    { $limit: THREAD_MATCH_CAP }
+  ]);
+  return rows.map((r) => r._id).filter(Boolean);
+};
+
+// @desc    List conversations, one row per thread
+// @route   GET /api/gmail/threads   (also GET /api/gmail/emails?group=thread)
+// @access  Private (Admin, Head — same gate as GET /api/gmail/emails)
+//
+// F-1. Follows docs/audits/API-LIST-CONTRACT.md exactly: `page`/`limit`/`sort`/
+// `q`, the `{data, pagination}` envelope when `page` is present, and the bare
+// array capped at LIST_LEGACY_CAP when it is not.
+exports.getThreads = async (req, res) => {
+  try {
+    const params = parseListParams(req, {
+      sortWhitelist: THREAD_SORT_FIELDS,
+      defaultSort: '-lastMessageAt',
+      // `_id` does not survive the projection; the thread id is the stable
+      // tiebreaker for a page boundary.
+      tiebreaker: 'threadId'
+    });
+
+    // Ownership scoping is applied INSIDE the pipeline, exactly as on
+    // GET /emails/:id. A Head can never observe a thread on a mailbox they do
+    // not own, not even transiently.
+    const baseMatch = {
+      ...NOT_DELETED,
+      ...threadScopeFilter(req.user),
+      threadId: { $nin: [null, ''] }
+    };
+
+    const accountEmail = firstStringOf(req.query.accountEmail, 254);
+    if (accountEmail) baseMatch.toEmail = accountEmail;
+
+    // Message-level narrowing filters, resolved to a thread-id set first.
+    const narrowing = {};
+    const dateFrom = firstStringOf(req.query.dateFrom, 40);
+    const dateTo = firstStringOf(req.query.dateTo, 40);
+    const range = {};
+    if (dateFrom && !Number.isNaN(Date.parse(dateFrom))) range.$gte = new Date(dateFrom);
+    if (dateTo && !Number.isNaN(Date.parse(dateTo))) range.$lte = new Date(dateTo);
+    if (Object.keys(range).length > 0) narrowing.date = range;
+
+    if (params.q) {
+      const searchRegex = new RegExp(escapeRegex(params.q), 'i');
+      narrowing.$or = [{ subject: searchRegex }, { from: searchRegex }];
+    }
+
+    if (Object.keys(narrowing).length > 0) {
+      const ids = await resolveMatchingThreadIds(baseMatch, narrowing);
+      if (ids.length === 0) {
+        return listResponse(res, {
+          params,
+          data: [],
+          pagination: params.paginated ? buildPagination(params, 0) : null
+        });
+      }
+      baseMatch.threadId = { $in: ids };
+    }
+
+    const postGroup = [];
+    // Backlog / "needs an answer" view, and what the SLA breach list links to.
+    if (firstStringOf(req.query.unanswered, 10).toLowerCase() === 'true') {
+      postGroup.push({ $match: { hasUnansweredInbound: true } });
+    }
+    if (firstStringOf(req.query.unread, 10).toLowerCase() === 'true') {
+      postGroup.push({ $match: { unreadCount: { $gt: 0 } } });
+    }
+
+    const pipeline = [
+      { $match: baseMatch },
+      threadGroupStage(req.user._id),
+      projectThreadStage(),
+      ...postGroup,
+      {
+        $facet: {
+          rows: [{ $sort: params.sort }, { $skip: params.skip }, { $limit: params.limit }],
+          total: [{ $count: 'value' }]
+        }
+      }
+    ];
+
+    const [result] = await Email.aggregate(pipeline).allowDiskUse(true);
+    const data = result?.rows || [];
+    const total = result?.total?.[0]?.value || 0;
+
+    res.set('Cache-Control', 'private, max-age=15, stale-while-revalidate=60');
+
+    return listResponse(res, {
+      params,
+      data,
+      pagination: params.paginated ? buildPagination(params, total) : null
+    });
+  } catch (error) {
+    logger.error({ err: error.message, stack: error.stack }, 'getThreads failed');
+    return res.status(500).json({ message: 'Server error. Failed to query conversations.' });
+  }
+};
+
+// @desc    One conversation, ordered oldest-first, INCLUDING message bodies
+// @route   GET /api/gmail/threads/:threadId
+// @access  Private (all roles, subject to the same object-level authorization
+//          as GET /api/gmail/emails/:id)
+exports.getThreadById = async (req, res) => {
+  try {
+    const threadId = String(req.params.threadId || '').slice(0, 200);
+    if (!threadId) return res.status(400).json({ message: 'A thread id is required.' });
+
+    const messages = await Email.find({ threadId, ...NOT_DELETED })
+      // The ONLY thread route that opts into bodies. The list above carries a
+      // snippet, per API-LIST-CONTRACT.md rule 1.
+      .select(`${EMAIL_LIST_FIELDS} +body`)
+      .populate('assignedTo', 'name email')
+      .populate('fetchedBy', 'name email gmailEmail')
+      .populate('sentBy', 'name email')
+      .sort({ date: 1, _id: 1 })
+      .limit(THREAD_MESSAGE_CAP)
+      .lean();
+
+    if (messages.length === 0) return res.status(404).json({ message: 'Conversation not found.' });
+
+    // Identical rule to GET /emails/:id, applied per message: a Head must not
+    // read a thread on an inbox they do not own.
+    const visible = messages.filter((m) => canAccessEmail(m, req.user));
+    if (visible.length === 0) {
+      return res.status(403).json({ message: 'Access denied. This conversation is not in your mailbox.' });
+    }
+
+    const inbound = visible.filter((m) => m.direction !== 'outbound');
+    const outbound = visible.filter((m) => m.direction === 'outbound');
+    const at = (list, pick) => (list.length === 0 ? null : pick(list.map((m) => m.date).filter(Boolean)));
+    const minDate = (dates) => (dates.length ? new Date(Math.min(...dates.map((d) => new Date(d)))) : null);
+    const maxDate = (dates) => (dates.length ? new Date(Math.max(...dates.map((d) => new Date(d)))) : null);
+
+    const firstInboundAt = at(inbound, minDate);
+    const lastInboundAt = at(inbound, maxDate);
+    const firstOutboundAt = at(outbound, minDate);
+    const lastOutboundAt = at(outbound, maxDate);
+    const latest = visible[visible.length - 1];
+
+    return res.status(200).json({
+      threadId,
+      subject: latest.subject || '',
+      participants: [...new Set(visible.map((m) => m.from).filter(Boolean))],
+      accountEmail: latest.toEmail || '',
+      clientId: visible.find((m) => m.clientId)?.clientId || null,
+      messageCount: visible.length,
+      inboundCount: inbound.length,
+      outboundCount: outbound.length,
+      unreadCount: visible.filter((m) => !deriveIsRead(m, req.user._id).isRead).length,
+      firstMessageAt: visible[0]?.date || null,
+      lastMessageAt: latest.date || null,
+      firstInboundAt,
+      lastInboundAt,
+      firstOutboundAt,
+      lastOutboundAt,
+      lastDirection: latest.direction || 'inbound',
+      // Same derivation as the list row, so the two surfaces cannot disagree.
+      hasUnansweredInbound: Boolean(
+        lastInboundAt && (!lastOutboundAt || new Date(lastOutboundAt) < new Date(lastInboundAt))
+      ),
+      firstResponseAt: firstOutboundAt,
+      firstResponseMinutes:
+        firstInboundAt && firstOutboundAt && new Date(firstOutboundAt) >= new Date(firstInboundAt)
+          ? Math.round(((new Date(firstOutboundAt) - new Date(firstInboundAt)) / 60000) * 10) / 10
+          : null,
+      truncated: messages.length >= THREAD_MESSAGE_CAP,
+      // Oldest first, so the reading pane renders newest last.
+      messages: visible.map((m) => deriveIsRead(sanitizeEmailDoc(m), req.user._id))
+    });
+  } catch (error) {
+    logger.error({ err: error.message, stack: error.stack }, 'getThreadById failed');
+    return res.status(500).json({ message: 'Server error. Failed to load the conversation.' });
+  }
+};
+
+// @desc    Get a single email INCLUDING its body
+// @route   GET /api/gmail/emails/:id
+// @access  Private (all roles, subject to object-level authorization)
+exports.getEmailById = async (req, res) => {
+  try {
+    // `+body` is the only opt-in to the (potentially multi-megabyte) body in the
+    // whole codebase's read path.
+    const email = await Email.findOne({ _id: req.params.id, ...NOT_DELETED })
+      .select(`${EMAIL_LIST_FIELDS} +body`)
+      .populate('assignedTo', 'name email')
+      .populate('fetchedBy', 'name email gmailEmail')
+      .populate('suggestedAssignedTo', 'name email role')
+      .lean();
+
+    if (!email) {
+      return res.status(404).json({ message: 'Email not found.' });
+    }
+
+    if (!canAccessEmail(email, req.user)) {
+      return res.status(403).json({ message: 'Access denied. This email is not in your mailbox.' });
+    }
+
+    // Defence in depth: bodies stored before ingest-time sanitization existed
+    // are cleaned on the way out too.
+    //
+    // NOTE: opening an email does NOT implicitly mark it read. Marking is an
+    // explicit PATCH, so a prefetch or a bot cannot silently clear the badge.
+    return res.status(200).json(deriveIsRead(sanitizeEmailDoc(email), req.user._id));
+  } catch (error) {
+    logger.error({ err: error.message }, 'getEmailById failed');
+    return res.status(500).json({ message: 'Server error. Failed to load the email.' });
+  }
+};
+
+/**
+ * Apply a read/unread change to a set of emails the caller is allowed to touch.
+ *
+ * Shared by the single and bulk endpoints so the ownership rule cannot drift
+ * between them. Authorization is `canAccessEmail`, exactly as for read and
+ * delete: an id the caller cannot see is reported as `forbidden`, never acted
+ * on, and never silently skipped.
+ *
+ * @param {String[]} ids
+ * @param {Object} user - req.user
+ * @param {Boolean} read
+ * @returns {Promise<{results: Array, updated: Number}>}
+ */
+const applyReadState = async (ids, user, read) => {
+  // Only the fields the authorization check and the response need.
+  const emails = await Email.find({ _id: { $in: ids }, ...NOT_DELETED })
+    .select('_id subject fetchedBy assignedTo readBy')
+    .lean();
+
+  const byId = new Map(emails.map((e) => [String(e._id), e]));
+  const actionable = [];
+  const results = [];
+
+  for (const id of ids) {
+    const email = byId.get(id);
+    if (!email) {
+      results.push({ id, ok: false, status: 404, message: 'Email not found.' });
+      continue;
+    }
+    if (!canAccessEmail(email, user)) {
+      results.push({ id, ok: false, status: 403, message: 'This email is not in your mailbox.' });
+      continue;
+    }
+    actionable.push(email);
+    results.push({ id, ok: true, status: 200, isRead: read });
+  }
+
+  if (actionable.length > 0) {
+    const actionableIds = actionable.map((e) => e._id);
+    if (read) {
+      // `$ne` in the filter makes this idempotent: re-marking an already-read
+      // email is a no-op rather than a duplicate array entry.
+      await Email.updateMany(
+        { _id: { $in: actionableIds }, 'readBy.user': { $ne: user._id } },
+        { $push: { readBy: { user: user._id, readAt: new Date() } } }
+      );
+    } else {
+      await Email.updateMany(
+        { _id: { $in: actionableIds } },
+        { $pull: { readBy: { user: user._id } } }
+      );
+    }
+  }
+
+  return { results, updated: actionable.length };
+};
+
+// @desc    Mark a single email read/unread for the calling user
+// @route   PATCH /api/gmail/emails/:id/read
+// @access  Private (all roles, subject to object-level authorization)
+//
+// WAVE2 gap S-16. Body: { "read": true }  (defaults to true when omitted).
+exports.markEmailRead = async (req, res) => {
+  try {
+    const id = String(req.params.id || '');
+    if (!OBJECT_ID_RE.test(id)) {
+      return res.status(400).json({ message: 'Invalid email ID.' });
+    }
+
+    const read = req.body?.read === undefined ? true : Boolean(req.body.read);
+    const { results } = await applyReadState([id], req.user, read);
+    const result = results[0];
+
+    if (!result.ok) {
+      return res.status(result.status).json({ message: result.message });
+    }
+
+    return res.status(200).json({ message: read ? 'Email marked as read.' : 'Email marked as unread.', _id: id, isRead: read });
+  } catch (error) {
+    logger.error({ err: error.message }, 'markEmailRead failed');
+    return res.status(500).json({ message: 'Server error. Failed to update read state.' });
+  }
+};
+
+// @desc    Mark many emails read/unread for the calling user
+// @route   PATCH /api/gmail/emails/read
+// @access  Private (all roles, subject to object-level authorization)
+//
+// WAVE2 gap S-16. Body: { "ids": ["..."], "read": true }
+// Returns PER-ID results so a partial failure is reportable, rather than one
+// status for the whole batch.
+exports.bulkMarkEmailsRead = async (req, res) => {
+  try {
+    const { ids, error } = parseEmailIds(req.body?.ids);
+    if (error) return res.status(400).json({ message: error });
+
+    const read = req.body?.read === undefined ? true : Boolean(req.body.read);
+    const { results, updated } = await applyReadState(ids, req.user, read);
+
+    return res.status(200).json({
+      message: `${updated} of ${ids.length} email(s) marked as ${read ? 'read' : 'unread'}.`,
+      read,
+      updated,
+      failed: ids.length - updated,
+      results
+    });
+  } catch (error) {
+    logger.error({ err: error.message }, 'bulkMarkEmailsRead failed');
+    return res.status(500).json({ message: 'Server error. Failed to update read state.' });
+  }
+};
+
+// @desc    Bulk soft-delete emails by id
+// @route   DELETE /api/gmail/emails   (body: { "ids": [...] })
+// @access  Private (Admin, Head — same ownership scoping as the single delete)
+//
+// WAVE2 gap S-15. The client previously fanned out N x DELETE
+// /api/gmail/emails/:id via Promise.allSettled. Per-id results are returned so
+// that partial-failure reporting survives the collapse into one request.
+exports.bulkDeleteEmails = async (req, res) => {
+  try {
+    const { ids, error } = parseEmailIds(req.body?.ids);
+    if (error) return res.status(400).json({ message: error });
+
+    const emails = await Email.find({ _id: { $in: ids }, ...NOT_DELETED })
+      .select('_id subject fetchedBy assignedTo status')
+      .lean();
+
+    const byId = new Map(emails.map((e) => [String(e._id), e]));
+    const deletable = [];
+    const results = [];
+
+    for (const id of ids) {
+      const email = byId.get(id);
+      if (!email) {
+        results.push({ id, ok: false, status: 404, message: 'Email not found.' });
+        continue;
+      }
+      // Identical object-level check to deleteSingleEmail — a Head must not be
+      // able to destroy the Admin's or another Head's mail by enumerating ids.
+      if (!canAccessEmail(email, req.user)) {
+        results.push({ id, ok: false, status: 403, message: 'This email is not in your mailbox.' });
+        continue;
+      }
+      deletable.push(email);
+      results.push({ id, ok: true, status: 200 });
+    }
+
+    if (deletable.length > 0) {
+      const deletableIds = deletable.map((e) => e._id);
+      // Soft delete, consistent with the single-email path.
+      await Email.updateMany(
+        { _id: { $in: deletableIds } },
+        { $set: { deletedAt: new Date(), deletedBy: req.user._id, status: 'unassigned', assignedTo: null } }
+      );
+      await Task.updateMany({ linkedEmail: { $in: deletableIds } }, { $set: { linkedEmail: null } });
+      await cache.invalidateStats();
+
+      await logActivity(
+        req.user._id,
+        'Gmail Bulk Delete',
+        `Deleted ${deletable.length} of ${ids.length} email(s)`,
+        {
+          req,
+          targetType: 'Email',
+          targetId: deletableIds.length === 1 ? deletableIds[0] : null,
+          targetLabel: `${deletable.length} email(s)`,
+          before: { requested: ids.length },
+          after: { deleted: deletable.length, failed: ids.length - deletable.length }
+        }
+      );
+    }
+
+    return res.status(200).json({
+      message: `${deletable.length} of ${ids.length} email(s) deleted.`,
+      deleted: deletable.length,
+      failed: ids.length - deletable.length,
+      results
+    });
+  } catch (error) {
+    logger.error({ err: error.message }, 'bulkDeleteEmails failed');
+    return res.status(500).json({ message: 'Server error. Failed to delete emails.' });
+  }
+};
+
+// @desc    DELETE /api/gmail/emails dispatcher
+// @route   DELETE /api/gmail/emails
+// @access  Private (Admin always; Head only for the id-scoped bulk form)
+//
+// One path, two behaviours, because the "clear all" route already owned this
+// URL and the client still calls it:
+//
+//   body { ids: [...] }  -> bulk soft-delete, ownership-scoped   (Admin, Head)
+//   body absent/empty    -> clear the whole workspace inbox      (Admin only)
+exports.deleteEmailsDispatch = async (req, res) => {
+  const ids = req.body?.ids;
+  if (Array.isArray(ids)) {
+    return exports.bulkDeleteEmails(req, res);
+  }
+  if (req.user.role !== 'Admin') {
+    return res.status(403).json({
+      message: 'Access denied. Clearing the entire inbox is an Admin action. Send { "ids": [...] } to delete specific emails.'
+    });
+  }
+  return exports.deleteAllEmails(req, res);
 };
 
 // @desc    Delete all emails (Admin only)
@@ -586,17 +1647,24 @@ exports.getEmails = async (req, res) => {
 // @access  Private (Admin only)
 exports.deleteAllEmails = async (req, res) => {
   try {
-    const result = await Email.deleteMany({});
+    // Soft delete, consistent with deleteSingleEmail — a single Admin click must
+    // not be able to irrecoverably destroy the entire mail corpus.
+    const result = await Email.updateMany(
+      { ...NOT_DELETED },
+      { $set: { deletedAt: new Date(), deletedBy: req.user._id, status: 'unassigned', assignedTo: null } }
+    );
     await Task.updateMany({ linkedEmail: { $ne: null } }, { $set: { linkedEmail: null } });
-    
-    await logActivity(req.user._id, 'Gmail Delete All', `Cleared all emails (${result.deletedCount} emails deleted)`);
+    await cache.invalidateStats();
+
+    await logActivity(req.user._id, 'Gmail Delete All', `Cleared all emails (${result.modifiedCount} emails deleted)`);
 
     return res.status(200).json({
       message: "All emails cleared",
-      count: result.deletedCount
+      // Response shape preserved: the client reads `count`.
+      count: result.modifiedCount
     });
   } catch (error) {
-    console.error('Error in deleteAllEmails:', error);
+    logger.error({ err: error.message }, 'deleteAllEmails failed');
     return res.status(500).json({ message: 'Server error. Failed to clear emails.' });
   }
 };
@@ -607,19 +1675,44 @@ exports.deleteAllEmails = async (req, res) => {
 exports.deleteSingleEmail = async (req, res) => {
   try {
     const emailId = req.params.id;
-    const email = await Email.findById(emailId);
+    // Projection: the authorization check and the audit line need five fields,
+    // not a multi-megabyte body.
+    const email = await Email.findOne({ _id: emailId, ...NOT_DELETED }).select(
+      '_id subject fetchedBy assignedTo status'
+    );
     if (!email) {
       return res.status(404).json({ message: "Email not found" });
     }
-    
-    await Email.findByIdAndDelete(emailId);
+
+    // Object-level authorization: a Head could previously enumerate ids and
+    // permanently destroy the Admin's or another Head's mail.
+    if (!canAccessEmail(email, req.user)) {
+      return res.status(403).json({ message: 'Access denied. This email is not in your mailbox.' });
+    }
+
+    // Soft delete, so the record and its body remain recoverable and linked
+    // Tasks do not silently lose their evidence.
+    email.deletedAt = new Date();
+    email.deletedBy = req.user._id;
+    email.status = 'unassigned';
+    email.assignedTo = null;
+    await email.save();
+
     await Task.updateMany({ linkedEmail: emailId }, { $set: { linkedEmail: null } });
-    
-    await logActivity(req.user._id, 'Gmail Delete Single', `Deleted email: "${email.subject}"`);
+    await cache.invalidateStats();
+
+    await logActivity(req.user._id, 'Gmail Delete Single', `Deleted email: "${email.subject}"`, {
+      req,
+      targetType: 'Email',
+      targetId: emailId,
+      targetLabel: email.subject || '(no subject)',
+      before: { status: 'active' },
+      after: { deletedAt: email.deletedAt }
+    });
 
     return res.status(200).json({ message: "Email deleted" });
   } catch (error) {
-    console.error('Error in deleteSingleEmail:', error);
+    logger.error({ err: error.message }, 'deleteSingleEmail failed');
     return res.status(500).json({ message: 'Server error. Failed to delete email.' });
   }
 };
@@ -629,10 +1722,13 @@ exports.deleteSingleEmail = async (req, res) => {
 // @access  Private
 exports.getConnectedStatus = async (req, res) => {
   try {
-    // Clean up duplicates and blanks first
-    await deduplicateConnections();
-
-    const currentUser = await User.findById(req.user._id).select('+gmailAccessToken +linkedGmailAccounts');
+    // NOTE: deduplicateConnections() used to run here. A GET must never mutate:
+    // it hard-deleted OAuth tokens for whichever user MongoDB happened to
+    // return second, on every dashboard poll, with no audit trail. It is now an
+    // explicit Admin action (POST /api/gmail/deduplicate).
+    const currentUser = await User.findById(req.user._id)
+      .select('_id name role gmailEmail +gmailAccessToken +linkedGmailAccounts')
+      .lean();
     if (!currentUser) {
       return res.status(404).json({ message: "User not found" });
     }
@@ -656,8 +1752,11 @@ exports.getConnectedStatus = async (req, res) => {
       // Find other users with connected accounts
       const otherUsers = await User.find({
         _id: { $ne: currentUser._id },
-        gmailAccessToken: { $ne: null, $ne: "" }
-      }).select('+gmailAccessToken +linkedGmailAccounts');
+        deletedAt: null,
+        gmailAccessToken: { $nin: [null, ''] }
+      })
+        .select('_id name gmailEmail +gmailAccessToken +linkedGmailAccounts')
+        .lean();
 
       for (const u of otherUsers) {
         // Add their primary account
@@ -685,10 +1784,13 @@ exports.getConnectedStatus = async (req, res) => {
     return res.status(200).json({
       connected: isConnected,
       gmailEmail: currentUser.gmailEmail || "",
+      // The Profile page reads `.email`; both keys are returned so the
+      // "Inbox Address" field is no longer blank regardless of which is used.
+      email: currentUser.gmailEmail || "",
       linkedAccounts
     });
   } catch (error) {
-    console.error('Error in getConnectedStatus:', error);
+    logger.error({ err: error.message }, 'getConnectedStatus failed');
     return res.status(500).json({ message: 'Server error. Failed to check connected status.' });
   }
 };
@@ -752,19 +1854,42 @@ exports.disconnectLinkedAccount = async (req, res) => {
       return res.status(404).json({ message: 'Linked account not found.' });
     }
 
-    // Delete all emails fetched from this account (identified by toEmail or fetchedBy)
-    const emailsToDelete = await Email.find({ toEmail: gmailEmail, fetchedBy: targetUserId });
-    const emailIds = emailsToDelete.map(e => e._id);
-    await Email.deleteMany({ toEmail: gmailEmail, fetchedBy: targetUserId });
+    // Soft-delete all emails fetched from this account (identified by toEmail or
+    // fetchedBy), consistent with deleteSingleEmail — disconnecting an account
+    // must not irrecoverably destroy its mail history.
+    //
+    // `.distinct('_id')` instead of loading full documents: the previous
+    // `Email.find(...)` pulled every body (base64 images included) into memory
+    // purely to map over `_id`.
+    const scope = { toEmail: gmailEmail, fetchedBy: targetUserId, ...NOT_DELETED };
+    const emailIds = await Email.distinct('_id', scope);
+
+    await Email.updateMany(scope, {
+      $set: { deletedAt: new Date(), deletedBy: req.user._id, status: 'unassigned', assignedTo: null }
+    });
     if (emailIds.length > 0) {
       await Task.updateMany({ linkedEmail: { $in: emailIds } }, { $set: { linkedEmail: null } });
     }
+    await cache.del(cache.KEYS.gmailToken(String(targetUserId), gmailEmail));
+    await cache.invalidateStats();
 
-    await logActivity(req.user._id, 'Gmail Unlink Account', `Unlinked Gmail account ${gmailEmail} of user ${user.email}`);
+    await logActivity(
+      req.user._id,
+      'Gmail Unlink Account',
+      `Unlinked Gmail account ${gmailEmail} of user ${user.email}`,
+      {
+        req,
+        targetType: 'User',
+        targetId: targetUserId,
+        targetLabel: user.email,
+        before: { gmailAccount: gmailEmail, isPrimary },
+        after: { gmailAccount: null, emailsSoftDeleted: emailIds.length }
+      }
+    );
 
     return res.status(200).json({ message: `${gmailEmail} disconnected successfully.` });
   } catch (error) {
-    console.error('Error in disconnectLinkedAccount:', error);
+    logger.error({ err: error.message }, 'disconnectLinkedAccount failed');
     return res.status(500).json({ message: 'Server error. Failed to disconnect linked account.' });
   }
 };
@@ -786,12 +1911,14 @@ exports.disconnectGmail = async (req, res) => {
     user.gmailEmail = "";
     await user.save();
 
-    // 2. Find all emails fetched by this user
-    const emailsToDelete = await Email.find({ fetchedBy: userId });
-    const emailIds = emailsToDelete.map(e => e._id);
+    // 2. Collect the affected ids WITHOUT materialising the documents.
+    const scope = { fetchedBy: userId, ...NOT_DELETED };
+    const emailIds = await Email.distinct('_id', scope);
 
-    // 3. Delete the emails from collection
-    await Email.deleteMany({ fetchedBy: userId });
+    // 3. Soft-delete the emails (recoverable, consistent with deleteSingleEmail)
+    await Email.updateMany(scope, {
+      $set: { deletedAt: new Date(), deletedBy: userId, status: 'unassigned', assignedTo: null }
+    });
 
     // 4. Update tasks that had linkedEmail in those emailIds
     if (emailIds.length > 0) {
@@ -801,65 +1928,198 @@ exports.disconnectGmail = async (req, res) => {
       );
     }
 
+    await cache.delPrefix(`gtok:${String(userId)}:`);
+    await cache.invalidateStats();
+
     await logActivity(userId, 'Gmail Disconnect', `Disconnected Gmail account for user ${user.email}`);
 
     return res.status(200).json({ message: "Gmail disconnected successfully" });
   } catch (error) {
-    console.error('Error in disconnectGmail:', error);
+    logger.error({ err: error.message }, 'disconnectGmail failed');
     return res.status(500).json({ message: 'Server error. Failed to disconnect Gmail.' });
   }
 };
 
-// Workspace-wide deduplication and cleanup helper
-const deduplicateConnections = async () => {
-  try {
-    const users = await User.find({}).select('+gmailAccessToken +gmailRefreshToken +linkedGmailAccounts');
-    const seenEmails = new Set();
+/**
+ * Workspace-wide Gmail connection de-duplication.
+ *
+ * Rewritten to be safe. The previous version ran on every `GET /api/gmail/status`
+ * with `User.find({})` and no `.sort()`, so which user lost their tokens was
+ * decided by MongoDB's natural order and could flip between requests, producing
+ * an oscillating connected/disconnected state with no notification and no audit
+ * entry.
+ *
+ * Guarantees now:
+ *  - Deterministic ordering (createdAt, then _id). The EARLIEST connector of an
+ *    address is its legitimate owner and is never touched.
+ *  - Only blank entries and genuine duplicates held by a LATER claimant are
+ *    removed.
+ *  - Every single change writes an ActivityLog entry.
+ *  - Supports a dry run so conflicts can be reported without mutating anything.
+ *
+ * @param {{ dryRun?: Boolean, actorId?: String }} options
+ * @returns {Promise<{ changes: Array, scannedUsers: Number, dryRun: Boolean }>}
+ */
+const deduplicateConnections = async (options = {}) => {
+  const { dryRun = false, actorId = null } = options;
+  const changes = [];
 
-    for (const u of users) {
-      let modified = false;
+  const users = await User.find({ deletedAt: null })
+    // Deterministic: the first user to have connected an address keeps it.
+    .sort({ createdAt: 1, _id: 1 })
+    .select('_id email gmailEmail +gmailAccessToken +gmailRefreshToken +linkedGmailAccounts')
+    .lean();
 
-      // 1. Check and clean primary connection
-      const hasPrimary = !!u.gmailAccessToken || !!u.gmailEmail;
-      if (hasPrimary) {
-        const emailLower = (u.gmailEmail || "").toLowerCase().trim();
-        // If the email is blank or it has already been registered elsewhere, clear it
-        if (!emailLower || seenEmails.has(emailLower)) {
-          u.gmailAccessToken = null;
-          u.gmailRefreshToken = null;
-          u.gmailEmail = "";
-          modified = true;
-          console.log(`[DEDUPLICATE] Cleared duplicate/invalid primary account for user: ${u.email}`);
-        } else {
-          seenEmails.add(emailLower);
-        }
-      }
+  // address -> { userId, userEmail } of the legitimate owner
+  const owners = new Map();
+  // One bulkWrite at the end instead of an unbounded number of per-user save()
+  // round-trips.
+  const operations = [];
 
-      // 2. Check and clean linked extra accounts
-      if (u.linkedGmailAccounts && u.linkedGmailAccounts.length > 0) {
-        const originalLength = u.linkedGmailAccounts.length;
-        u.linkedGmailAccounts = u.linkedGmailAccounts.filter(acct => {
-          const emailLower = (acct.gmailEmail || "").toLowerCase().trim();
-          // If the email is blank or has already been registered elsewhere, remove it
-          if (!emailLower || seenEmails.has(emailLower)) {
-            console.log(`[DEDUPLICATE] Removed duplicate/invalid linked account ${acct.gmailEmail || "(blank)"} from user: ${u.email}`);
-            return false;
-          }
-          seenEmails.add(emailLower);
-          return true;
+  for (const u of users) {
+    const updates = {};
+    let modified = false;
+
+    // 1. Primary connection
+    const primaryAddress = (u.gmailEmail || '').toLowerCase().trim();
+    const hasPrimary = !!u.gmailAccessToken || !!u.gmailEmail;
+
+    if (hasPrimary) {
+      if (!primaryAddress) {
+        // Blank primary with a dangling token: safe to clear, owns nothing.
+        changes.push({
+          userId: u._id.toString(),
+          userEmail: u.email,
+          type: 'primary',
+          gmailEmail: '',
+          reason: 'blank'
         });
-
-        if (u.linkedGmailAccounts.length !== originalLength) {
+        if (!dryRun) {
+          Object.assign(updates, { gmailAccessToken: null, gmailRefreshToken: null, gmailEmail: '' });
           modified = true;
         }
-      }
-
-      if (modified) {
-        await u.save();
+      } else if (owners.has(primaryAddress)) {
+        // Someone earlier legitimately owns this inbox — this is the duplicate.
+        const owner = owners.get(primaryAddress);
+        changes.push({
+          userId: u._id.toString(),
+          userEmail: u.email,
+          type: 'primary',
+          gmailEmail: u.gmailEmail,
+          reason: 'duplicate',
+          ownedBy: owner.userEmail
+        });
+        if (!dryRun) {
+          Object.assign(updates, { gmailAccessToken: null, gmailRefreshToken: null, gmailEmail: '' });
+          modified = true;
+        }
+      } else {
+        // Legitimate owner: never nulled out.
+        owners.set(primaryAddress, { userId: u._id.toString(), userEmail: u.email });
       }
     }
-  } catch (err) {
-    console.error('[DEDUPLICATE ERROR] Failed to clean duplicates:', err);
+
+    // 2. Linked (extra) accounts
+    if (u.linkedGmailAccounts && u.linkedGmailAccounts.length > 0) {
+      const kept = [];
+      for (const acct of u.linkedGmailAccounts) {
+        const address = (acct.gmailEmail || '').toLowerCase().trim();
+
+        if (!address) {
+          changes.push({
+            userId: u._id.toString(),
+            userEmail: u.email,
+            type: 'linked',
+            gmailEmail: '',
+            reason: 'blank'
+          });
+          continue;
+        }
+
+        if (owners.has(address)) {
+          const owner = owners.get(address);
+          // Only a LATER claimant is pruned; the owner's own entry is retained.
+          if (owner.userId !== u._id.toString()) {
+            changes.push({
+              userId: u._id.toString(),
+              userEmail: u.email,
+              type: 'linked',
+              gmailEmail: acct.gmailEmail,
+              reason: 'duplicate',
+              ownedBy: owner.userEmail
+            });
+            continue;
+          }
+          // Same user holds it both as primary and linked — drop the redundant
+          // linked copy but keep the primary intact.
+          changes.push({
+            userId: u._id.toString(),
+            userEmail: u.email,
+            type: 'linked',
+            gmailEmail: acct.gmailEmail,
+            reason: 'duplicate-of-own-primary',
+            ownedBy: owner.userEmail
+          });
+          continue;
+        }
+
+        owners.set(address, { userId: u._id.toString(), userEmail: u.email });
+        kept.push(acct);
+      }
+
+      if (!dryRun && kept.length !== u.linkedGmailAccounts.length) {
+        updates.linkedGmailAccounts = kept;
+        modified = true;
+      }
+    }
+
+    if (modified) {
+      operations.push({ updateOne: { filter: { _id: u._id }, update: { $set: updates } } });
+    }
+  }
+
+  // One round-trip for the whole sweep.
+  if (operations.length > 0) {
+    await User.bulkWrite(operations, { ordered: false });
+  }
+
+  // Audit every change, not just a console line.
+  if (!dryRun && changes.length > 0 && actorId) {
+    for (const change of changes) {
+      await logActivity(
+        actorId,
+        'Gmail Deduplicate',
+        `Removed ${change.reason} ${change.type} Gmail connection ${change.gmailEmail || '(blank)'} from user ${change.userEmail}` +
+          (change.ownedBy ? ` (owned by ${change.ownedBy})` : '')
+      );
+    }
+  }
+
+  return { changes, scannedUsers: users.length, dryRun };
+};
+
+// @desc    Explicitly de-duplicate workspace Gmail connections
+// @route   POST /api/gmail/deduplicate
+// @access  Private (Admin only)
+exports.deduplicateGmailConnections = async (req, res) => {
+  try {
+    // Defaults to a dry run: pass { "apply": true } to actually write.
+    const apply = req.body && req.body.apply === true;
+
+    const result = await deduplicateConnections({ dryRun: !apply, actorId: req.user._id });
+
+    return res.status(200).json({
+      message: apply
+        ? `De-duplication applied. ${result.changes.length} connection(s) removed.`
+        : `Dry run complete. ${result.changes.length} conflicting connection(s) found.`,
+      applied: apply,
+      count: result.changes.length,
+      scannedUsers: result.scannedUsers,
+      changes: result.changes
+    });
+  } catch (error) {
+    logger.error({ err: error.message }, 'deduplicateGmailConnections failed');
+    return res.status(500).json({ message: 'Server error. Failed to de-duplicate Gmail connections.' });
   }
 };
 
@@ -877,53 +2137,53 @@ exports.replyToEmail = async (req, res) => {
     }
 
     // Load the original email from DB
-    const email = await Email.findById(emailId);
+    const email = await Email.findOne({ _id: emailId, ...NOT_DELETED })
+      .select('_id messageId threadId rfcMessageId references subject from toEmail fetchedBy assignedTo clientId')
+      .lean();
     if (!email) return res.status(404).json({ message: 'Email not found.' });
 
-    // Find the user who owns the account this email arrived on (toEmail)
-    // It could be their primary or a linked account
-    const user = await User.findById(req.user._id).select('+gmailAccessToken +gmailRefreshToken +linkedGmailAccounts');
+    // Object-level authorization. Previously absent entirely: any Head could
+    // reply to an email belonging to the Admin's mailbox.
+    if (!canAccessEmail(email, req.user)) {
+      return res.status(403).json({ message: 'Access denied. This email does not belong to your mailbox.' });
+    }
+
+    const user = await User.findById(req.user._id)
+      .select('_id gmailEmail +gmailAccessToken +gmailRefreshToken +linkedGmailAccounts')
+      .lean();
     if (!user) return res.status(404).json({ message: 'User not found.' });
 
-    let accessToken = null;
-    let refreshToken = null;
     const targetInbox = email.toEmail;
 
-    if (user.gmailEmail === targetInbox) {
-      accessToken = user.gmailAccessToken;
-      refreshToken = user.gmailRefreshToken;
-    } else {
-      const linked = (user.linkedGmailAccounts || []).find(a => a.gmailEmail === targetInbox);
-      if (linked) {
-        accessToken = linked.gmailAccessToken;
-        refreshToken = linked.gmailRefreshToken;
-      }
-    }
-
-    // If this user doesn't own the inbox, find the Admin who does
-    if (!accessToken) {
-      const allAdmins = await User.find({ role: 'Admin' }).select('+gmailAccessToken +gmailRefreshToken +linkedGmailAccounts');
-      for (const admin of allAdmins) {
-        if (admin.gmailEmail === targetInbox) {
-          accessToken = admin.gmailAccessToken;
-          refreshToken = admin.gmailRefreshToken;
-          break;
-        }
-        const linked = (admin.linkedGmailAccounts || []).find(a => a.gmailEmail === targetInbox);
-        if (linked) {
-          accessToken = linked.gmailAccessToken;
-          refreshToken = linked.gmailRefreshToken;
-          break;
-        }
-      }
-    }
+    // The sending identity is resolved ONLY from the authenticated user. The
+    // previous "borrow an Admin's OAuth tokens" fallback is deleted: it let a
+    // Head send mail from the Admin's real Gmail account to any address, an
+    // ideal business-email-compromise primitive.
+    const { accessToken, refreshToken } = resolveInboxCredentials(user, targetInbox);
 
     if (!accessToken) {
-      return res.status(400).json({ message: 'No connected Gmail account found for this inbox. Please reconnect.' });
+      return res.status(403).json({
+        message: 'Access denied. You do not have a connected Gmail account for this inbox.'
+      });
+    }
+
+    // decrypt() now THROWS rather than returning the ciphertext as if it were a
+    // token, so an unreadable credential is reported honestly instead of
+    // producing an opaque 401 from Google.
+    let plainAccessToken;
+    let plainRefreshToken;
+    try {
+      plainAccessToken = decrypt(accessToken);
+      plainRefreshToken = decrypt(refreshToken);
+    } catch (err) {
+      logger.error({ err: err.message, inbox: targetInbox }, 'stored Gmail token could not be decrypted');
+      return res.status(409).json({
+        message: 'The stored Gmail credential for this inbox could not be read. Please reconnect the account.'
+      });
     }
 
     const oauth2Client = getOAuth2Client();
-    oauth2Client.setCredentials({ access_token: decrypt(accessToken), refresh_token: decrypt(refreshToken) });
+    oauth2Client.setCredentials({ access_token: plainAccessToken, refresh_token: plainRefreshToken });
 
     const gmail = google.gmail({ version: 'v1', auth: oauth2Client });
 
@@ -932,7 +2192,19 @@ exports.replyToEmail = async (req, res) => {
     let references = '';
     let threadId = '';
     try {
-      const original = await gmail.users.messages.get({ userId: 'me', id: email.messageId, format: 'metadata', metadataHeaders: ['Message-ID', 'References', 'In-Reply-To'] });
+      const original = await gmailCall(
+        () =>
+          gmail.users.messages.get(
+            {
+              userId: 'me',
+              id: email.messageId,
+              format: 'metadata',
+              metadataHeaders: ['Message-ID', 'References', 'In-Reply-To']
+            },
+            GMAIL_REQUEST_OPTIONS
+          ),
+        'messages.get(metadata)'
+      );
       threadId = original.data.threadId || '';
       const headers = original.data.payload?.headers || [];
       const msgIdHeader = headers.find(h => h.name.toLowerCase() === 'message-id');
@@ -940,20 +2212,32 @@ exports.replyToEmail = async (req, res) => {
       originalMessageId = msgIdHeader ? msgIdHeader.value : '';
       references = refsHeader ? `${refsHeader.value} ${originalMessageId}` : originalMessageId;
     } catch (e) {
-      console.warn('[REPLY] Could not fetch original headers:', e.message);
+      logger.warn({ err: e.message }, 'could not fetch original reply headers');
     }
 
-    // Extract plain sender address from "Name <email@domain.com>" format
-    const toAddress = email.from.match(/<(.+?)>/) ? email.from.match(/<(.+?)>/)[1] : email.from;
-    const replySubject = email.subject.startsWith('Re:') ? email.subject : `Re: ${email.subject}`;
+    // F-1: fall back to what we already persisted when the metadata fetch above
+    // failed. The whole defect was that `threadId` was read and then dropped —
+    // losing it a second time to a transient Gmail error would be the same bug.
+    if (!threadId) threadId = email.threadId || '';
+    if (!originalMessageId) originalMessageId = email.rfcMessageId || '';
+    if (!references) references = (email.references || []).concat(originalMessageId).filter(Boolean).join(' ');
+
+    // Extract plain sender address from "Name <email@domain.com>" format.
+    // `subject` and `from` come from attacker-controlled inbound headers, so
+    // every interpolated value has CR/LF stripped — otherwise a header value
+    // containing a newline injects arbitrary headers (e.g. Bcc:) into the reply.
+    const fromMatch = email.from.match(/<(.+?)>/);
+    const toAddress = sanitizeHeaderValue(fromMatch ? fromMatch[1] : email.from);
+    const rawSubject = sanitizeHeaderValue(email.subject);
+    const replySubject = rawSubject.startsWith('Re:') ? rawSubject : `Re: ${rawSubject}`;
 
     // Build RFC 2822 raw email
     const rawLines = [
-      `From: ${targetInbox}`,
+      `From: ${sanitizeHeaderValue(targetInbox)}`,
       `To: ${toAddress}`,
       `Subject: ${replySubject}`,
-      `In-Reply-To: ${originalMessageId}`,
-      `References: ${references}`,
+      `In-Reply-To: ${sanitizeHeaderValue(originalMessageId)}`,
+      `References: ${sanitizeHeaderValue(references)}`,
       'Content-Type: text/plain; charset="UTF-8"',
       'MIME-Version: 1.0',
       '',
@@ -963,19 +2247,105 @@ exports.replyToEmail = async (req, res) => {
     const rawEmail = rawLines.join('\r\n');
     const encodedEmail = Buffer.from(rawEmail).toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
 
-    await gmail.users.messages.send({
-      userId: 'me',
-      requestBody: {
-        raw: encodedEmail,
-        ...(threadId ? { threadId } : {})
-      }
-    });
+    const sendResult = await gmailCall(
+      () =>
+        gmail.users.messages.send(
+          {
+            userId: 'me',
+            requestBody: {
+              raw: encodedEmail,
+              ...(threadId ? { threadId } : {})
+            }
+          },
+          GMAIL_REQUEST_OPTIONS
+        ),
+      'messages.send'
+    );
+
+    // -------------------------------------------------------------------
+    // F-1: PERSIST the outbound message.
+    //
+    // This handler previously stored nothing at all after a successful send,
+    // so the app could not show that a client had been answered and no
+    // response-time metric was computable. Everything in F-2 depends on this
+    // row existing.
+    //
+    // Persistence failure must NOT turn a delivered reply into a 500 — the mail
+    // has already left. It is logged and the request still succeeds.
+    // -------------------------------------------------------------------
+    const sentAt = new Date();
+    const effectiveThreadId = sendResult?.data?.threadId || threadId || email.threadId || null;
+    let outboundId = null;
+
+    try {
+      const replyText = replyBody.trim();
+      const outbound = await Email.create({
+        // Gmail's id for the message we just sent, so the unique index holds and
+        // a later sync of the Sent label cannot duplicate this row.
+        messageId: sendResult?.data?.id || `outbound-${email.messageId}-${sentAt.getTime()}`,
+        threadId: effectiveThreadId,
+        // Gmail assigns the RFC Message-ID after the fact; we do not learn it
+        // from the send response, so it stays null rather than being invented.
+        rfcMessageId: null,
+        inReplyTo: originalMessageId || null,
+        references: parseReferences(references),
+        direction: 'outbound',
+        subject: replySubject,
+        // The sending mailbox is the author of an outbound message.
+        from: targetInbox,
+        toEmail: targetInbox,
+        date: sentAt,
+        sentBy: req.user._id,
+        sentAt,
+        // Ownership: the reply belongs to the same mailbox as the message it
+        // answers, which is what keeps thread scoping consistent for a Head.
+        fetchedBy: email.fetchedBy || req.user._id,
+        fetchedAt: sentAt,
+        // Our own outbound text is not attacker-controlled, but it goes through
+        // the same sanitizer as everything else that can be rendered.
+        body: sanitizeEmailHtml(replyText),
+        bodyRaw: replyText,
+        snippet: makeSnippet('', replyText),
+        clientId: email.clientId || null,
+        // A message we wrote is, by definition, read by its author.
+        readBy: [{ user: req.user._id, readAt: sentAt }],
+        labelIds: ['SENT']
+      });
+      outboundId = outbound._id;
+
+      if (effectiveThreadId) await resyncThreadPositions([effectiveThreadId]);
+
+      // F-2: stamp `firstResponseAt` on any task linked to this conversation.
+      // `firstResponseAt: null` in the filter makes it first-write-wins, so a
+      // second reply cannot move the first-response instant.
+      const threadEmailIds = effectiveThreadId
+        ? await Email.distinct('_id', { threadId: effectiveThreadId })
+        : [email._id];
+      await Task.updateMany(
+        { linkedEmail: { $in: threadEmailIds }, firstResponseAt: null },
+        { $set: { firstResponseAt: sentAt } }
+      );
+
+      // Reply is a write that moves SLA and dashboard aggregates.
+      await cache.invalidateStats();
+    } catch (err) {
+      logger.error(
+        { err: err.message, emailId: String(email._id), threadId: effectiveThreadId },
+        'reply was SENT but could not be persisted'
+      );
+    }
 
     await logActivity(req.user._id, 'Email Reply', `Replied to email "${email.subject}" from ${email.from}`);
 
-    return res.status(200).json({ message: 'Reply sent successfully.' });
+    // Additive only: the pre-existing `message` field is unchanged.
+    return res.status(200).json({
+      message: 'Reply sent successfully.',
+      threadId: effectiveThreadId,
+      emailId: outboundId,
+      sentAt
+    });
   } catch (error) {
-    console.error('Error in replyToEmail:', error);
+    logger.error({ err: error.message }, 'replyToEmail failed');
     return res.status(500).json({ message: 'Server error. Failed to send reply.' });
   }
 };
@@ -999,45 +2369,79 @@ exports.bulkAssignEmails = async (req, res) => {
       return res.status(404).json({ message: 'Assignee not found.' });
     }
 
-    const taskDeadline = deadline ? new Date(deadline) : new Date(Date.now() + 3 * 24 * 60 * 60 * 1000);
+    // `deadline` is already normalized to a UTC Date by the Zod schema.
+    const taskDeadline = deadline || new Date(Date.now() + 3 * 24 * 60 * 60 * 1000);
     const taskPriority = priority || 'Medium';
 
-    const emails = await Email.find({ _id: { $in: emailIds } });
+    // Ownership scope. Without this a Head could assign — and read back the
+    // full body of — any email in the workspace, including the Admin's.
+    const scope = { _id: { $in: emailIds }, ...NOT_DELETED };
+    if (req.user.role !== 'Admin') {
+      scope.fetchedBy = req.user._id;
+    }
+
+    // Projection: only the fields the task body needs. This used to load every
+    // full document including the base64-laden body.
+    const emails = await Email.find(scope).select('_id subject from').lean();
     if (emails.length === 0) {
       return res.status(404).json({ message: 'No matching emails found.' });
     }
 
+    // Fail closed when any requested id was outside the caller's mailbox,
+    // rather than silently acting on the subset they do own.
+    const uniqueRequested = new Set(emailIds.map(String));
+    if (emails.length !== uniqueRequested.size) {
+      return res.status(403).json({ message: 'One or more emails are outside your mailbox.' });
+    }
+
     const { createNotification } = require('../utils/notificationHelper');
     const io = req.app.get('io');
-    const createdTasks = [];
 
-    for (const email of emails) {
-      const task = new Task({
-        title: email.subject || 'Assigned Email',
-        description: email.body || '',
-        linkedEmail: email._id,
-        assignedTo: assignee._id,
-        clientName: email.from || 'Inbox Client',
-        deadline: taskDeadline,
-        priority: taskPriority,
-        createdBy: req.user._id,
-        status: 'Pending'
-      });
+    // 2N sequential writes (one task save + one email save PER EMAIL, up to 200
+    // of each) collapse into two round-trips.
+    //
+    // `bulkWrite` with an upsert on `linkedEmail` rather than `insertMany`,
+    // because the unique partial index on `Task.linkedEmail` would otherwise
+    // reject an email that already has a task.
+    const now = new Date();
+    const operations = emails.map((email) => ({
+      updateOne: {
+        filter: { linkedEmail: email._id },
+        update: {
+          $set: { assignedTo: assignee._id, status: 'Pending', deadline: taskDeadline, priority: taskPriority },
+          $setOnInsert: {
+            title: email.subject || 'Assigned Email',
+            // The full email body is NOT copied into the task description. The
+            // task links to the email; the body is served only through an
+            // authorized email read path.
+            description: '',
+            linkedEmail: email._id,
+            clientName: email.from || 'Inbox Client',
+            createdBy: req.user._id,
+            createdAt: now
+          }
+        },
+        upsert: true
+      }
+    }));
 
-      const savedTask = await task.save();
-      createdTasks.push(savedTask);
+    await Task.bulkWrite(operations, { ordered: false });
+    await Email.updateMany(
+      { _id: { $in: emails.map((e) => e._id) } },
+      { $set: { assignedTo: assignee._id, status: 'assigned' } }
+    );
+    await cache.invalidateStats();
 
-      email.assignedTo = assignee._id;
-      email.status = 'assigned';
-      await email.save();
-    }
+    const createdTasks = await Task.find({ linkedEmail: { $in: emails.map((e) => e._id) } })
+      .select('_id title linkedEmail assignedTo clientName deadline priority status createdBy createdAt')
+      .lean();
 
     await createNotification(
       assignee._id,
       `You have been assigned ${emails.length} new tasks from the Inbox.`,
       io,
       null,
-      'task_assigned'
+      'email_assigned'
     );
 
     await logActivity(
@@ -1048,10 +2452,22 @@ exports.bulkAssignEmails = async (req, res) => {
 
     return res.status(200).json({
       message: `Successfully assigned ${emails.length} emails to ${assignee.name}.`,
-      tasks: createdTasks
+      // Only non-sensitive task metadata is echoed back — never email bodies.
+      tasks: createdTasks.map((t) => ({
+        _id: t._id,
+        title: t.title,
+        linkedEmail: t.linkedEmail,
+        assignedTo: t.assignedTo,
+        clientName: t.clientName,
+        deadline: t.deadline,
+        priority: t.priority,
+        status: t.status,
+        createdBy: t.createdBy,
+        createdAt: t.createdAt
+      }))
     });
   } catch (error) {
-    console.error('Error in bulkAssignEmails:', error);
+    logger.error({ err: error.message }, 'bulkAssignEmails failed');
     return res.status(500).json({ message: 'Server error. Failed to bulk assign emails.' });
   }
 };
@@ -1064,19 +2480,17 @@ exports.downloadAttachment = async (req, res) => {
     const { id, attachmentId } = req.params;
     
     // Find the email
-    const email = await Email.findById(id);
+    const email = await Email.findOne({ _id: id, ...NOT_DELETED })
+      .select('_id messageId toEmail attachments fetchedBy assignedTo')
+      .lean();
     if (!email) {
       return res.status(404).json({ message: 'Email not found.' });
     }
 
-    // Access control:
-    // Employee can only download attachments of emails assigned to them
-    if (req.user.role === 'Employee' && email.assignedTo?.toString() !== req.user._id.toString()) {
-      return res.status(403).json({ message: 'Access denied. Email is not assigned to you.' });
-    }
-    // Head can only download attachments of emails fetched by them
-    if (req.user.role === 'Head' && email.fetchedBy?.toString() !== req.user._id.toString()) {
-      return res.status(403).json({ message: 'Access denied. Email is not fetched by you.' });
+    // Object-level authorization (Admin: any; otherwise own mailbox, or
+    // assigned to the caller for an Employee).
+    if (!canAccessEmail(email, req.user)) {
+      return res.status(403).json({ message: 'Access denied. This email is not in your mailbox.' });
     }
 
     // Find attachment info
@@ -1085,58 +2499,54 @@ exports.downloadAttachment = async (req, res) => {
       return res.status(404).json({ message: 'Attachment metadata not found on email.' });
     }
 
-    // Find user context to get Gmail oauth credentials
-    const fetcher = await User.findById(email.fetchedBy).select('+gmailAccessToken +gmailRefreshToken +linkedGmailAccounts');
-    if (!fetcher) {
-      return res.status(404).json({ message: 'Email fetcher user context not found.' });
-    }
-
-    let accessToken = null;
-    let refreshToken = null;
     const targetInbox = email.toEmail;
 
-    if (fetcher.gmailEmail === targetInbox) {
-      accessToken = fetcher.gmailAccessToken;
-      refreshToken = fetcher.gmailRefreshToken;
-    } else {
-      const linked = (fetcher.linkedGmailAccounts || []).find(a => a.gmailEmail === targetInbox);
-      if (linked) {
-        accessToken = linked.gmailAccessToken;
-        refreshToken = linked.gmailRefreshToken;
-      }
+    // Credentials come from the mailbox OWNER, resolved from a single user
+    // document. The previous "fall back to any Admin's tokens" block is deleted.
+    //
+    // An Employee legitimately reads an attachment on a task assigned to them
+    // but never holds Gmail credentials, so for them the fetcher's credentials
+    // are used — but only after canAccessEmail() has confirmed the assignment.
+    const credentialOwnerId =
+      req.user.role === 'Employee' ? email.fetchedBy : req.user._id;
+
+    const credentialOwner = await User.findById(credentialOwnerId)
+      .select('_id gmailEmail +gmailAccessToken +gmailRefreshToken +linkedGmailAccounts')
+      .lean();
+    if (!credentialOwner) {
+      return res.status(404).json({ message: 'Mailbox owner context not found.' });
     }
 
-    // Fallback to Admin credentials
-    if (!accessToken) {
-      const allAdmins = await User.find({ role: 'Admin' }).select('+gmailAccessToken +gmailRefreshToken +linkedGmailAccounts');
-      for (const admin of allAdmins) {
-        if (admin.gmailEmail === targetInbox) {
-          accessToken = admin.gmailAccessToken;
-          refreshToken = admin.gmailRefreshToken;
-          break;
-        }
-        const linked = (admin.linkedGmailAccounts || []).find(a => a.gmailEmail === targetInbox);
-        if (linked) {
-          accessToken = linked.gmailAccessToken;
-          refreshToken = linked.gmailRefreshToken;
-          break;
-        }
-      }
-    }
+    const { accessToken, refreshToken } = resolveInboxCredentials(credentialOwner, targetInbox);
 
     if (!accessToken) {
-      return res.status(400).json({ message: 'No authenticated Gmail credentials found for this inbox.' });
+      return res.status(403).json({ message: 'No authenticated Gmail credentials found for this inbox.' });
+    }
+
+    let plainAccessToken;
+    let plainRefreshToken;
+    try {
+      plainAccessToken = decrypt(accessToken);
+      plainRefreshToken = decrypt(refreshToken);
+    } catch (err) {
+      logger.error({ err: err.message, inbox: targetInbox }, 'stored Gmail token could not be decrypted');
+      return res.status(409).json({
+        message: 'The stored Gmail credential for this inbox could not be read. Please reconnect the account.'
+      });
     }
 
     const oauth2Client = getOAuth2Client();
-    oauth2Client.setCredentials({ access_token: decrypt(accessToken), refresh_token: decrypt(refreshToken) });
+    oauth2Client.setCredentials({ access_token: plainAccessToken, refresh_token: plainRefreshToken });
 
     const gmail = google.gmail({ version: 'v1', auth: oauth2Client });
-    const attachRes = await gmail.users.messages.attachments.get({
-      userId: 'me',
-      messageId: email.messageId,
-      id: attachmentId
-    });
+    const attachRes = await gmailCall(
+      () =>
+        gmail.users.messages.attachments.get(
+          { userId: 'me', messageId: email.messageId, id: attachmentId },
+          GMAIL_REQUEST_OPTIONS
+        ),
+      'attachments.get'
+    );
 
     const base64Data = attachRes.data.data;
     if (!base64Data) {
@@ -1152,7 +2562,7 @@ exports.downloadAttachment = async (req, res) => {
     return res.send(fileBuffer);
 
   } catch (error) {
-    console.error('Error in downloadAttachment:', error);
+    logger.error({ err: error.message }, 'downloadAttachment failed');
     return res.status(500).json({ message: 'Server error. Failed to download attachment.' });
   }
 };

@@ -2,6 +2,13 @@
 
 ### *Where Emails Meet Action.*
 
+[![CI](https://github.com/kedardk005/MailDesk/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/kedardk005/MailDesk/actions/workflows/ci.yml)
+[![Node](https://img.shields.io/badge/node-22%20LTS-339933?logo=node.js&logoColor=white)](https://nodejs.org)
+[![MongoDB](https://img.shields.io/badge/mongodb-7.0%2B-47A248?logo=mongodb&logoColor=white)](https://www.mongodb.com)
+[![React](https://img.shields.io/badge/react-19-61DAFB?logo=react&logoColor=black)](https://react.dev)
+[![Tests](https://img.shields.io/badge/tests-185%20client%20%2B%20282%20server-brightgreen)](#-testing)
+[![License](https://img.shields.io/badge/license-ISC-blue.svg)](#-license)
+
 A full-stack web application for centralized company email and task management — built for teams that need structure, accountability, and real-time collaboration.
 
 ---
@@ -32,13 +39,27 @@ Built with a role-based system (Admin, Head, Employee) so every team member sees
 | Layer | Technology |
 |---|---|
 | Frontend | React 19 + Vite + Tailwind CSS + React Router v7 |
-| Backend | Node.js + Express.js v5 |
-| Database | MongoDB Atlas + Mongoose |
+| UI | Radix primitives + TanStack Table + lucide-react + Recharts |
+| Backend | Node.js 22 + Express.js v5 |
+| Database | **MongoDB 7.0+** + Mongoose (self-hosted or Atlas) |
+| Cache / queue | Redis + BullMQ — **optional**, with in-process fallbacks |
 | Authentication | JWT (JSON Web Tokens) |
 | Gmail Integration | Gmail API + Google OAuth 2.0 |
-| Real-time | Socket.io v4 |
+| Real-time | Socket.io v4 (Redis adapter when available) |
+| AI | Google Gemini |
 | Email Notifications | Nodemailer |
-| Cron Jobs | node-cron |
+| Cron Jobs | node-cron (distributed lock when Redis is present) |
+| Testing | Vitest + Testing Library + MSW + jest-axe |
+| CI / deploy | GitHub Actions · Docker · Docker Compose |
+
+> **MongoDB 7.0 or newer is required.** The SLA reports use the `$median` and
+> `$percentile` aggregation operators added in 7.0. On 6.x the app boots and
+> runs normally, then SLA reports fail at query time.
+
+> **Redis is optional.** With `REDIS_URL` unset the app runs correctly as a
+> single instance using an in-process cache, queue and rate limiter. Set it to
+> enable BullMQ, a shared cache, a distributed cron lock and the Socket.io
+> adapter — required if you ever run more than one instance.
 
 ---
 
@@ -81,14 +102,15 @@ MailDesk/
 │   │   │       ├── ManageUsers.jsx  # User management (Admin only)
 │   │   │       ├── ActivityLog.jsx  # Activity logs (Admin only)
 │   │   │       └── Reports.jsx      # Analytics (Admin + Head)
-│   │   └── utils/
-│   │       ├── countUp.jsx
-│   │       ├── cursorEffects.js
-│   │       ├── moduleCursor.js
-│   │       ├── scrollAnimations.js
-│   │       └── tiltEffect.js
-│   ├── .env                         # VITE_API_URL for dev
-│   ├── .env.production              # VITE_API_URL for production
+│   │   ├── components/ui/           # 26 design-system primitives
+│   │   ├── lib/
+│   │   │   ├── auth.js              # single source of session state
+│   │   │   ├── config.js            # validates VITE_* at startup
+│   │   │   ├── socket.js            # one shared authenticated socket
+│   │   │   └── utils.js
+│   │   └── test/                    # Vitest setup + MSW handlers
+│   ├── .env                         # VITE_API_URL, VITE_SOCKET_URL (dev)
+│   ├── .env.production              # same, for the production build
 │   └── package.json
 │
 ├── server/                          # Node.js + Express Backend
@@ -118,14 +140,25 @@ MailDesk/
 │   │   ├── notificationRoutes.js
 │   │   └── reportsRoutes.js
 │   ├── utils/
-│   │   ├── activityLogger.js
-│   │   ├── notificationHelper.js
+│   │   ├── activityLogger.js        # structured audit trail
+│   │   ├── cache.js                 # Redis or in-process LRU
+│   │   ├── queue.js                 # BullMQ or in-process runner
+│   │   ├── paginate.js              # the shared list contract
+│   │   ├── resilience.js            # timeouts, retry, circuit breakers
+│   │   ├── sanitizeEmailHtml.js     # untrusted inbound HTML
+│   │   ├── threadHelper.js          # conversation grouping
+│   │   ├── presence.js              # ephemeral collision detection
+│   │   ├── logger.js                # structured request logging
 │   │   ├── emailHelper.js           # Nodemailer setup
-│   │   └── cronJobs.js              # Deadline checker + auto email sync
+│   │   └── cronJobs.js              # deadline checker + auto email sync
+│   ├── scripts/                     # migrations, index sync, smoke test
 │   ├── seeders/
-│   │   └── clientSeeder.js
 │   └── index.js                     # Express server entry point
 │
+├── docker/                          # server + client images, nginx config
+├── docs/                            # audit, contracts, deploy guides
+├── .github/workflows/ci.yml
+├── docker-compose.yml
 ├── .gitignore
 └── README.md
 ```
@@ -196,6 +229,50 @@ npm run dev
 
 - Backend runs on: `http://localhost:5015`
 - Frontend runs on: `http://localhost:5174`
+
+---
+
+## 🧪 Testing
+
+```bash
+cd client && npm run test -- --run
+```
+
+```bash
+cd server && npm run check:syntax
+```
+
+The server suite is a real integration test — it needs a running server and a
+scratch database, and asserts auth, the pagination contract, authorization
+boundaries and the security fixes end to end:
+
+```bash
+cd server && MONGO_URI="mongodb://127.0.0.1:27017/maildesk_smoke" BASE_URL="http://127.0.0.1:5150" npm run test:smoke
+```
+
+> Start the server with `RATE_LIMIT_AUTH_MAX=500 RATE_LIMIT_GENERAL_MAX=5000
+> AI_RATE_LIMIT_PER_MINUTE=200` for repeat runs — the suite makes more requests
+> than the shipped production limits allow.
+
+CI runs all of this on every push, including both Docker image builds.
+
+---
+
+## 🚢 Deployment
+
+- **Docker / Compose** — `docker compose up` brings up MongoDB, Redis, the API
+  and the client together.
+- **Self-hosted Windows Server** — see **[docs/DEPLOY-WINDOWS.md](docs/DEPLOY-WINDOWS.md)**
+  for a single-box install with no managed cluster.
+
+Run the migrations once per environment, in order:
+
+```bash
+cd server && npm run sync-indexes -- --apply && npm run backfill-emails && node scripts/backfillEmailThreads.js --apply && node scripts/backfillTaskCompletedAt.js --apply
+```
+
+Project documentation lives in [`docs/`](docs/) — the audit that shaped the
+current codebase, the API contracts, and per-area implementation records.
 
 ---
 
