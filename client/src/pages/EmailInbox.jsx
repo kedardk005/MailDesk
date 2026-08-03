@@ -71,6 +71,7 @@ import {
   AvatarGroup,
   Badge,
   Button,
+  Combobox,
   CountBadge,
   DataTable,
   Dialog,
@@ -95,7 +96,6 @@ import {
   PopoverTrigger,
   SegmentedControl,
   Select,
-  SelectMenu,
   SkeletonText,
   Tabs,
   TabsList,
@@ -106,6 +106,7 @@ import {
   Tooltip,
   useConfirm,
 } from '../components/ui'
+import { searchAssignees } from '../lib/pickers'
 import { getSocket } from '../lib/socket'
 import { cn, formatDurationMinutes, formatNumber, timeAgo } from '../lib/utils'
 import { ExtractActionsPanel } from '../components/ActionExtraction'
@@ -497,9 +498,11 @@ function useThreadDetail(threadId, nonce) {
   }
 }
 
-/** Reference data: assignable users, connected accounts, approval queue size. */
+/** Reference data: connected accounts and the approval queue size. Assignable
+ * people are no longer preloaded here — the assign dialog searches the server
+ * as you type (lib/pickers.js). */
 function useInboxAux(enabled, nonce) {
-  const [aux, setAux] = useState({ users: [], status: null, pendingApprovals: 0 })
+  const [aux, setAux] = useState({ status: null, pendingApprovals: 0 })
 
   useEffect(() => {
     const controller = new AbortController()
@@ -507,13 +510,11 @@ function useInboxAux(enabled, nonce) {
     const options = { signal: controller.signal }
 
     Promise.allSettled([
-      enabled ? api.get('/users', options) : Promise.resolve(null),
       api.get('/gmail/status', options),
       enabled ? api.get('/keyword-rules/pending-approvals', options) : Promise.resolve(null),
-    ]).then(([users, status, approvals]) => {
+    ]).then(([status, approvals]) => {
       if (!alive) return
       setAux({
-        users: users?.value ? readList(users.value.data).rows : [],
         status: status?.value?.data ?? null,
         pendingApprovals: approvals?.value ? readList(approvals.value.data).rows.length : 0,
       })
@@ -835,7 +836,6 @@ function EmailDrawer({
   error,
   canManage,
   canDelete,
-  users,
   onOpenChange,
   onAssign,
   onDelete,
@@ -966,7 +966,6 @@ function EmailDrawer({
           {canManage && email ? (
             <ExtractActionsPanel
               emailId={email._id}
-              users={users}
               linkedEmail={email._id}
               onCreated={onTasksCreated}
             />
@@ -1269,7 +1268,6 @@ function ThreadDrawer({
   loading,
   error,
   canManage,
-  users,
   selfId,
   onOpenChange,
   onRetry,
@@ -1399,7 +1397,6 @@ function ThreadDrawer({
           {canManage && messages.length > 0 ? (
             <ExtractActionsPanel
               threadId={threadId}
-              users={users}
               linkedEmail={replyTarget?._id}
               onCreated={onReplied}
             />
@@ -1423,8 +1420,10 @@ function ThreadDrawer({
 /* Dialogs                                                                     */
 /* -------------------------------------------------------------------------- */
 
-function AssignDialog({ open, onOpenChange, emailIds, users, onAssigned }) {
-  const [assignee, setAssignee] = useState('')
+function AssignDialog({ open, onOpenChange, emailIds, onAssigned }) {
+  /* The picker submits `assigneeOption.value`; the option carries the label. */
+  const [assigneeOption, setAssigneeOption] = useState(null)
+  const assignee = assigneeOption?.value || ''
   const [deadline, setDeadline] = useState('')
   const [priority, setPriority] = useState('Medium')
   const [taskStatus, setTaskStatus] = useState('Pending')
@@ -1434,22 +1433,12 @@ function AssignDialog({ open, onOpenChange, emailIds, users, onAssigned }) {
   if (open !== prevOpen) {
     setPrevOpen(open)
     if (open) {
-      setAssignee('')
+      setAssigneeOption(null)
       setDeadline('')
       setPriority('Medium')
       setTaskStatus('Pending')
     }
   }
-
-  const options = useMemo(
-    () =>
-      users.map((u) => ({
-        value: u._id,
-        label: u.name || u.email || 'Unnamed user',
-        group: u.role ? `${u.role}s` : 'Team',
-      })),
-    [users]
-  )
 
   const submit = async () => {
     if (!assignee) return
@@ -1500,13 +1489,15 @@ function AssignDialog({ open, onOpenChange, emailIds, users, onAssigned }) {
         <div className="space-y-4">
           <FormField label="Assignee" required>
             {(field) => (
-              <SelectMenu
-                id={field.id}
-                ariaLabel="Assignee"
-                value={assignee}
-                onValueChange={setAssignee}
-                options={options}
+              <Combobox
+                {...field}
+                value={assigneeOption}
+                onChange={setAssigneeOption}
+                loadOptions={searchAssignees}
                 placeholder="Choose a team member"
+                searchPlaceholder="Search people…"
+                emptyMessage="No matching people."
+                errorMessage="Could not search people."
               />
             )}
           </FormField>
@@ -3044,7 +3035,6 @@ export default function EmailInbox() {
         loading={threadDetail.loading}
         error={threadDetail.error}
         canManage={canManage}
-        users={aux.users}
         selfId={userId}
         onOpenChange={(next) => !next && closeThread()}
         onRetry={refresh}
@@ -3059,7 +3049,6 @@ export default function EmailInbox() {
         error={detail.error}
         canManage={canManage}
         canDelete={hasExported}
-        users={aux.users}
         onOpenChange={(next) => !next && closeEmail()}
         onAssign={setAssignIds}
         onDelete={deleteEmail}
@@ -3071,7 +3060,6 @@ export default function EmailInbox() {
         open={Boolean(assignIds)}
         onOpenChange={(next) => !next && setAssignIds(null)}
         emailIds={assignIds || []}
-        users={aux.users}
         onAssigned={() => {
           setAssignIds(null)
           setSelection({})
