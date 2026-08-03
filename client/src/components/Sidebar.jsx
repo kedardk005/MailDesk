@@ -1,211 +1,132 @@
-import React, { useState, useEffect } from 'react';
-import { NavLink, useNavigate } from 'react-router-dom';
+import { NavLink } from 'react-router-dom'
+import {
+  Building2,
+  CheckSquare,
+  ChevronLeft,
+  ChevronRight,
+  History,
+  Inbox,
+  LayoutDashboard,
+  ScrollText,
+  User,
+  Users,
+  X,
+} from 'lucide-react'
+import { cn } from '../lib/utils'
+import { useAuth } from './AuthProvider'
+import { Button } from './ui/Button'
+import { Tooltip } from './ui/Tooltip'
 
-const Sidebar = ({ isOpen, onClose }) => {
-  const navigate = useNavigate();
-  
-  const [currentUser, setCurrentUser] = useState(() => {
-    const userString = localStorage.getItem('user');
-    try {
-      return userString ? JSON.parse(userString) : { name: 'Guest', role: 'Employee' };
-    } catch {
-      return { name: 'Guest', role: 'Employee' };
-    }
-  });
+/**
+ * Primary navigation. 240px expanded / 56px collapsed, lucide icons, no emoji,
+ * no gradient user card, no hover translate.
+ *
+ * @param {boolean} isOpen - mobile drawer state
+ * @param {() => void} onClose
+ * @param {boolean} [collapsed] - desktop rail state (persisted by ProtectedLayout)
+ * @param {() => void} [onToggleCollapsed]
+ */
+const NAV_ITEMS = [
+  { to: '/dashboard', label: 'Dashboard', icon: LayoutDashboard, roles: ['Admin', 'Head', 'Employee'] },
+  { to: '/inbox', label: 'Inbox', icon: Inbox, roles: ['Admin', 'Head'] },
+  { to: '/tasks', label: 'Tasks', icon: CheckSquare, roles: ['Admin', 'Head', 'Employee'] },
+  { to: '/clients', label: 'Clients', icon: Building2, roles: ['Admin', 'Head', 'Employee'] },
+  { to: '/reports', label: 'Reports', icon: ScrollText, roles: ['Admin'] },
+  { to: '/admin/users', label: 'Users & Approvals', icon: Users, roles: ['Admin'] },
+  { to: '/admin/activities', label: 'Activity Log', icon: History, roles: ['Admin'] },
+  { to: '/profile', label: 'My Profile', icon: User, roles: ['Admin', 'Head', 'Employee'] },
+]
 
-  useEffect(() => {
-    const handleStorageChange = () => {
-      const userString = localStorage.getItem('user');
-      try {
-        if (userString) {
-          setCurrentUser(JSON.parse(userString));
-        }
-      } catch (err) {
-        console.error('Error syncing user details for Sidebar:', err);
-      }
-    };
-    
-    window.addEventListener('storage', handleStorageChange);
-    return () => window.removeEventListener('storage', handleStorageChange);
-  }, []);
-
-  const handleLogout = () => {
-    localStorage.removeItem('token');
-    localStorage.removeItem('user');
-    navigate('/login');
-    if (onClose) onClose();
-  };
-
-  const getInitials = (name) => {
-    if (!name) return 'U';
-    return name
-      .split(' ')
-      .map((n) => n[0])
-      .join('')
-      .toUpperCase()
-      .slice(0, 2);
-  };
-
-  const navItems = [
-    {
-      path: '/dashboard',
-      label: 'Dashboard',
-      roles: ['Admin', 'Head', 'Employee'],
-      icon: (
-        <svg className="h-5 w-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M3 12l2-2m0 0l7-7 7 7M5 10v10a1 1 0 001 1h3m10-11l2 2m-2-2v10a1 1 0 01-1 1h-3m-6 0a1 1 0 001-1v-4a1 1 0 011-1h2a1 1 0 011 1v4a1 1 0 001 1m-6 0h6" />
-        </svg>
-      )
-    },
-    {
-      path: '/inbox',
-      label: 'Inbox',
-      roles: ['Admin', 'Head'],
-      icon: (
-        <svg className="h-5 w-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M3 8l7.89 5.26a2 2 0 002.22 0L21 8M5 19h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v10a2 2 0 002 2z" />
-        </svg>
-      )
-    },
-    {
-      path: '/tasks',
-      label: 'Tasks',
-      roles: ['Admin', 'Head', 'Employee'],
-      icon: (
-        <svg className="h-5 w-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2" />
-        </svg>
-      )
-    },
-    {
-      path: '/clients',
-      label: 'Clients',
-      roles: ['Admin', 'Head', 'Employee'],
-      icon: (
-        <svg className="h-5 w-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M19 21V5a2 2 0 00-2-2H7a2 2 0 00-2 2v16m14 0h2m-2 0h-5m-9 0H3m2 0h5m0 0h4m-4 0a2 2 0 01-2-2V7a2 2 0 012-2h4a2 2 0 012 2v12a2 2 0 01-2 2m-6 0h6" />
-        </svg>
-      )
-    },
-    {
-      path: '/reports',
-      label: 'Reports',
-      roles: ['Admin'],
-      icon: (
-        <svg className="h-5 w-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 002 2h2a2 2 0 002-2z" />
-        </svg>
-      )
-    },
-    {
-      path: '/admin/users',
-      label: 'Users & Approvals',
-      roles: ['Admin'],
-      icon: (
-        <svg className="h-5 w-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M12 4.354a4 4 0 110 5.292M15 21H3v-1a6 6 0 0112 0v1zm0 0h6v-1a6 6 0 00-9-5.197M13 7a3 3 0 11-6 0 3 3 0 016 0z" />
-        </svg>
-      )
-    },
-    {
-      path: '/profile',
-      label: 'My Profile',
-      roles: ['Admin', 'Head', 'Employee'],
-      icon: (
-        <svg className="h-5 w-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M16 7a4 4 0 11-8 0 4 4 0 018 0zM12 14a7 7 0 00-7 7h14a7 7 0 00-7-7z" />
-        </svg>
-      )
-    }
-  ];
-
-  const filteredItems = navItems.filter((item) => item.roles.includes(currentUser.role));
+export function Sidebar({ isOpen, onClose, collapsed = false, onToggleCollapsed }) {
+  const { role } = useAuth()
+  const items = NAV_ITEMS.filter((i) => !role || i.roles.includes(role))
 
   return (
     <>
-      {/* Mobile Drawer Overlay Backdrop */}
-      {isOpen && (
+      {isOpen ? (
         <div
           onClick={onClose}
-          className="fixed inset-0 bg-slate-900/30 backdrop-blur-sm z-40 lg:hidden transition-all duration-300"
+          aria-hidden="true"
+          className="fixed inset-0 z-drawer bg-[rgb(15_23_42/0.45)] lg:hidden"
         />
-      )}
+      ) : null}
 
-      {/* Sidebar Container */}
       <aside
-        className={`fixed top-16 left-0 bottom-0 w-[260px] h-[calc(100vh-4rem)] bg-white border-r border-slate-100 z-45 flex flex-col justify-between overflow-y-auto transition-transform duration-300 lg:translate-x-0 ${
+        aria-label="Main navigation"
+        className={cn(
+          'fixed inset-y-0 left-0 z-drawer flex shrink-0 flex-col border-r border-line bg-canvas',
+          'transition-[transform,width] duration-150',
+          'lg:static lg:z-sidebar lg:translate-x-0',
+          collapsed ? 'w-sidebar-collapsed' : 'w-sidebar',
           isOpen ? 'translate-x-0' : '-translate-x-full'
-        }`}
+        )}
       >
-        <div className="flex flex-col">
-          {/* Header area for logo on mobile */}
-          <div className="h-16 flex items-center px-6 border-b border-slate-100 lg:hidden justify-between">
-            <div className="flex items-center gap-2.5">
-              <div className="h-9 w-9 rounded-xl bg-gradient-to-tr from-indigo-600 to-purple-600 flex items-center justify-center text-white shadow-md shadow-indigo-600/10 shrink-0">
-                <svg className="h-5 w-5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
-                  <polyline points="22 12 16 12 14 15 10 15 8 12 2 12" />
-                  <path d="M5.45 5.11L2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.45-6.89A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11z" />
-                </svg>
-              </div>
-              <span className="font-bold text-slate-800 text-sm leading-none">K M KOTHARI</span>
-            </div>
-            <button onClick={onClose} className="p-1.5 text-slate-400 hover:text-slate-605 rounded-lg">
-              <svg className="h-5 w-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M6 18L18 6M6 6l12 12" />
-              </svg>
-            </button>
-          </div>
+        {/* Mobile header — on desktop the brand lives in the top bar. */}
+        <div className="flex h-topbar shrink-0 items-center justify-between border-b border-line px-3 lg:hidden">
+          <span className="text-sm font-semibold text-fg">K M KOTHARI</span>
+          <Button variant="ghost" size="sm" iconOnly aria-label="Close navigation" onClick={onClose}>
+            <X className="h-4 w-4" />
+          </Button>
+        </div>
 
-          {/* User Profile Block (Gradient Card) */}
-          <div className="p-4 mx-4 mt-4 bg-gradient-to-br from-indigo-600 to-purple-600 rounded-2xl text-white shadow-md shadow-indigo-600/10 flex items-center space-x-3">
-            <div className="h-9 w-9 rounded-xl bg-white/10 backdrop-blur-md border border-white/25 flex items-center justify-center text-white font-bold text-sm shrink-0">
-              {getInitials(currentUser.name)}
-            </div>
-            <div className="flex flex-col min-w-0">
-              <span className="text-xs font-bold truncate leading-none mb-1">{currentUser.name}</span>
-              <span className="text-[9px] font-extrabold tracking-wider bg-white/20 text-white px-2 py-0.5 rounded-full w-max uppercase font-mono">
-                {currentUser.role}
-              </span>
-            </div>
-          </div>
-
-          {/* Navigation vertical items list */}
-          <nav className="p-4 space-y-1.5">
-            {filteredItems.map((item) => (
-              <NavLink
-                key={item.path}
-                to={item.path}
-                onClick={onClose}
-                className={({ isActive }) =>
-                  `flex items-center space-x-3 px-4 py-3 rounded-xl text-xs font-semibold transition-all duration-200 border-l-[3px] ${
-                    isActive
-                      ? 'bg-indigo-50/60 border-indigo-600 text-indigo-600 font-semibold shadow-sm'
-                      : 'border-transparent text-slate-500 hover:bg-slate-50 hover:text-slate-850 hover:translate-x-1'
-                  }`
-                }
-              >
-                <div className="shrink-0 w-5 h-5 flex items-center justify-center">{item.icon}</div>
-                <span>{item.label}</span>
-              </NavLink>
+        <nav className="min-h-0 flex-1 overflow-y-auto p-2 custom-scrollbar">
+          <ul className="space-y-0.5">
+            {items.map(({ to, label, icon: Icon }) => (
+              <li key={to}>
+                <Tooltip content={collapsed ? label : null} side="right">
+                  <NavLink
+                    to={to}
+                    onClick={onClose}
+                    className={({ isActive }) =>
+                      cn(
+                        'flex h-8 items-center gap-2.5 rounded px-2 text-sm font-medium',
+                        'transition-colors duration-100',
+                        'focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary-600',
+                        collapsed && 'justify-center px-0',
+                        isActive
+                          ? 'bg-primary-subtle text-primary-text'
+                          : 'text-fg-2 hover:bg-subtle hover:text-fg'
+                      )
+                    }
+                  >
+                    <Icon aria-hidden="true" className="h-4 w-4 shrink-0" />
+                    {collapsed ? (
+                      <span className="sr-only">{label}</span>
+                    ) : (
+                      <span className="truncate">{label}</span>
+                    )}
+                  </NavLink>
+                </Tooltip>
+              </li>
             ))}
-          </nav>
-        </div>
+          </ul>
+        </nav>
 
-        {/* Footer Logout area */}
-        <div className="p-4 border-t border-slate-100">
-          <button
-            onClick={handleLogout}
-            className="w-full flex items-center justify-center gap-2 px-4 py-3 rounded-xl text-xs font-bold text-red-500 hover:bg-red-50/80 hover:text-red-600 border border-transparent hover:border-red-100 transition-all duration-150 active:scale-98"
-          >
-            <svg className="h-4 w-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M17 16l4-4m0 0l-4-4m4 4H7m6 4v1a3 3 0 01-3 3H6a3 3 0 01-3-3V7a3 3 0 013-3h4a3 3 0 013 3v1" />
-            </svg>
-            <span>Log Out</span>
-          </button>
-        </div>
+        {onToggleCollapsed ? (
+          <div className="hidden shrink-0 border-t border-line p-2 lg:block">
+            <Button
+              variant="ghost"
+              size="sm"
+              fullWidth={!collapsed}
+              iconOnly={collapsed}
+              aria-label={collapsed ? 'Expand navigation' : 'Collapse navigation'}
+              onClick={onToggleCollapsed}
+              className={collapsed ? '' : 'justify-start'}
+            >
+              {collapsed ? (
+                <ChevronRight className="h-4 w-4" />
+              ) : (
+                <>
+                  <ChevronLeft className="h-4 w-4" />
+                  Collapse
+                </>
+              )}
+            </Button>
+          </div>
+        ) : null}
       </aside>
     </>
-  );
-};
+  )
+}
 
-export default Sidebar;
+export default Sidebar

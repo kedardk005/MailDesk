@@ -1,184 +1,257 @@
-import React, { useState } from 'react';
-import { useNavigate, Link } from 'react-router-dom';
-import api from '../api/axios';
+import { useState } from 'react'
+import { Link, Navigate, useNavigate } from 'react-router-dom'
+import { CheckCircle2, Eye, EyeOff, Mail } from 'lucide-react'
 
-const Register = () => {
-  const [name, setName] = useState('');
-  const [email, setEmail] = useState('');
-  const [password, setPassword] = useState('');
-  const [role, setRole] = useState('Employee'); // Default role
-  const [error, setError] = useState('');
-  const [success, setSuccess] = useState('');
-  const [loading, setLoading] = useState(false);
-  const navigate = useNavigate();
+import api, { getErrorMessage } from '../api/axios'
+import { useAuth } from '../components/AuthProvider'
+import { Alert, Button, FormField, Input } from '../components/ui'
 
-  const handleSubmit = async (e) => {
-    e.preventDefault();
-    setError('');
-    setSuccess('');
-    setLoading(true);
+/** Map the server's 400 `{ errors: [{ path, message }] }` onto field messages. */
+function fieldErrorsFrom(error) {
+  const issues = error?.response?.data?.errors
+  if (!Array.isArray(issues)) return {}
+  const out = {}
+  for (const issue of issues) {
+    const key = Array.isArray(issue?.path) ? issue.path.join('.') : issue?.path
+    if (key && !out[key]) out[key] = issue.message
+  }
+  return out
+}
 
+/** Shared chrome for the three unauthenticated screens. */
+function AuthShell({ heading, description, children, footer }) {
+  return (
+    <div className="flex min-h-screen flex-col bg-canvas">
+      <main className="flex flex-1 items-center justify-center px-6 py-12">
+        <div className="w-full max-w-[420px]">
+          <div className="flex items-center gap-2.5">
+            <span
+              aria-hidden="true"
+              className="flex h-9 w-9 items-center justify-center rounded-lg border border-primary-border bg-primary-subtle text-primary-text"
+            >
+              <Mail className="h-4 w-4" />
+            </span>
+            <span className="text-md font-semibold tracking-tight text-fg">K M KOTHARI</span>
+          </div>
+
+          <div className="mt-6 rounded-lg border border-line bg-surface p-6">
+            <h1 className="text-xl font-semibold text-fg">{heading}</h1>
+            {description ? <p className="mt-1.5 text-sm text-fg-2">{description}</p> : null}
+            {children}
+          </div>
+
+          {footer ? <div className="mt-4 text-sm text-fg-3">{footer}</div> : null}
+        </div>
+      </main>
+    </div>
+  )
+}
+
+export default function Register() {
+  const navigate = useNavigate()
+  const { isAuthenticated, login } = useAuth()
+
+  const [form, setForm] = useState({ name: '', email: '', password: '', confirmPassword: '' })
+  const [showPassword, setShowPassword] = useState(false)
+  const [errors, setErrors] = useState({})
+  const [formError, setFormError] = useState('')
+  const [submitting, setSubmitting] = useState(false)
+  /** Set when the server accepts the account but withholds a token. */
+  const [pending, setPending] = useState(null)
+
+  if (isAuthenticated) return <Navigate to="/dashboard" replace />
+
+  const setField = (key) => (event) => {
+    const { value } = event.target
+    setForm((prev) => ({ ...prev, [key]: value }))
+  }
+
+  const validate = () => {
+    const found = {}
+    if (!form.name.trim()) found.name = 'Enter your full name.'
+    if (!form.email.trim()) found.email = 'Enter your work email address.'
+    else if (!/^\S+@\S+\.\S+$/.test(form.email.trim())) found.email = 'Enter a valid email address.'
+    if (!form.password) found.password = 'Choose a password.'
+    else if (form.password.length < 6) found.password = 'Use at least 6 characters.'
+    if (form.confirmPassword !== form.password) found.confirmPassword = 'Passwords do not match.'
+    return found
+  }
+
+  const handleSubmit = async (event) => {
+    event.preventDefault()
+    setFormError('')
+
+    const found = validate()
+    setErrors(found)
+    if (Object.keys(found).length > 0) return
+
+    setSubmitting(true)
     try {
       const res = await api.post('/auth/register', {
-        name,
-        email,
-        password,
-        role
-      });
-      
-      const isPending = res.data?.user?.status === 'Pending';
-      if (isPending) {
-        setSuccess('Account created successfully! Administrator approval is required before you can log in.');
-      } else {
-        setSuccess('Account created successfully! Redirecting to login...');
+        name: form.name.trim(),
+        email: form.email.trim(),
+        password: form.password,
+      })
+
+      // Registration no longer mints a JWT for a non-approved account: the
+      // server returns 201 with a message and the user object, and Admin
+      // approval is a real gate rather than a decorative one. The old code
+      // assumed a token was always present and signed the user straight in.
+      if (res.data?.token) {
+        login({ token: res.data.token, user: res.data.user })
+        navigate('/dashboard', { replace: true })
+        return
       }
-      
-      // Redirect to login: longer delay for pending admins so they can read the notice
-      setTimeout(() => {
-        navigate('/login');
-      }, isPending ? 5000 : 2000);
+
+      setPending({
+        email: res.data?.user?.email || form.email.trim(),
+        message:
+          res.data?.message ||
+          'Registration submitted. An administrator must approve your account before you can sign in.',
+      })
+      setSubmitting(false)
     } catch (err) {
-      console.error('Registration error:', err);
-      const message = err.response?.data?.message || 'Registration failed. Please check your details.';
-      setError(message);
-    } finally {
-      setLoading(false);
+      const fieldErrors = fieldErrorsFrom(err)
+      setErrors(fieldErrors)
+      if (Object.keys(fieldErrors).length === 0) {
+        setFormError(getErrorMessage(err, 'Could not create the account. Check your details.'))
+      }
+      setSubmitting(false)
     }
-  };
+  }
+
+  if (pending) {
+    return (
+      <AuthShell heading="Request submitted">
+        <div className="mt-5 flex flex-col gap-4">
+          <div className="flex items-start gap-2.5 rounded-lg border border-success-border bg-success-subtle px-3 py-2.5 text-sm text-success-text">
+            <CheckCircle2 aria-hidden="true" className="mt-px h-4 w-4 shrink-0 text-success" />
+            <p>{pending.message}</p>
+          </div>
+
+          <dl className="rounded-lg border border-line bg-subtle px-3 py-2.5 text-sm">
+            <dt className="text-xs text-fg-3">Account</dt>
+            <dd className="mt-0.5 break-all font-mono text-fg">{pending.email}</dd>
+            <dt className="mt-2.5 text-xs text-fg-3">Status</dt>
+            <dd className="mt-0.5 text-fg">Awaiting administrator approval</dd>
+          </dl>
+
+          <p className="text-sm text-fg-2">
+            You will not be able to sign in until an administrator approves the account. Contact
+            your workspace administrator if it is urgent.
+          </p>
+
+          <Button as={Link} to="/login" variant="primary" size="lg" fullWidth>
+            Back to sign in
+          </Button>
+        </div>
+      </AuthShell>
+    )
+  }
+
+  const passwordToggle = (
+    <button
+      type="button"
+      aria-label={showPassword ? 'Hide password' : 'Show password'}
+      aria-pressed={showPassword}
+      onClick={() => setShowPassword((v) => !v)}
+      className="flex h-6 w-6 items-center justify-center rounded text-fg-3 hover:text-fg-2 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-primary-600"
+    >
+      {showPassword ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
+    </button>
+  )
 
   return (
-    <div className="min-h-screen flex bg-white font-sans overflow-hidden select-none relative">
-      {/* Left half: Decorative Indigo Gradient (hidden on mobile) */}
-      <div className="hidden lg:flex lg:w-1/2 bg-gradient-to-tr from-indigo-600 via-indigo-500 to-purple-600 relative items-center justify-center p-12 overflow-hidden">
-        {/* Floating animated blobs */}
-        <div className="absolute top-10 left-10 h-72 w-72 bg-white/10 rounded-full blur-2xl animate-pulse" />
-        <div className="absolute bottom-10 right-10 h-96 w-96 bg-white/5 rounded-full blur-3xl animate-pulse delay-1000" />
-        <div className="absolute top-1/2 left-1/3 h-56 w-56 bg-indigo-400/20 rounded-full blur-3xl pointer-events-none" />
+    <AuthShell
+      heading="Request access"
+      description="Create an account request. An administrator approves it before you can sign in."
+      footer={
+        <>
+          Already have an account?{' '}
+          <Link
+            to="/login"
+            className="rounded font-medium text-primary-text underline underline-offset-2 hover:text-primary-700 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary-600"
+          >
+            Sign in
+          </Link>
+          .
+        </>
+      }
+    >
+      {formError ? (
+        <Alert variant="danger" title="Could not submit the request" className="mt-5">
+          {formError}
+        </Alert>
+      ) : null}
 
-        <div className="relative z-10 max-w-md text-white text-center space-y-6">
-          <div className="mx-auto h-16 w-16 rounded-2xl bg-white/10 backdrop-blur-md flex items-center justify-center shadow-2xl border border-white/20">
-            <svg className="h-8 w-8 text-white" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
-              <polyline points="22 12 16 12 14 15 10 15 8 12 2 12" />
-              <path d="M5.45 5.11L2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.45-6.89A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11z" />
-            </svg>
-          </div>
-          <h1 className="text-4xl font-black tracking-tight leading-none">K M KOTHARI</h1>
-          <p className="text-white/80 leading-relaxed text-base font-semibold">
-            Where Emails Meet Action.
-          </p>
-        </div>
-      </div>
-
-      {/* Right half: Form card (full screen on mobile) */}
-      <div className="w-full lg:w-1/2 flex items-center justify-center px-6 sm:px-12 lg:px-20 bg-slate-50/30">
-        <div className="max-w-md w-full space-y-6 bg-white p-8 sm:p-10 rounded-3xl shadow-xl border border-slate-100/80 relative">
-          <div>
-            <div className="mx-auto lg:mx-0 h-11 w-11 rounded-2xl bg-gradient-to-tr from-indigo-600 to-purple-600 flex items-center justify-center text-white shadow-md shadow-indigo-600/10 mb-6">
-              <svg className="h-5 w-5 text-white" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
-                <polyline points="22 12 16 12 14 15 10 15 8 12 2 12" />
-                <path d="M5.45 5.11L2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.45-6.89A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11z" />
-              </svg>
-            </div>
-            <h2 className="text-3xl font-black text-slate-900 tracking-tight leading-none">
-              Create account
-            </h2>
-            <p className="mt-2 text-xs text-slate-500 font-medium leading-relaxed">
-              Manage Mails. Assign Tasks. Stay Ahead.
-            </p>
-          </div>
-
-          {error && (
-            <div className="bg-red-50 border border-red-100 text-red-500 p-4 rounded-xl text-xs flex items-start space-x-2 animate-shake">
-              <svg className="h-4 w-4 shrink-0 mt-0.5 text-red-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" />
-              </svg>
-              <span>{error}</span>
-            </div>
+      <form className="mt-5 flex flex-col gap-4" onSubmit={handleSubmit} noValidate>
+        <FormField label="Full name" required error={errors.name}>
+          {(field) => (
+            <Input
+              {...field}
+              name="name"
+              size="lg"
+              autoComplete="name"
+              placeholder="Asha Rao"
+              value={form.name}
+              onChange={setField('name')}
+            />
           )}
+        </FormField>
 
-          {success && (
-            <div className="bg-emerald-50 border border-emerald-100 text-emerald-600 p-4 rounded-xl text-xs flex items-start space-x-2">
-              <svg className="h-4 w-4 shrink-0 mt-0.5 text-emerald-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z" />
-              </svg>
-              <span>{success}</span>
-            </div>
+        <FormField label="Email address" required error={errors.email}>
+          {(field) => (
+            <Input
+              {...field}
+              type="email"
+              name="email"
+              size="lg"
+              autoComplete="username"
+              placeholder="you@company.com"
+              value={form.email}
+              onChange={setField('email')}
+            />
           )}
+        </FormField>
 
-          <form className="mt-4 space-y-3" onSubmit={handleSubmit}>
-            <div>
-              <label htmlFor="name" className="block text-[10px] font-bold text-slate-400 uppercase tracking-wider mb-1">
-                Full Name
-              </label>
-              <input
-                id="name"
-                name="name"
-                type="text"
-                required
-                className="mt-1 block w-full px-4 py-2.5 bg-slate-50/50 hover:bg-slate-50/80 border border-slate-200/80 rounded-xl text-slate-900 placeholder-slate-400 focus:outline-none focus:ring-2 focus:ring-indigo-100 focus:border-indigo-500 transition-all duration-150 text-xs font-semibold focus:bg-white"
-                placeholder="John Doe"
-                value={name}
-                onChange={(e) => setName(e.target.value)}
-              />
-            </div>
+        <FormField
+          label="Password"
+          required
+          error={errors.password}
+          hint="At least 6 characters."
+        >
+          {(field) => (
+            <Input
+              {...field}
+              type={showPassword ? 'text' : 'password'}
+              name="password"
+              size="lg"
+              autoComplete="new-password"
+              value={form.password}
+              onChange={setField('password')}
+              trailingIcon={passwordToggle}
+            />
+          )}
+        </FormField>
 
-            <div>
-              <label htmlFor="email" className="block text-[10px] font-bold text-slate-400 uppercase tracking-wider mb-1">
-                Email Address
-              </label>
-              <input
-                id="email"
-                name="email"
-                type="email"
-                required
-                className="mt-1 block w-full px-4 py-2.5 bg-slate-50/50 hover:bg-slate-50/80 border border-slate-200/80 rounded-xl text-slate-900 placeholder-slate-400 focus:outline-none focus:ring-2 focus:ring-indigo-100 focus:border-indigo-500 transition-all duration-150 text-xs font-semibold focus:bg-white"
-                placeholder="you@example.com"
-                value={email}
-                onChange={(e) => setEmail(e.target.value)}
-              />
-            </div>
+        <FormField label="Confirm password" required error={errors.confirmPassword}>
+          {(field) => (
+            <Input
+              {...field}
+              type={showPassword ? 'text' : 'password'}
+              name="confirmPassword"
+              size="lg"
+              autoComplete="new-password"
+              value={form.confirmPassword}
+              onChange={setField('confirmPassword')}
+            />
+          )}
+        </FormField>
 
-            <div>
-              <label htmlFor="password" className="block text-[10px] font-bold text-slate-400 uppercase tracking-wider mb-1">
-                Password
-              </label>
-              <input
-                id="password"
-                name="password"
-                type="password"
-                required
-                className="mt-1 block w-full px-4 py-2.5 bg-slate-50/50 hover:bg-slate-50/80 border border-slate-200/80 rounded-xl text-slate-900 placeholder-slate-400 focus:outline-none focus:ring-2 focus:ring-indigo-100 focus:border-indigo-500 transition-all duration-150 text-xs font-semibold focus:bg-white"
-                placeholder="••••••••"
-                value={password}
-                onChange={(e) => setPassword(e.target.value)}
-              />
-            </div>
-
-
-
-            <div className="pt-2">
-              <button
-                type="submit"
-                disabled={loading}
-                className="w-full flex justify-center py-3 px-4 text-xs font-bold rounded-xl text-white bg-gradient-to-r from-indigo-600 to-purple-600 hover:from-indigo-700 hover:to-purple-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-indigo-500 transition-all duration-150 disabled:opacity-50 disabled:cursor-not-allowed shadow-[0_4px_15px_rgba(99,102,241,0.3)] hover:shadow-[0_6px_20px_rgba(99,102,241,0.4)] active:scale-[0.98]"
-              >
-                {loading ? 'Registering...' : 'Register'}
-              </button>
-            </div>
-          </form>
-
-          <div className="text-center mt-4">
-            <p className="text-xs text-slate-500 font-semibold">
-              Already have an account?{' '}
-              <Link to="/login" className="font-bold text-indigo-600 hover:text-indigo-700 transition-colors">
-                Sign In
-              </Link>
-            </p>
-          </div>
-        </div>
-      </div>
-    </div>
-  );
-};
-
-export default Register;
+        <Button type="submit" variant="primary" size="lg" fullWidth loading={submitting}>
+          Submit request
+        </Button>
+      </form>
+    </AuthShell>
+  )
+}

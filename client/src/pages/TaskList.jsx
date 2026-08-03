@@ -1,1846 +1,2263 @@
-import React, { useState, useEffect, useRef } from 'react';
-import { useNavigate, Link, useLocation } from 'react-router-dom';
-import api from '../api/axios';
+/**
+ * Tasks — List / Board / Calendar.
+ *
+ * Everything that changes what is on screen (view, filters, sort, page, the
+ * open task, the create dialog) lives in the URL query string, so any view is
+ * bookmarkable and shareable.
+ *
+ * Data comes from `GET /api/tasks` under the list contract
+ * (docs/audits/API-LIST-CONTRACT.md): `{ data, pagination }` when `page` is
+ * sent. While the server migration is in flight the endpoint still answers with
+ * a bare array; `applyLegacyQuery` below reproduces the same filter/sort/page
+ * semantics on the client so the screen is correct either way. Delete it once
+ * `/api/tasks` returns `pagination`.
+ */
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { useSearchParams } from 'react-router-dom'
+import {
+  CalendarDays,
+  CheckCircle2,
+  ChevronDown,
+  ChevronLeft,
+  ChevronRight,
+  ClipboardList,
+  Columns3,
+  Download,
+  LayoutList,
+  Link2,
+  MessageSquare,
+  MoreHorizontal,
+  Pencil,
+  Plus,
+  Repeat,
+  Search,
+  Send,
+  Trash2,
+  X,
+} from 'lucide-react'
+import api, { getErrorMessage, isCanceled } from '../api/axios'
+import { useAuth } from '../components/AuthProvider'
+import { useRegisterCommands } from '../components/CommandRegistry'
+import EmailBody from '../components/EmailBody'
+import {
+  Alert,
+  Avatar,
+  Badge,
+  Button,
+  DataTable,
+  Dialog,
+  DialogClose,
+  DialogContent,
+  Drawer,
+  DrawerContent,
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuLabel,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+  EmptyState,
+  FormField,
+  Input,
+  PageBody,
+  PageHeader,
+  SegmentedControl,
+  Select,
+  SelectMenu,
+  Skeleton,
+  Tabs,
+  TabsContent,
+  TabsList,
+  TabsTrigger,
+  Textarea,
+  Toolbar,
+  Tooltip,
+  toast,
+  useConfirm,
+} from '../components/ui'
+import { cn, formatNumber, timeAgo } from '../lib/utils'
+import { ExtractActionsPanel } from '../components/ActionExtraction'
 
-const getPriorityStyle = (priority) => {
-  const styles = {
-    Low:    { background: '#f0fdf4', color: '#166534', border: '1px solid #bbf7d0' },
-    Medium: { background: '#fefce8', color: '#854d0e', border: '1px solid #fde68a' },
-    High:   { background: '#fff7ed', color: '#9a3412', border: '1px solid #fed7aa' },
-    Urgent: { background: '#fef2f2', color: '#991b1b', border: '1px solid #fecaca' },
-  };
-  return styles[priority] || styles['Medium'];
-};
+/* -------------------------------------------------------------------------- */
+/* Constants                                                                   */
+/* -------------------------------------------------------------------------- */
 
-const renderEmailContent = (body) => {
-  if (!body) return '<html><body><span style="font-family: sans-serif; font-size: 13px; color: #94a3b8; font-style: italic;">This email has no text content.</span></body></html>';
-  // Strip <script> tags to prevent execution warnings
-  const cleanBody = body.replace(/<script\b[^<]*(?:(?!<\/script>)<[^<]*)*<\/script>/gi, '');
-  const isHtml = /<[a-z][\s\S]*>/i.test(cleanBody);
-  const styledBody = isHtml 
-    ? cleanBody 
-    : `<div style="white-space: pre-wrap; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; font-size: 13px; line-height: 1.5; color: #334155;">${cleanBody.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')}</div>`;
-  return `<html><head><style>body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; font-size: 13px; line-height: 1.5; color: #334155; margin: 12px; word-break: break-word; } img { max-width: 100%; height: auto; display: block; margin: 8px 0; }</style></head><body>${styledBody}</body></html>`;
-};
+const STATUSES = ['Pending', 'Completed', 'Late']
+const PRIORITIES = ['Low', 'Medium', 'High', 'Urgent']
+const RECURRENCES = ['Daily', 'Weekly', 'Monthly']
+const WEEKDAYS = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat']
 
-const TaskList = () => {
-  const [tasks, setTasks] = useState(() => {
-    try {
-      const cached = localStorage.getItem('cached_tasks_data');
-      return cached ? JSON.parse(cached) : [];
-    } catch {
-      return [];
+/** Mirrors the server Zod bounds in middleware/schemas.js. */
+const LIMITS = { title: 300, clientName: 200, description: 20000, notes: 20000 }
+
+/** Radix Select forbids an empty item value; this stands in for "no filter". */
+const ANY = '__any'
+
+const VIEW_OPTIONS = [
+  { value: 'list', label: 'List', icon: <LayoutList /> },
+  { value: 'board', label: 'Board', icon: <Columns3 /> },
+  { value: 'calendar', label: 'Calendar', icon: <CalendarDays /> },
+]
+
+/** Board/calendar load one page of this size — the contract caps `limit` at 100. */
+const WIDE_VIEW_LIMIT = 100
+
+const QUERY_DEFAULTS = {
+  view: 'list',
+  status: '',
+  priority: '',
+  assignee: '',
+  creator: '',
+  client: '',
+  q: '',
+  sort: '-createdAt',
+  page: '1',
+  limit: '25',
+  month: '',
+  task: '',
+  compose: '',
+}
+
+const FILTER_KEYS = ['status', 'priority', 'assignee', 'creator', 'client', 'q']
+
+/* -------------------------------------------------------------------------- */
+/* Pure helpers                                                                */
+/* -------------------------------------------------------------------------- */
+
+const idOf = (ref) => (ref && typeof ref === 'object' ? ref._id : ref) || ''
+
+const priorityVariant = (p) =>
+  ({ Low: 'neutral', Medium: 'info', High: 'warning', Urgent: 'danger' })[p] || 'info'
+
+const statusVariant = (s) =>
+  ({ Pending: 'warning', Completed: 'success', Late: 'danger' })[s] || 'neutral'
+
+const dayKey = (date) => `${date.getFullYear()}-${date.getMonth()}-${date.getDate()}`
+
+function toDate(value) {
+  if (!value) return null
+  const d = new Date(value)
+  return Number.isNaN(d.getTime()) ? null : d
+}
+
+/** Absolute, unambiguous — used in tooltips and the drawer. */
+function formatAbsolute(value) {
+  const d = toDate(value)
+  if (!d) return 'No deadline'
+  return d.toLocaleString(undefined, {
+    day: '2-digit',
+    month: 'short',
+    year: 'numeric',
+    hour: '2-digit',
+    minute: '2-digit',
+  })
+}
+
+/** Short relative deadline: "Overdue 2d", "in 5h", "in 3d". */
+function relativeDue(value, now) {
+  const d = toDate(value)
+  if (!d) return '—'
+  const diff = d.getTime() - now
+  const abs = Math.abs(diff)
+  const mins = Math.round(abs / 60000)
+  const hours = Math.round(abs / 3600000)
+  const days = Math.round(abs / 86400000)
+  const span = mins < 60 ? `${mins}m` : hours < 48 ? `${hours}h` : `${days}d`
+  return diff < 0 ? `Overdue ${span}` : `in ${span}`
+}
+
+/** `<input type="datetime-local">` needs a local, offset-free value. */
+function toLocalInput(value) {
+  const d = toDate(value)
+  if (!d) return ''
+  const pad = (n) => String(n).padStart(2, '0')
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`
+}
+
+/** Accepts both contract shapes plus the pre-migration bare array. */
+function unwrapList(payload) {
+  if (Array.isArray(payload)) return { data: payload, pagination: null }
+  if (payload && Array.isArray(payload.data)) {
+    return { data: payload.data, pagination: payload.pagination || null }
+  }
+  return { data: [], pagination: null }
+}
+
+const SORT_ACCESSORS = {
+  title: (t) => (t.title || '').toLowerCase(),
+  clientName: (t) => (t.clientName || '').toLowerCase(),
+  status: (t) => STATUSES.indexOf(t.status),
+  priority: (t) => PRIORITIES.indexOf(t.priority || 'Medium'),
+  deadline: (t) => toDate(t.deadline)?.getTime() ?? Number.POSITIVE_INFINITY,
+  createdAt: (t) => toDate(t.createdAt)?.getTime() ?? 0,
+  assignedTo: (t) => (t.assignedTo?.name || '').toLowerCase(),
+}
+
+/**
+ * Client-side stand-in for the not-yet-migrated `/api/tasks`. Applies exactly
+ * the filters, sort and paging the request asked the server for.
+ */
+function applyLegacyQuery(list, params) {
+  const needle = (params.q || '').trim().toLowerCase()
+  const filtered = list.filter((t) => {
+    if (params.status && t.status !== params.status) return false
+    if (params.priority && (t.priority || 'Medium') !== params.priority) return false
+    if (params.assignedTo && idOf(t.assignedTo) !== params.assignedTo) return false
+    if (params.createdBy && idOf(t.createdBy) !== params.createdBy) return false
+    if (params.clientName && t.clientName !== params.clientName) return false
+    if (needle) {
+      const hay = `${t.title || ''} ${t.clientName || ''} ${t.assignedTo?.name || ''}`.toLowerCase()
+      if (!hay.includes(needle)) return false
     }
-  });
-  const [loading, setLoading] = useState(() => {
-    try {
-      return !localStorage.getItem('cached_tasks_data');
-    } catch {
-      return true;
-    }
-  });
-  const [actionLoading, setActionLoading] = useState(false);
-  const [alert, setAlert] = useState({ type: '', message: '' });
-  const [creatorFilter, setCreatorFilter] = useState('');
-  const [statusFilter, setStatusFilter] = useState('All');
-  const [priorityFilter, setPriorityFilter] = useState('All');
-  const [expandedTaskId, setExpandedTaskId] = useState(null);
+    return true
+  })
 
+  const desc = String(params.sort || '').startsWith('-')
+  const field = desc ? params.sort.slice(1) : params.sort
+  const accessor = SORT_ACCESSORS[field] || SORT_ACCESSORS.createdAt
+  const sorted = filtered.slice().sort((a, b) => {
+    const av = accessor(a)
+    const bv = accessor(b)
+    if (av === bv) return 0
+    return (av > bv ? 1 : -1) * (desc ? -1 : 1)
+  })
 
+  const page = Math.max(1, Number(params.page) || 1)
+  const limit = Math.max(1, Number(params.limit) || 25)
+  return { rows: sorted.slice((page - 1) * limit, page * limit), total: sorted.length }
+}
 
-  // Comment state variables
-  const [commentMap, setCommentMap] = useState({}); // { taskId: Comment[] }
-  const [commentLoadingId, setCommentLoadingId] = useState(null);
-  const [commentInput, setCommentInput] = useState('');
-  const [commentSubmitting, setCommentSubmitting] = useState(false);
+/**
+ * 42 cells (6 weeks) covering the month `anchor` falls in.
+ * Computed once per month, never inside a cell.
+ */
+function buildMonthGrid(anchor) {
+  const year = anchor.getFullYear()
+  const month = anchor.getMonth()
+  const lead = new Date(year, month, 1).getDay()
+  const cells = []
+  for (let i = 0; i < 42; i += 1) {
+    const d = new Date(year, month, i - lead + 1)
+    cells.push({ date: d, key: dayKey(d), inMonth: d.getMonth() === month })
+  }
+  return cells
+}
 
-  // View mode & Calendar states
-  const [viewMode, setViewMode] = useState('list'); // 'list' | 'kanban' | 'calendar'
-  const [draggedTaskId, setDraggedTaskId] = useState(null);
-  const [dragOverColumn, setDragOverColumn] = useState(null);
-  const [currentDate, setCurrentDate] = useState(new Date());
+/** 401/403/429 are already surfaced by the axios interceptor. */
+function reportError(err, fallback) {
+  if (isCanceled(err)) return
+  const status = err?.response?.status
+  if (status === 401 || status === 403 || status === 429) return
+  toast.error(fallback, { description: getErrorMessage(err) })
+}
 
-  // Dropdown options data
-  const [clients, setClients] = useState([]);
-  const [users, setUsers] = useState([]);
-  const [unassignedEmails, setUnassignedEmails] = useState([]);
+/* -------------------------------------------------------------------------- */
+/* URL state                                                                   */
+/* -------------------------------------------------------------------------- */
 
-  // Modals state
-  const [isCreateOpen, setIsCreateOpen] = useState(false);
-  const [isEditOpen, setIsEditOpen] = useState(false);
-
-  // Form states for Create Task
-  const [newTask, setNewTask] = useState({
-    title: '',
-    description: '',
-    clientName: '',
-    assignedTo: '',
-    linkedEmail: '',
-    deadline: '',
-    notes: '',
-    priority: 'Medium',
-    isRecurring: false,
-    recurrence: 'Weekly'
-  });
-
-  // Client search suggestions states (Create Task)
-  const [clientSearchQuery, setClientSearchQuery] = useState('');
-  const [showClientSuggestions, setShowClientSuggestions] = useState(false);
-  const clientSuggestionsRef = useRef(null);
-
-  // Form states for Edit Task
-  const [selectedTask, setSelectedTask] = useState(null);
-  const [editForm, setEditForm] = useState({
-    id: '',
-    title: '',
-    description: '',
-    clientName: '',
-    assignedTo: '',
-    deadline: '',
-    notes: '',
-    status: 'Pending',
-    priority: 'Medium',
-    isRecurring: false,
-    recurrence: 'Weekly'
-  });
-
-  // Client search suggestions states (Edit Task)
-  const [editClientSearchQuery, setEditClientSearchQuery] = useState('');
-  const [showEditClientSuggestions, setShowEditClientSuggestions] = useState(false);
-  const editClientSuggestionsRef = useRef(null);
-
-  // Current logged in user context
-  const [currentUser, setCurrentUser] = useState({ name: 'Guest', role: 'Employee' });
-
-  const navigate = useNavigate();
-  const location = useLocation();
-
-  // Load current user and fetch tasks on mount
+/**
+ * A clock the render can depend on. Reading `Date.now()` during render is
+ * impure — relative deadlines would only refresh when something else happened
+ * to re-render the row.
+ */
+function useNow(intervalMs = 60000) {
+  const [now, setNow] = useState(() => Date.now())
   useEffect(() => {
-    const userString = localStorage.getItem('user');
-    if (userString) {
+    const id = setInterval(() => setNow(Date.now()), intervalMs)
+    return () => clearInterval(id)
+  }, [intervalMs])
+  return now
+}
+
+function useQueryState() {
+  const [searchParams, setSearchParams] = useSearchParams()
+
+  const state = useMemo(() => {
+    const read = (key) => searchParams.get(key) ?? QUERY_DEFAULTS[key]
+    return {
+      view: ['list', 'board', 'calendar'].includes(read('view')) ? read('view') : 'list',
+      status: STATUSES.includes(read('status')) ? read('status') : '',
+      priority: PRIORITIES.includes(read('priority')) ? read('priority') : '',
+      assignee: read('assignee'),
+      creator: read('creator'),
+      client: read('client'),
+      q: read('q'),
+      sort: read('sort'),
+      page: Math.max(1, Number(read('page')) || 1),
+      limit: Math.min(100, Math.max(1, Number(read('limit')) || 25)),
+      month: read('month'),
+      // `expandTaskId` is the notification deep link (NotificationBell.jsx).
+      task: searchParams.get('task') || searchParams.get('expandTaskId') || '',
+      // `linkEmail` is the "create task from email" deep link (EmailInbox.jsx).
+      composing: searchParams.get('compose') === '1' || Boolean(searchParams.get('linkEmail')),
+      linkEmail: searchParams.get('linkEmail') || '',
+      linkTitle: searchParams.get('title') || '',
+      linkClient: searchParams.get('clientName') || '',
+    }
+  }, [searchParams])
+
+  const update = useCallback(
+    (patch) => {
+      setSearchParams(
+        (prev) => {
+          const next = new URLSearchParams(prev)
+          Object.entries(patch).forEach(([key, value]) => {
+            const str = value === null || value === undefined ? '' : String(value)
+            if (!str || str === QUERY_DEFAULTS[key]) next.delete(key)
+            else next.set(key, str)
+          })
+          return next
+        },
+        { replace: true }
+      )
+    },
+    [setSearchParams]
+  )
+
+  return [state, update]
+}
+
+/* -------------------------------------------------------------------------- */
+/* Data hooks                                                                  */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * @param {object} params memoised request params — every fetch is aborted on
+ *   change, so the five refetch paths can never race each other.
+ */
+function useTaskQuery(params) {
+  const [result, setResult] = useState({ rows: [], total: 0, loading: true, error: null })
+  const [nonce, setNonce] = useState(0)
+
+  useEffect(() => {
+    const ctrl = new AbortController()
+    let alive = true
+    ;(async () => {
+      setResult((prev) => ({ ...prev, loading: true, error: null }))
       try {
-        setCurrentUser(JSON.parse(userString));
-      } catch (err) {
-        console.error('Error parsing current user details:', err);
-      }
-    }
-    fetchTasks();
-    fetchDropdownData();
-  }, []);
-
-  // Check for notification redirect with expandTaskId to expand task and fetch comments
-  useEffect(() => {
-    if (loading || tasks.length === 0) return;
-    const params = new URLSearchParams(location.search);
-    const expandId = params.get('expandTaskId');
-    if (expandId) {
-      setExpandedTaskId(expandId);
-      if (!commentMap[expandId]) {
-        loadComments(expandId);
-      }
-      // Clear URL parameter using react-router navigation replace
-      navigate('/tasks', { replace: true });
-    }
-  }, [location.search, tasks, loading]);
-
-  // Check for linking parameters from Email Inbox page to pre-fill Create Task form
-  useEffect(() => {
-    const params = new URLSearchParams(location.search);
-    const linkEmail = params.get('linkEmail');
-    const title = params.get('title');
-    const clientName = params.get('clientName');
-
-    if (linkEmail) {
-      setNewTask(prev => ({
-        ...prev,
-        linkedEmail: linkEmail,
-        title: title || '',
-        clientName: clientName || ''
-      }));
-      if (clientName) {
-        setClientSearchQuery(clientName);
-      }
-      setIsCreateOpen(true);
-      // Clean up URL parameters using react-router navigation replace
-      navigate('/tasks', { replace: true });
-    }
-  }, [tasks]);
-
-  // Handle outside clicks to close client dropdown suggestions
-  useEffect(() => {
-    const handleClickOutside = (event) => {
-      if (clientSuggestionsRef.current && !clientSuggestionsRef.current.contains(event.target)) {
-        setShowClientSuggestions(false);
-      }
-      if (editClientSuggestionsRef.current && !editClientSuggestionsRef.current.contains(event.target)) {
-        setShowEditClientSuggestions(false);
-      }
-    };
-    document.addEventListener('mousedown', handleClickOutside);
-    return () => document.removeEventListener('mousedown', handleClickOutside);
-  }, []);
-
-  const triggerAlert = (type, message) => {
-    setAlert({ type, message });
-    setTimeout(() => {
-      setAlert({ type: '', message: '' });
-    }, 4500);
-  };
-
-  const fetchTasks = async () => {
-    setLoading(prev => tasks.length === 0 ? true : false);
-    try {
-      const response = await api.get('/tasks');
-      setTasks(response.data);
-      try {
-        localStorage.setItem('cached_tasks_data', JSON.stringify(response.data));
-      } catch (e) {
-        console.error('Failed to update task cache:', e);
-      }
-    } catch (err) {
-      console.error('Error loading task list:', err);
-      triggerAlert('error', err.response?.data?.message || 'Failed to retrieve task records.');
-    } finally {
-      setLoading(false);
-    }
-  };
-
-  const fetchDropdownData = async () => {
-    try {
-      // 1. Fetch Clients
-      const clientsRes = await api.get('/tasks/clients');
-      setClients(clientsRes.data);
-
-      // 2. Fetch Users (only if role is Admin or Head)
-      const userString = localStorage.getItem('user');
-      if (userString) {
-        const parsed = JSON.parse(userString);
-        if (parsed.role === 'Admin' || parsed.role === 'Head') {
-          const usersRes = await api.get('/users');
-          // Filter to show all approved users for assignment list
-          const assignable = usersRes.data.filter(u => u.status === 'Approved' || !u.status);
-          setUsers(assignable);
-
-          // 3. Fetch unassigned emails (excluding spam)
-          const emailsRes = await api.get('/gmail/emails');
-          const unassigned = emailsRes.data.filter(e => e.status === 'unassigned' && !e.labelIds?.includes('SPAM'));
-          setUnassignedEmails(unassigned);
+        const res = await api.get('/tasks', { params, signal: ctrl.signal })
+        if (!alive) return
+        const { data, pagination } = unwrapList(res.data)
+        if (pagination) {
+          setResult({ rows: data, total: pagination.total ?? data.length, loading: false, error: null })
+        } else {
+          const { rows, total } = applyLegacyQuery(data, params)
+          setResult({ rows, total, loading: false, error: null })
         }
+      } catch (err) {
+        if (!alive || isCanceled(err)) return
+        setResult({ rows: [], total: 0, loading: false, error: getErrorMessage(err) })
       }
-    } catch (err) {
-      console.error('Error fetching dropdown resource feeds:', err);
+    })()
+    return () => {
+      alive = false
+      ctrl.abort()
     }
-  };
+  }, [params, nonce])
 
-  const handleCreateTask = async (e) => {
-    e.preventDefault();
+  const reload = useCallback(() => setNonce((n) => n + 1), [])
 
-    // Validate required fields
-    if (!newTask.title || !newTask.clientName || !newTask.assignedTo || !newTask.deadline) {
-      triggerAlert('error', 'Title, Client Name, Assignee, and Deadline are required fields.');
-      return;
+  /** Merge a partial into exactly one row — never restores a whole snapshot. */
+  const patchRow = useCallback((taskId, partial) => {
+    setResult((prev) => ({
+      ...prev,
+      rows: prev.rows.map((t) => (t._id === taskId ? { ...t, ...partial } : t)),
+    }))
+  }, [])
+
+  return { ...result, reload, patchRow }
+}
+
+/** Clients / assignable users / linkable emails, fetched once and in parallel. */
+function useTaskOptions(canAssign) {
+  const [options, setOptions] = useState({ clients: [], users: [], emails: [] })
+  const [nonce, setNonce] = useState(0)
+
+  useEffect(() => {
+    const ctrl = new AbortController()
+    let alive = true
+    ;(async () => {
+      const get = (url, params) =>
+        api
+          .get(url, { params, signal: ctrl.signal })
+          .then((r) => unwrapList(r.data).data)
+          .catch(() => [])
+
+      const [clients, users, emails] = await Promise.all([
+        get('/tasks/clients'),
+        canAssign ? get('/users', { page: 1, limit: 100, sort: 'name' }) : Promise.resolve([]),
+        // Only the linkable slice, and never with bodies — the list contract
+        // returns a snippet. This used to download every email in the account.
+        canAssign
+          ? get('/gmail/emails', { page: 1, limit: WIDE_VIEW_LIMIT, status: 'unassigned' })
+          : Promise.resolve([]),
+      ])
+      if (!alive) return
+      setOptions({
+        clients,
+        users: users.filter((u) => !u.status || u.status === 'Approved'),
+        emails: emails.filter((e) => e.status === 'unassigned' && !e.labelIds?.includes('SPAM')),
+      })
+    })()
+    return () => {
+      alive = false
+      ctrl.abort()
     }
+  }, [canAssign, nonce])
 
-    // Validate deadline is in the future
-    const selectedDeadline = new Date(newTask.deadline);
-    if (selectedDeadline <= new Date()) {
-      triggerAlert('error', 'Deadline must be a date and time in the future.');
-      return;
+  const reload = useCallback(() => setNonce((n) => n + 1), [])
+  return useMemo(() => ({ ...options, reload }), [options, reload])
+}
+
+/* -------------------------------------------------------------------------- */
+/* Small presentational pieces                                                 */
+/* -------------------------------------------------------------------------- */
+
+function DueCell({ task, now }) {
+  const d = toDate(task.deadline)
+  if (!d) return <span className="text-fg-off">—</span>
+  const overdue = d.getTime() < now && task.status !== 'Completed'
+  return (
+    <Tooltip content={formatAbsolute(task.deadline)}>
+      <span className={cn('tabular text-sm', overdue ? 'font-medium text-danger-text' : 'text-fg-2')}>
+        {relativeDue(task.deadline, now)}
+      </span>
+    </Tooltip>
+  )
+}
+
+function AssigneeCell({ user }) {
+  if (!user) return <span className="text-fg-off">Unassigned</span>
+  return (
+    <span className="flex min-w-0 items-center gap-2">
+      <Avatar size="xs" name={user.name} id={user._id} />
+      <span className="truncate">{user.name}</span>
+    </span>
+  )
+}
+
+function TaskFlags({ task }) {
+  return (
+    <span className="flex items-center gap-1.5 text-fg-3">
+      {task.linkedEmail ? (
+        <Tooltip content="Has a linked email">
+          <Link2 role="img" aria-label="Has a linked email" className="h-3.5 w-3.5" />
+        </Tooltip>
+      ) : null}
+      {task.isRecurring ? (
+        <Tooltip content={`Repeats ${(task.recurrence || 'weekly').toLowerCase()}`}>
+          <Repeat
+            role="img"
+            aria-label={`Repeats ${(task.recurrence || 'Weekly').toLowerCase()}`}
+            className="h-3.5 w-3.5"
+          />
+        </Tooltip>
+      ) : null}
+    </span>
+  )
+}
+
+/* `DataTable` ignores row clicks originating on an interactive descendant, so
+ * the manual stopPropagation this menu used to carry is redundant. */
+function RowMenu({ task, perms, onOpen, onEdit, onComplete, onDelete }) {
+  return (
+    <DropdownMenu>
+      <DropdownMenuTrigger asChild>
+        <Button variant="ghost" size="sm" iconOnly aria-label={`Actions for ${task.title}`}>
+          <MoreHorizontal className="h-4 w-4" />
+        </Button>
+      </DropdownMenuTrigger>
+      <DropdownMenuContent align="end">
+        <DropdownMenuItem onSelect={() => onOpen(task)}>
+          <ClipboardList className="h-4 w-4" />
+          Open details
+        </DropdownMenuItem>
+        {perms.canComplete(task) ? (
+          <DropdownMenuItem onSelect={() => onComplete(task)}>
+            <CheckCircle2 className="h-4 w-4" />
+            Mark complete
+          </DropdownMenuItem>
+        ) : null}
+        {perms.canEdit(task) ? (
+          <DropdownMenuItem onSelect={() => onEdit(task)}>
+            <Pencil className="h-4 w-4" />
+            Edit task
+          </DropdownMenuItem>
+        ) : null}
+        {perms.canDelete(task) ? (
+          <>
+            <DropdownMenuSeparator />
+            <DropdownMenuItem destructive onSelect={() => onDelete(task)}>
+              <Trash2 className="h-4 w-4" />
+              Delete task
+            </DropdownMenuItem>
+          </>
+        ) : null}
+      </DropdownMenuContent>
+    </DropdownMenu>
+  )
+}
+
+/* -------------------------------------------------------------------------- */
+/* Toolbar                                                                     */
+/* -------------------------------------------------------------------------- */
+
+/** Every control here writes straight to the query string. */
+function TaskFilters({ query, setQuery, options, canAssign, hasFilters, onClear }) {
+  const peopleOptions = (label) => [
+    { value: ANY, label },
+    ...options.users.map((u) => ({ value: u._id, label: u.name })),
+  ]
+
+  return (
+    <Toolbar
+      left={
+        <>
+          <SegmentedControl
+            ariaLabel="Task view"
+            value={query.view}
+            onValueChange={(view) => setQuery({ view, page: 1 })}
+            options={VIEW_OPTIONS}
+          />
+          <Select
+            size="sm"
+            aria-label="Filter by status"
+            value={query.status}
+            placeholder="All statuses"
+            className="w-[140px]"
+            options={STATUSES.map((s) => ({ value: s, label: s }))}
+            onChange={(e) => setQuery({ status: e.target.value, page: 1 })}
+          />
+          <Select
+            size="sm"
+            aria-label="Filter by priority"
+            value={query.priority}
+            placeholder="All priorities"
+            className="w-[145px]"
+            options={PRIORITIES.map((p) => ({ value: p, label: p }))}
+            onChange={(e) => setQuery({ priority: e.target.value, page: 1 })}
+          />
+          {canAssign ? (
+            <>
+              <SelectMenu
+                size="sm"
+                ariaLabel="Filter by assignee"
+                value={query.assignee || ANY}
+                className="w-[165px]"
+                options={peopleOptions('All assignees')}
+                onValueChange={(v) => setQuery({ assignee: v === ANY ? null : v, page: 1 })}
+              />
+              <SelectMenu
+                size="sm"
+                ariaLabel="Filter by creator"
+                value={query.creator || ANY}
+                className="w-[165px]"
+                options={peopleOptions('All creators')}
+                onValueChange={(v) => setQuery({ creator: v === ANY ? null : v, page: 1 })}
+              />
+              <SelectMenu
+                size="sm"
+                ariaLabel="Filter by client"
+                value={query.client || ANY}
+                className="w-[165px]"
+                options={[
+                  { value: ANY, label: 'All clients' },
+                  ...options.clients.map((c) => ({ value: c.name, label: c.name })),
+                ]}
+                onValueChange={(v) => setQuery({ client: v === ANY ? null : v, page: 1 })}
+              />
+            </>
+          ) : null}
+          {hasFilters ? (
+            <Button variant="ghost" size="sm" leftIcon={<X className="h-3.5 w-3.5" />} onClick={onClear}>
+              Clear filters
+            </Button>
+          ) : null}
+        </>
+      }
+      right={
+        <Input
+          key={query.q}
+          size="sm"
+          type="search"
+          aria-label="Search tasks"
+          placeholder="Search title, client or assignee"
+          defaultValue={query.q}
+          leadingIcon={<Search />}
+          className="w-[260px]"
+          onKeyDown={(e) => {
+            if (e.key === 'Enter') setQuery({ q: e.currentTarget.value, page: 1 })
+          }}
+          onBlur={(e) => {
+            if (e.target.value !== query.q) setQuery({ q: e.target.value, page: 1 })
+          }}
+        />
+      }
+    />
+  )
+}
+
+/* -------------------------------------------------------------------------- */
+/* Bulk action bar                                                             */
+/* -------------------------------------------------------------------------- */
+
+function BulkBar({ selected, users, onClear, onAction, busy, blocked }) {
+  return (
+    <div className="mb-3 flex flex-wrap items-center gap-2 rounded-lg border border-line bg-subtle px-3 py-2">
+      <span className="text-sm font-medium text-fg">
+        {formatNumber(selected.length)} selected
+      </span>
+      <Button variant="ghost" size="sm" onClick={onClear}>
+        Clear selection
+      </Button>
+      <span className="mx-1 h-4 w-px bg-line" aria-hidden="true" />
+
+      {blocked ? (
+        <span className="text-xs text-fg-3">
+          Bulk actions are limited to tasks you created.
+        </span>
+      ) : (
+        <>
+          <DropdownMenu>
+            <DropdownMenuTrigger asChild>
+              <Button size="sm" disabled={busy} rightIcon={<ChevronDown className="h-3.5 w-3.5" />}>
+                Set status
+              </Button>
+            </DropdownMenuTrigger>
+            <DropdownMenuContent align="start">
+              {STATUSES.map((s) => (
+                <DropdownMenuItem key={s} onSelect={() => onAction('status', s)}>
+                  {s}
+                </DropdownMenuItem>
+              ))}
+            </DropdownMenuContent>
+          </DropdownMenu>
+
+          <DropdownMenu>
+            <DropdownMenuTrigger asChild>
+              <Button size="sm" disabled={busy || users.length === 0} rightIcon={<ChevronDown className="h-3.5 w-3.5" />}>
+                Reassign
+              </Button>
+            </DropdownMenuTrigger>
+            <DropdownMenuContent align="start" className="max-h-72 overflow-y-auto">
+              <DropdownMenuLabel>Assign to</DropdownMenuLabel>
+              {users.map((u) => (
+                <DropdownMenuItem key={u._id} onSelect={() => onAction('reassign', u._id)}>
+                  <Avatar size="xs" name={u.name} id={u._id} />
+                  {u.name}
+                </DropdownMenuItem>
+              ))}
+            </DropdownMenuContent>
+          </DropdownMenu>
+
+          <Button
+            variant="danger-ghost"
+            size="sm"
+            disabled={busy}
+            leftIcon={<Trash2 className="h-3.5 w-3.5" />}
+            onClick={() => onAction('delete')}
+          >
+            Delete
+          </Button>
+        </>
+      )}
+    </div>
+  )
+}
+
+/* -------------------------------------------------------------------------- */
+/* Board view                                                                  */
+/* -------------------------------------------------------------------------- */
+
+function BoardCard({ task, dragging, draggable, onOpen, onDragStart, onDragEnd }) {
+  return (
+    <button
+      type="button"
+      draggable={draggable}
+      onDragStart={(e) => onDragStart(e, task)}
+      onDragEnd={onDragEnd}
+      onClick={() => onOpen(task)}
+      className={cn(
+        'w-full rounded border border-line bg-surface p-2.5 text-left transition-colors duration-100',
+        'hover:border-line-strong focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary-600',
+        draggable && 'cursor-grab active:cursor-grabbing',
+        dragging && 'opacity-50'
+      )}
+    >
+      <span className="line-clamp-2 block text-sm font-medium text-fg">{task.title}</span>
+      <span className="mt-0.5 block truncate text-xs text-fg-3">{task.clientName || 'No client'}</span>
+      <span className="mt-2 flex items-center justify-between gap-2">
+        <span className="flex min-w-0 items-center gap-1.5">
+          <Avatar size="xs" name={task.assignedTo?.name} id={task.assignedTo?._id} />
+          <span className="truncate text-xs text-fg-3">{task.assignedTo?.name || 'Unassigned'}</span>
+        </span>
+        <span className="flex shrink-0 items-center gap-1.5">
+          <TaskFlags task={task} />
+          <Badge size="sm" variant={priorityVariant(task.priority)}>
+            {task.priority || 'Medium'}
+          </Badge>
+        </span>
+      </span>
+    </button>
+  )
+}
+
+function TaskBoard({ tasks, onOpen, onMove, canMoveTo }) {
+  const [dragId, setDragId] = useState(null)
+  const [overColumn, setOverColumn] = useState(null)
+
+  const grouped = useMemo(() => {
+    const map = { Pending: [], Completed: [], Late: [] }
+    tasks.forEach((t) => (map[t.status] || map.Pending).push(t))
+    return map
+  }, [tasks])
+
+  const dragged = dragId ? tasks.find((t) => t._id === dragId) : null
+
+  return (
+    <div className="grid grid-cols-1 gap-3 md:grid-cols-3">
+      {STATUSES.map((status) => {
+        const allowed = !dragged || canMoveTo(dragged, status)
+        const isOver = overColumn === status && allowed
+        return (
+          <section
+            key={status}
+            aria-label={`${status} tasks`}
+            onDragOver={(e) => {
+              if (!allowed) return
+              e.preventDefault()
+              e.dataTransfer.dropEffect = 'move'
+              if (overColumn !== status) setOverColumn(status)
+            }}
+            onDragLeave={() => setOverColumn((c) => (c === status ? null : c))}
+            onDrop={(e) => {
+              e.preventDefault()
+              setOverColumn(null)
+              const id = dragId || e.dataTransfer.getData('text/plain')
+              setDragId(null)
+              if (id) onMove(id, status)
+            }}
+            className={cn(
+              'flex min-h-[420px] flex-col rounded-lg border border-line bg-canvas',
+              isOver && 'outline outline-2 -outline-offset-2 outline-primary-600'
+            )}
+          >
+            <header className="flex h-10 shrink-0 items-center gap-2 border-b border-line px-3">
+              <span className="text-sm font-medium text-fg">{status}</span>
+              <Badge size="sm" variant="neutral">
+                {formatNumber(grouped[status].length)}
+              </Badge>
+            </header>
+            <div className="custom-scrollbar flex max-h-[64vh] flex-col gap-2 overflow-y-auto p-2">
+              {grouped[status].length === 0 ? (
+                <p className="px-2 py-8 text-center text-xs text-fg-3">No tasks</p>
+              ) : (
+                grouped[status].map((task) => (
+                  <BoardCard
+                    key={task._id}
+                    task={task}
+                    dragging={dragId === task._id}
+                    draggable={canMoveTo(task, 'Completed') || canMoveTo(task, 'Pending')}
+                    onOpen={onOpen}
+                    onDragStart={(e, t) => {
+                      setDragId(t._id)
+                      e.dataTransfer.effectAllowed = 'move'
+                      e.dataTransfer.setData('text/plain', t._id)
+                    }}
+                    onDragEnd={() => {
+                      setDragId(null)
+                      setOverColumn(null)
+                    }}
+                  />
+                ))
+              )}
+            </div>
+          </section>
+        )
+      })}
+    </div>
+  )
+}
+
+/* -------------------------------------------------------------------------- */
+/* Calendar view                                                               */
+/* -------------------------------------------------------------------------- */
+
+const CALENDAR_KEYS = {
+  ArrowLeft: -1,
+  ArrowRight: 1,
+  ArrowUp: -7,
+  ArrowDown: 7,
+}
+
+function TaskCalendar({ anchor, tasks, now, onOpen, onMonthChange, onPickDay }) {
+  const gridRef = useRef(null)
+  const [expanded, setExpanded] = useState(null)
+  /* Roving tabindex: the grid is a single tab stop, arrows move within it. */
+  const [activeCell, setActiveCell] = useState(0)
+
+  const cells = useMemo(() => buildMonthGrid(anchor), [anchor])
+
+  /* One pass over the tasks — not one filter per cell. */
+  const byDay = useMemo(() => {
+    const map = new Map()
+    tasks.forEach((task) => {
+      const d = toDate(task.deadline)
+      if (!d) return
+      const key = dayKey(d)
+      const bucket = map.get(key)
+      if (bucket) bucket.push(task)
+      else map.set(key, [task])
+    })
+    return map
+  }, [tasks])
+
+  const todayKey = dayKey(new Date(now))
+
+  const focusCell = (index) => {
+    const el = gridRef.current?.querySelector(`[data-day-index="${index}"]`)
+    if (el) el.focus()
+  }
+
+  const onKeyDown = (event, index) => {
+    if (event.key === 'PageUp' || event.key === 'PageDown') {
+      event.preventDefault()
+      onMonthChange(event.key === 'PageUp' ? -1 : 1)
+      return
     }
+    if (event.key === 'Home' || event.key === 'End') {
+      event.preventDefault()
+      const rowStart = Math.floor(index / 7) * 7
+      focusCell(event.key === 'Home' ? rowStart : rowStart + 6)
+      return
+    }
+    const delta = CALENDAR_KEYS[event.key]
+    if (delta === undefined) return
+    event.preventDefault()
+    const next = index + delta
+    if (next < 0 || next > 41) {
+      onMonthChange(delta < 0 ? -1 : 1)
+      return
+    }
+    focusCell(next)
+  }
 
-    setActionLoading(true);
+  return (
+    <div className="rounded-lg border border-line bg-surface">
+      <div className="flex items-center justify-between gap-2 border-b border-line px-3 py-2">
+        <h2 className="text-sm font-medium text-fg">
+          {anchor.toLocaleString(undefined, { month: 'long', year: 'numeric' })}
+        </h2>
+        <div className="flex items-center gap-1">
+          <Button size="sm" iconOnly aria-label="Previous month" onClick={() => onMonthChange(-1)}>
+            <ChevronLeft className="h-4 w-4" />
+          </Button>
+          <Button size="sm" onClick={() => onMonthChange(0)}>
+            Today
+          </Button>
+          <Button size="sm" iconOnly aria-label="Next month" onClick={() => onMonthChange(1)}>
+            <ChevronRight className="h-4 w-4" />
+          </Button>
+        </div>
+      </div>
+
+      <div className="grid grid-cols-7 border-b border-line bg-canvas">
+        {WEEKDAYS.map((d) => (
+          <div key={d} className="px-2 py-1.5 text-2xs font-semibold uppercase tracking-[0.04em] text-fg-3">
+            {d}
+          </div>
+        ))}
+      </div>
+
+      <div
+        ref={gridRef}
+        role="grid"
+        aria-label="Task deadlines by day"
+        className="grid grid-cols-7 border-l border-line"
+      >
+        {cells.map((cell, index) => {
+          const dayTasks = byDay.get(cell.key) || []
+          const isToday = cell.key === todayKey
+          const showAll = expanded === cell.key
+          const visible = showAll ? dayTasks : dayTasks.slice(0, 2)
+          return (
+            <div
+              key={cell.key}
+              role="gridcell"
+              className={cn(
+                'flex min-h-[104px] flex-col gap-1 border-b border-r border-line p-1.5',
+                !cell.inMonth && 'bg-canvas',
+                isToday && 'border-t-2 border-t-primary-600 bg-primary-subtle'
+              )}
+            >
+              <button
+                type="button"
+                data-day-index={index}
+                tabIndex={index === activeCell ? 0 : -1}
+                onFocus={() => setActiveCell(index)}
+                onKeyDown={(e) => onKeyDown(e, index)}
+                onClick={() => onPickDay(cell.date)}
+                aria-label={`${cell.date.toLocaleDateString(undefined, { dateStyle: 'full' })}, ${dayTasks.length} task${dayTasks.length === 1 ? '' : 's'}`}
+                className={cn(
+                  'self-start rounded-sm px-1 text-xs tabular focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-primary-600',
+                  isToday ? 'font-semibold text-primary-text' : cell.inMonth ? 'text-fg-2' : 'text-fg-off'
+                )}
+              >
+                {cell.date.getDate()}
+              </button>
+
+              {visible.map((task) => (
+                <button
+                  key={task._id}
+                  type="button"
+                  onClick={() => onOpen(task)}
+                  title={`${task.title} · ${task.clientName || 'No client'}`}
+                  className={cn(
+                    'flex h-5 w-full items-center gap-1 overflow-hidden rounded-sm border-l-[3px] bg-subtle px-1 text-left text-2xs text-fg-2',
+                    'hover:bg-muted focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-primary-600',
+                    task.priority === 'Urgent'
+                      ? 'border-l-danger'
+                      : task.priority === 'High'
+                        ? 'border-l-warning'
+                        : task.priority === 'Low'
+                          ? 'border-l-neutral'
+                          : 'border-l-info',
+                    task.status === 'Completed' && 'line-through'
+                  )}
+                >
+                  <span className="truncate">{task.title}</span>
+                </button>
+              ))}
+
+              {dayTasks.length > 2 ? (
+                <button
+                  type="button"
+                  onClick={() => setExpanded(showAll ? null : cell.key)}
+                  className="self-start rounded-sm px-1 text-2xs text-primary-600 hover:underline focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-primary-600"
+                >
+                  {showAll ? 'Show less' : `+${dayTasks.length - 2} more`}
+                </button>
+              ) : null}
+            </div>
+          )
+        })}
+      </div>
+    </div>
+  )
+}
+
+/* -------------------------------------------------------------------------- */
+/* Comment thread                                                              */
+/* -------------------------------------------------------------------------- */
+
+function CommentThread({ taskId, task, user, isAdmin, isHead, onCountChange }) {
+  const confirm = useConfirm()
+  const [comments, setComments] = useState([])
+  const [loading, setLoading] = useState(true)
+  const [error, setError] = useState(null)
+  const [draft, setDraft] = useState('')
+  const [posting, setPosting] = useState(false)
+  const postingRef = useRef(false)
+
+  useEffect(() => {
+    const ctrl = new AbortController()
+    let alive = true
+    ;(async () => {
+      try {
+        const res = await api.get(`/tasks/${taskId}/comments`, {
+          params: { page: 1, limit: 100 },
+          signal: ctrl.signal,
+        })
+        if (!alive) return
+        const list = unwrapList(res.data).data
+        setComments(list)
+        setLoading(false)
+        onCountChange?.(list.length)
+      } catch (err) {
+        if (!alive || isCanceled(err)) return
+        setError(getErrorMessage(err))
+        setLoading(false)
+      }
+    })()
+    return () => {
+      alive = false
+      ctrl.abort()
+    }
+  }, [taskId, onCountChange])
+
+  /* Mirrors commentController.deleteComment exactly, so no button 403s. */
+  const canDelete = (comment) => {
+    const me = user?._id
+    if (!me) return false
+    const isOwner = idOf(comment.author) === me
+    const isCreator = idOf(task?.createdBy) === me
+    const isAssignee = idOf(task?.assignedTo) === me
+    if (isAdmin) return true
+    if (isHead) return isCreator || (isOwner && isAssignee)
+    return isOwner && isAssignee
+  }
+
+  const submit = async () => {
+    const message = draft.trim()
+    if (!message || postingRef.current) return
+    postingRef.current = true
+    setPosting(true)
+
+    const tempId = `pending-${Date.now()}`
+    const optimistic = {
+      _id: tempId,
+      message,
+      pending: true,
+      createdAt: new Date().toISOString(),
+      author: { _id: user?._id, name: user?.name, role: user?.role },
+    }
+    const pendingList = [...comments, optimistic]
+    setComments(pendingList)
+    setDraft('')
+    onCountChange?.(pendingList.length)
+
     try {
-      await api.post('/tasks', {
-        title: newTask.title,
-        description: newTask.description,
-        clientName: newTask.clientName,
-        assignedTo: newTask.assignedTo,
-        linkedEmail: newTask.linkedEmail || undefined,
-        deadline: newTask.deadline,
-        notes: newTask.notes,
-        priority: newTask.priority,
-        isRecurring: newTask.isRecurring,
-        recurrence: newTask.recurrence
-      });
-
-      triggerAlert('success', `Task '${newTask.title}' successfully initialized.`);
-      setIsCreateOpen(false);
-      setNewTask({
-        title: '',
-        description: '',
-        clientName: '',
-        assignedTo: '',
-        linkedEmail: '',
-        deadline: '',
-        notes: '',
-        priority: 'Medium',
-        isRecurring: false,
-        recurrence: 'Weekly'
-      });
-      setClientSearchQuery('');
-      fetchTasks();
-      fetchDropdownData(); // Refresh unassigned email list
+      const res = await api.post(`/tasks/${taskId}/comments`, { message })
+      setComments((prev) => prev.map((c) => (c._id === tempId ? res.data : c)))
     } catch (err) {
-      console.error('Error saving new task:', err);
-      triggerAlert('error', err.response?.data?.message || 'Failed to register new task.');
+      setComments((prev) => prev.filter((c) => c._id !== tempId))
+      setDraft(message)
+      onCountChange?.(pendingList.length - 1)
+      reportError(err, 'Could not post the comment')
     } finally {
-      setActionLoading(false);
+      postingRef.current = false
+      setPosting(false)
     }
-  };
+  }
 
-  const handleEditTask = async (e) => {
-    e.preventDefault();
-
-    // Validate fields
-    if (!editForm.title || !editForm.clientName || !editForm.assignedTo || !editForm.deadline) {
-      triggerAlert('error', 'Title, Client, Assignee, and Deadline are required.');
-      return;
-    }
-
-    // Validate deadline is in future
-    const selectedDeadline = new Date(editForm.deadline);
-    if (selectedDeadline <= new Date()) {
-      triggerAlert('error', 'Deadline must be in the future.');
-      return;
-    }
-
-    setActionLoading(true);
+  const remove = async (comment) => {
+    const ok = await confirm({
+      title: 'Delete this comment?',
+      description: 'The comment is removed permanently for everyone on this task.',
+      confirmLabel: 'Delete comment',
+      cancelLabel: 'Keep comment',
+      tone: 'danger',
+    })
+    if (!ok) return
+    const snapshot = comments
+    const next = snapshot.filter((c) => c._id !== comment._id)
+    setComments(next)
+    onCountChange?.(next.length)
     try {
-      await api.put(`/tasks/${editForm.id}`, {
-        title: editForm.title,
-        description: editForm.description,
-        clientName: editForm.clientName,
-        assignedTo: editForm.assignedTo,
-        deadline: editForm.deadline,
-        notes: editForm.notes,
-        status: editForm.status,
-        priority: editForm.priority,
-        isRecurring: editForm.isRecurring,
-        recurrence: editForm.recurrence
-      });
-
-      triggerAlert('success', 'Task records successfully updated.');
-      setIsEditOpen(false);
-      setSelectedTask(null);
-      fetchTasks();
+      await api.delete(`/tasks/${taskId}/comments/${comment._id}`)
     } catch (err) {
-      console.error('Error updating task:', err);
-      triggerAlert('error', err.response?.data?.message || 'Failed to modify task.');
+      setComments(snapshot)
+      onCountChange?.(snapshot.length)
+      reportError(err, 'Could not delete the comment')
+    }
+  }
+
+  return (
+    <div className="flex flex-col gap-3">
+      {error ? <Alert variant="danger" title="Could not load comments">{error}</Alert> : null}
+
+      {loading ? (
+        <div className="flex flex-col gap-2">
+          <Skeleton className="h-14 w-full" />
+          <Skeleton className="h-14 w-full" />
+        </div>
+      ) : comments.length === 0 ? (
+        <EmptyState
+          icon={MessageSquare}
+          title="No comments yet"
+          description="Use comments to record what changed and who was told."
+        />
+      ) : (
+        <ul className="flex flex-col gap-3">
+          {comments.map((comment) => (
+            <li key={comment._id} className={cn('flex gap-2.5', comment.pending && 'opacity-60')}>
+              <Avatar size="sm" name={comment.author?.name} id={idOf(comment.author)} />
+              <div className="min-w-0 flex-1">
+                <div className="flex items-center gap-2">
+                  <span className="text-sm font-medium text-fg">{comment.author?.name || 'Unknown'}</span>
+                  <span className="text-xs text-fg-3">
+                    {comment.pending ? 'Sending…' : timeAgo(comment.createdAt)}
+                  </span>
+                  {!comment.pending && canDelete(comment) ? (
+                    <Button
+                      variant="danger-ghost"
+                      size="sm"
+                      iconOnly
+                      aria-label={`Delete comment by ${comment.author?.name || 'unknown author'}`}
+                      className="ml-auto"
+                      onClick={() => remove(comment)}
+                    >
+                      <Trash2 className="h-3.5 w-3.5" />
+                    </Button>
+                  ) : null}
+                </div>
+                <p className="whitespace-pre-wrap text-sm text-fg-2">{comment.message}</p>
+              </div>
+            </li>
+          ))}
+        </ul>
+      )}
+
+      <div className="flex items-end gap-2 border-t border-line pt-3">
+        <Textarea
+          rows={2}
+          value={draft}
+          aria-label="Add a comment"
+          placeholder="Add a comment. Enter to send, Shift+Enter for a new line."
+          onChange={(e) => setDraft(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === 'Enter' && !e.shiftKey) {
+              e.preventDefault()
+              submit()
+            }
+          }}
+        />
+        <Button
+          variant="primary"
+          loading={posting}
+          disabled={!draft.trim()}
+          leftIcon={<Send className="h-4 w-4" />}
+          onClick={submit}
+        >
+          Post
+        </Button>
+      </div>
+    </div>
+  )
+}
+
+/* -------------------------------------------------------------------------- */
+/* Task drawer                                                                 */
+/* -------------------------------------------------------------------------- */
+
+function DetailRow({ label, children }) {
+  return (
+    <div className="grid grid-cols-[120px_1fr] gap-3 border-b border-line py-2 last:border-b-0">
+      <dt className="text-xs text-fg-3">{label}</dt>
+      <dd className="min-w-0 text-sm text-fg-2">{children}</dd>
+    </div>
+  )
+}
+
+function TaskDrawerBody({
+  taskId,
+  perms,
+  user,
+  users,
+  now,
+  onEdit,
+  onComplete,
+  onDelete,
+  onClose,
+  onTasksCreated,
+}) {
+  const [task, setTask] = useState(null)
+  const [loading, setLoading] = useState(true)
+  const [error, setError] = useState(null)
+  const [commentCount, setCommentCount] = useState(null)
+  const [nonce, setNonce] = useState(0)
+
+  useEffect(() => {
+    const ctrl = new AbortController()
+    let alive = true
+    ;(async () => {
+      try {
+        const res = await api.get(`/tasks/${taskId}`, { signal: ctrl.signal })
+        if (!alive) return
+        setTask(res.data)
+        setLoading(false)
+      } catch (err) {
+        if (!alive || isCanceled(err)) return
+        setError(getErrorMessage(err))
+        setLoading(false)
+      }
+    })()
+    return () => {
+      alive = false
+      ctrl.abort()
+    }
+  }, [taskId, nonce])
+
+  const download = async (emailId, attachmentId, filename) => {
+    let url
+    try {
+      const res = await api.get(`/gmail/emails/${emailId}/attachments/${attachmentId}`, {
+        responseType: 'blob',
+      })
+      url = window.URL.createObjectURL(new Blob([res.data]))
+      const link = document.createElement('a')
+      link.href = url
+      link.download = filename
+      document.body.appendChild(link)
+      link.click()
+      link.remove()
+    } catch (err) {
+      reportError(err, 'Could not download the attachment')
     } finally {
-      setActionLoading(false);
+      if (url) window.URL.revokeObjectURL(url)
     }
-  };
+  }
 
-  const handleMarkComplete = async (taskId) => {
-    setActionLoading(true);
-    try {
-      await api.put(`/tasks/${taskId}`, { status: 'Completed' });
-      triggerAlert('success', 'Task marked as Completed.');
-      fetchTasks();
-    } catch (err) {
-      console.error('Error setting task status to Completed:', err);
-      triggerAlert('error', err.response?.data?.message || 'Failed to update task status.');
-    } finally {
-      setActionLoading(false);
-    }
-  };
-
-  const handleDeleteTask = async (taskId) => {
-    if (!window.confirm('Are you sure you want to permanently delete this task?')) return;
-
-    setActionLoading(true);
-    try {
-      const response = await api.delete(`/tasks/${taskId}`);
-      setTasks((prev) => prev.filter((task) => task._id !== taskId));
-      setExpandedTaskId((prev) => (prev === taskId ? null : prev));
-      triggerAlert('success', response.data?.message || 'Task deleted successfully.');
-      await fetchTasks();
-      fetchDropdownData(); // Refresh unassigned email list
-    } catch (err) {
-      console.error('Error deleting task:', err);
-      triggerAlert('error', err.response?.data?.message || 'Failed to delete task.');
-    } finally {
-      setActionLoading(false);
-    }
-  };
-
-
-
-  const loadComments = async (taskId) => {
-    setCommentLoadingId(taskId);
-    try {
-      const res = await api.get(`/tasks/${taskId}/comments`);
-      setCommentMap(prev => ({ ...prev, [taskId]: res.data }));
-    } catch (err) {
-      console.error('Failed to load comments:', err);
-    } finally {
-      setCommentLoadingId(null);
-    }
-  };
-
-  const handlePostComment = async (taskId) => {
-    if (!commentInput.trim()) return;
-    setCommentSubmitting(true);
-    try {
-      const res = await api.post(`/tasks/${taskId}/comments`, { message: commentInput.trim() });
-      setCommentMap(prev => ({
-        ...prev,
-        [taskId]: [...(prev[taskId] || []), res.data]
-      }));
-      setCommentInput('');
-    } catch (err) {
-      triggerAlert('error', err.response?.data?.message || 'Failed to post comment.');
-    } finally {
-      setCommentSubmitting(false);
-    }
-  };
-
-  const handleDeleteComment = async (taskId, commentId) => {
-    try {
-      await api.delete(`/tasks/${taskId}/comments/${commentId}`);
-      setCommentMap(prev => ({
-        ...prev,
-        [taskId]: (prev[taskId] || []).filter(c => c._id !== commentId)
-      }));
-    } catch (err) {
-      triggerAlert('error', 'Failed to delete comment.');
-    }
-  };
-
-  const handleDownloadAttachment = async (emailId, attachmentId, filename) => {
-    try {
-      const response = await api.get(`/gmail/emails/${emailId}/attachments/${attachmentId}`, {
-        responseType: 'blob'
-      });
-      const url = window.URL.createObjectURL(new Blob([response.data]));
-      const link = document.createElement('a');
-      link.href = url;
-      link.setAttribute('download', filename);
-      document.body.appendChild(link);
-      link.click();
-      link.parentNode.removeChild(link);
-    } catch (err) {
-      console.error('Failed to download attachment:', err);
-      triggerAlert('error', 'Failed to download attachment.');
-    }
-  };
-
-  const openEditModal = (task) => {
-    setSelectedTask(task);
-    setEditForm({
-      id: task._id,
-      title: task.title,
-      description: task.description || '',
-      clientName: task.clientName,
-      assignedTo: task.assignedTo?._id || '',
-      deadline: task.deadline ? new Date(task.deadline).toISOString().slice(0, 16) : '',
-      notes: task.notes || '',
-      status: task.status,
-      priority: task.priority || 'Medium',
-      isRecurring: task.isRecurring || false,
-      recurrence: task.recurrence || 'Weekly'
-    });
-    setEditClientSearchQuery(task.clientName);
-    setIsEditOpen(true);
-  };
-
-  // Calendar logic helpers
-  const getDaysInMonth = (date) => {
-    const year = date.getFullYear();
-    const month = date.getMonth();
-    const firstDayIndex = new Date(year, month, 1).getDay();
-    const totalDays = new Date(year, month + 1, 0).getDate();
-    const prevMonthTotalDays = new Date(year, month, 0).getDate();
-    
-    const days = [];
-    
-    // Padding from previous month
-    for (let i = firstDayIndex - 1; i >= 0; i--) {
-      days.push({
-        day: prevMonthTotalDays - i,
-        month: month === 0 ? 11 : month - 1,
-        year: month === 0 ? year - 1 : year,
-        isCurrentMonth: false
-      });
-    }
-    
-    // Current month days
-    for (let i = 1; i <= totalDays; i++) {
-      days.push({
-        day: i,
-        month,
-        year,
-        isCurrentMonth: true
-      });
-    }
-    
-    // Padding for next month to fill 42 cells (6 rows)
-    const remainingCells = 42 - days.length;
-    for (let i = 1; i <= remainingCells; i++) {
-      days.push({
-        day: i,
-        month: month === 11 ? 0 : month + 1,
-        year: month === 11 ? year + 1 : year,
-        isCurrentMonth: false
-      });
-    }
-    
-    return days;
-  };
-
-  const isSameDay = (taskDateStr, year, month, day) => {
-    if (!taskDateStr) return false;
-    const taskDate = new Date(taskDateStr);
+  if (loading) {
     return (
-      taskDate.getFullYear() === year &&
-      taskDate.getMonth() === month &&
-      taskDate.getDate() === day
-    );
-  };
+      <DrawerContent size="lg" title="Loading task…">
+        <div className="flex flex-col gap-3">
+          <Skeleton className="h-6 w-2/3" />
+          <Skeleton className="h-4 w-1/3" />
+          <Skeleton className="h-32 w-full" />
+        </div>
+      </DrawerContent>
+    )
+  }
 
-  const handlePrevMonth = () => {
-    setCurrentDate(new Date(currentDate.getFullYear(), currentDate.getMonth() - 1, 1));
-  };
+  if (error || !task) {
+    return (
+      <DrawerContent size="lg" title="Task unavailable">
+        <Alert
+          variant="danger"
+          title="Could not load this task"
+          action={
+            <Button size="sm" onClick={() => setNonce((n) => n + 1)}>
+              Retry
+            </Button>
+          }
+        >
+          {error || 'The task no longer exists.'}
+        </Alert>
+      </DrawerContent>
+    )
+  }
 
-  const handleNextMonth = () => {
-    setCurrentDate(new Date(currentDate.getFullYear(), currentDate.getMonth() + 1, 1));
-  };
+  const email = task.linkedEmail
+  const attachments = email?.attachments || []
 
-  const handleGoToday = () => {
-    setCurrentDate(new Date());
-  };
+  return (
+    <DrawerContent
+      size="lg"
+      title={task.title}
+      description={`${task.clientName || 'No client'} · ${formatAbsolute(task.deadline)}`}
+      headerActions={
+        <>
+          {perms.canComplete(task) ? (
+            <Button
+              variant="primary"
+              size="sm"
+              leftIcon={<CheckCircle2 className="h-4 w-4" />}
+              onClick={async () => {
+                setTask((prev) => ({ ...prev, status: 'Completed' }))
+                const ok = await onComplete(task)
+                if (!ok) setTask((prev) => ({ ...prev, status: task.status }))
+              }}
+            >
+              Mark complete
+            </Button>
+          ) : null}
+          {perms.canEdit(task) || perms.canDelete(task) ? (
+            <DropdownMenu>
+              <DropdownMenuTrigger asChild>
+                <Button variant="ghost" size="sm" iconOnly aria-label="More task actions">
+                  <MoreHorizontal className="h-4 w-4" />
+                </Button>
+              </DropdownMenuTrigger>
+              <DropdownMenuContent align="end">
+                {perms.canEdit(task) ? (
+                  <DropdownMenuItem onSelect={() => onEdit(task)}>
+                    <Pencil className="h-4 w-4" />
+                    Edit task
+                  </DropdownMenuItem>
+                ) : null}
+                {perms.canDelete(task) ? (
+                  <DropdownMenuItem destructive onSelect={() => onDelete(task)}>
+                    <Trash2 className="h-4 w-4" />
+                    Delete task
+                  </DropdownMenuItem>
+                ) : null}
+              </DropdownMenuContent>
+            </DropdownMenu>
+          ) : null}
+        </>
+      }
+      footer={
+        <Button variant="secondary" onClick={onClose}>
+          Close
+        </Button>
+      }
+      bodyClassName="p-0"
+    >
+      <div className="flex items-center gap-2 border-b border-line px-5 py-3">
+        <Badge variant={statusVariant(task.status)}>{task.status}</Badge>
+        <Badge variant={priorityVariant(task.priority)}>{task.priority || 'Medium'} priority</Badge>
+        <TaskFlags task={task} />
+      </div>
 
-  // Date formatter helper
-  const formatDate = (dateString) => {
-    if (!dateString) return 'N/A';
-    try {
-      const d = new Date(dateString);
-      return d.toLocaleString(undefined, {
-        month: 'short',
-        day: 'numeric',
-        year: 'numeric',
-        hour: '2-digit',
-        minute: '2-digit'
-      });
-    } catch (err) {
-      return dateString;
+      <Tabs defaultValue="details" className="px-5">
+        <TabsList>
+          <TabsTrigger value="details">Details</TabsTrigger>
+          {email ? <TabsTrigger value="email">Linked email</TabsTrigger> : null}
+          <TabsTrigger value="comments" count={commentCount ?? undefined}>
+            Comments
+          </TabsTrigger>
+          <TabsTrigger value="activity">Activity</TabsTrigger>
+        </TabsList>
+
+        <TabsContent value="details" className="py-4">
+          <dl>
+            <DetailRow label="Client">{task.clientName || '—'}</DetailRow>
+            <DetailRow label="Assignee">
+              <AssigneeCell user={task.assignedTo} />
+            </DetailRow>
+            <DetailRow label="Deadline">
+              <span className="tabular">{formatAbsolute(task.deadline)}</span>{' '}
+              <span className="text-fg-3">({relativeDue(task.deadline, now)})</span>
+            </DetailRow>
+            <DetailRow label="Recurrence">
+              {task.isRecurring ? `Repeats ${(task.recurrence || 'Weekly').toLowerCase()}` : 'Does not repeat'}
+            </DetailRow>
+            <DetailRow label="Description">
+              <p className="whitespace-pre-wrap">{task.description || '—'}</p>
+            </DetailRow>
+            <DetailRow label="Internal notes">
+              <p className="whitespace-pre-wrap">{task.notes || '—'}</p>
+            </DetailRow>
+          </dl>
+        </TabsContent>
+
+        {email ? (
+          <TabsContent value="email" className="py-4">
+            <div className="mb-3">
+              <p className="text-sm font-medium text-fg">{email.subject || '(No subject)'}</p>
+              <p className="text-xs text-fg-3">From {email.from}</p>
+            </div>
+            {/* `imageGate` gives the reader the same "Show remote images"
+                control the inbox has; without it remote images are blocked
+                with no way to reveal them. */}
+            <EmailBody html={email.body} minHeight={220} maxHeight={640} imageGate />
+            {attachments.length > 0 ? (
+              <div className="mt-4">
+                <p className="mb-2 text-xs font-medium text-fg-2">
+                  Attachments ({attachments.length})
+                </p>
+                <div className="flex flex-wrap gap-2">
+                  {attachments.map((att) => (
+                    <Button
+                      key={att.attachmentId}
+                      size="sm"
+                      leftIcon={<Download className="h-3.5 w-3.5" />}
+                      onClick={() => download(email._id, att.attachmentId, att.filename)}
+                    >
+                      {att.filename}
+                      <span className="ml-1 tabular text-xs text-fg-3">
+                        {Math.max(1, Math.round((att.size || 0) / 1024))} KB
+                      </span>
+                    </Button>
+                  ))}
+                </div>
+              </div>
+            ) : null}
+
+            {/* F-3: pull follow-up work out of the message this task came
+                from. Suggestions only — a new task is created solely by an
+                explicit "Create selected", and is linked back to this email. */}
+            {perms.canCreate ? (
+              <div className="mt-4">
+                <ExtractActionsPanel
+                  emailId={email._id}
+                  users={users}
+                  linkedEmail={email._id}
+                  onCreated={onTasksCreated}
+                />
+              </div>
+            ) : null}
+          </TabsContent>
+        ) : null}
+
+        <TabsContent value="comments" className="py-4">
+          <CommentThread
+            taskId={task._id}
+            task={task}
+            user={user}
+            isAdmin={perms.isAdmin}
+            isHead={perms.isHead}
+            onCountChange={setCommentCount}
+          />
+        </TabsContent>
+
+        <TabsContent value="activity" className="py-4">
+          <dl>
+            <DetailRow label="Created by">{task.createdBy?.name || 'System'}</DetailRow>
+            <DetailRow label="Created">
+              <span className="tabular">{formatAbsolute(task.createdAt)}</span>{' '}
+              <span className="text-fg-3">({timeAgo(task.createdAt)})</span>
+            </DetailRow>
+            <DetailRow label="Current status">{task.status}</DetailRow>
+            <DetailRow label="Recurring from">
+              {task.parentTaskId ? 'A previous occurrence of this task' : '—'}
+            </DetailRow>
+          </dl>
+          <p className="mt-3 text-xs text-fg-3">
+            Full edit history is recorded in the Activity Log.
+          </p>
+        </TabsContent>
+      </Tabs>
+    </DrawerContent>
+  )
+}
+
+/* -------------------------------------------------------------------------- */
+/* Create / edit dialog                                                        */
+/* -------------------------------------------------------------------------- */
+
+const EMPTY_FORM = {
+  title: '',
+  description: '',
+  clientName: '',
+  assignedTo: '',
+  linkedEmail: '',
+  deadline: '',
+  notes: '',
+  status: 'Pending',
+  priority: 'Medium',
+  isRecurring: false,
+  recurrence: 'Weekly',
+}
+
+function validateForm(form, mode) {
+  const errors = {}
+  const title = form.title.trim()
+  if (!title) errors.title = 'A title is required.'
+  else if (title.length > LIMITS.title) errors.title = `Keep the title under ${LIMITS.title} characters.`
+
+  const client = form.clientName.trim()
+  if (!client) errors.clientName = 'A client name is required.'
+  else if (client.length > LIMITS.clientName)
+    errors.clientName = `Keep the client name under ${LIMITS.clientName} characters.`
+
+  if (!form.assignedTo) errors.assignedTo = 'Choose who this task is for.'
+
+  if (!form.deadline) errors.deadline = 'A deadline is required.'
+  else {
+    const d = new Date(form.deadline)
+    if (Number.isNaN(d.getTime())) errors.deadline = 'Enter a valid date and time.'
+    else if (mode === 'create' && d.getTime() <= Date.now())
+      errors.deadline = 'The deadline must be in the future.'
+  }
+
+  if (form.description.length > LIMITS.description) errors.description = 'This description is too long.'
+  if (form.notes.length > LIMITS.notes) errors.notes = 'These notes are too long.'
+  return errors
+}
+
+/**
+ * Remounted by the page (`key`) whenever it opens, so the form always starts
+ * from `initial` without a state-syncing effect.
+ */
+function TaskFormDialog({ open, mode, initial, options, saving, onSubmit, onOpenChange }) {
+  const [form, setForm] = useState(() => ({ ...EMPTY_FORM, ...initial }))
+  const [errors, setErrors] = useState({})
+  const formId = `task-form-${mode}`
+
+  const set = (key) => (value) => setForm((prev) => ({ ...prev, [key]: value }))
+
+  const handleSubmit = (event) => {
+    event.preventDefault()
+    const found = validateForm(form, mode)
+    setErrors(found)
+    if (Object.keys(found).length > 0) return
+    onSubmit(form)
+  }
+
+  const clientOptions = useMemo(
+    () => options.clients.map((c) => ({ value: c.name, label: c.name })),
+    [options.clients]
+  )
+
+  /* A deep link from the inbox may reference an email that is not in the
+     first page of unassigned mail — keep it selectable rather than silently
+     dropping the link. */
+  const emailOptions = useMemo(() => {
+    const list = options.emails.map((e) => ({
+      value: e._id,
+      label: `${e.subject || '(No subject)'} — ${e.from}`,
+    }))
+    if (initial?.linkedEmail && !list.some((o) => o.value === initial.linkedEmail)) {
+      list.unshift({ value: initial.linkedEmail, label: 'Email selected from the inbox' })
     }
-  };
+    return list
+  }, [options.emails, initial])
 
-  // Filter clients list according to search query input
-  const filteredClients = clients.filter(c => 
-    c.name.toLowerCase().includes(clientSearchQuery.toLowerCase())
-  );
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      {open ? (
+        <DialogContent
+          size="lg"
+          dismissable={false}
+          title={mode === 'create' ? 'New task' : 'Edit task'}
+          description={
+            mode === 'create'
+              ? 'Assign work and, optionally, link the email it came from.'
+              : 'Update the assignment, schedule or status.'
+          }
+          footer={
+            <>
+              <DialogClose asChild>
+                <Button variant="secondary">Cancel</Button>
+              </DialogClose>
+              <Button variant="primary" type="submit" form={formId} loading={saving}>
+                {mode === 'create' ? 'Create task' : 'Save changes'}
+              </Button>
+            </>
+          }
+        >
+          <form id={formId} onSubmit={handleSubmit} className="flex flex-col gap-4" noValidate>
+            <FormField label="Title" required error={errors.title}>
+              {(field) => (
+                <Input
+                  {...field}
+                  value={form.title}
+                  maxLength={LIMITS.title}
+                  placeholder="e.g. File Q3 GST return"
+                  onChange={(e) => set('title')(e.target.value)}
+                />
+              )}
+            </FormField>
 
-  const filteredEditClients = clients.filter(c => 
-    c.name.toLowerCase().includes(editClientSearchQuery.toLowerCase())
-  );
+            <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
+              <FormField label="Client" required error={errors.clientName} hint="Type a new name or pick an existing client.">
+                {(field) => (
+                  <Input
+                    {...field}
+                    list={`${formId}-clients`}
+                    value={form.clientName}
+                    maxLength={LIMITS.clientName}
+                    placeholder="Search clients…"
+                    onChange={(e) => set('clientName')(e.target.value)}
+                  />
+                )}
+              </FormField>
+              <datalist id={`${formId}-clients`}>
+                {clientOptions.map((c) => (
+                  <option key={c.value} value={c.value} />
+                ))}
+              </datalist>
 
-  // Get distinct list of creators for Admin/Head creator filter
-  const taskCreators = Array.from(
-    new Map(
-      tasks
-        .filter(t => t.createdBy)
-        .map(t => [t.createdBy._id, t.createdBy])
-    ).values()
-  );
+              <FormField label="Assignee" required error={errors.assignedTo}>
+                {(field) => (
+                  <Select
+                    {...field}
+                    value={form.assignedTo}
+                    placeholder="Choose a team member"
+                    options={options.users.map((u) => ({ value: u._id, label: `${u.name} (${u.role})` }))}
+                    onChange={(e) => set('assignedTo')(e.target.value)}
+                  />
+                )}
+              </FormField>
+            </div>
 
-  // Apply creator, status, and priority filters
-  const filteredTasks = tasks.filter(task => {
-    if (creatorFilter && task.createdBy?._id !== creatorFilter) {
-      return false;
+            <div className="grid grid-cols-1 gap-4 sm:grid-cols-3">
+              <FormField label="Deadline" required error={errors.deadline}>
+                {(field) => (
+                  <Input
+                    {...field}
+                    type="datetime-local"
+                    value={form.deadline}
+                    onChange={(e) => set('deadline')(e.target.value)}
+                  />
+                )}
+              </FormField>
+              <FormField label="Priority">
+                {(field) => (
+                  <Select
+                    {...field}
+                    value={form.priority}
+                    options={PRIORITIES.map((p) => ({ value: p, label: p }))}
+                    onChange={(e) => set('priority')(e.target.value)}
+                  />
+                )}
+              </FormField>
+              {mode === 'edit' ? (
+                <FormField label="Status">
+                  {(field) => (
+                    <Select
+                      {...field}
+                      value={form.status}
+                      options={STATUSES.map((s) => ({ value: s, label: s }))}
+                      onChange={(e) => set('status')(e.target.value)}
+                    />
+                  )}
+                </FormField>
+              ) : (
+                <FormField label="Link an email" optionalText="Optional">
+                  {(field) => (
+                    <Select
+                      {...field}
+                      value={form.linkedEmail}
+                      placeholder="No linked email"
+                      options={emailOptions}
+                      onChange={(e) => set('linkedEmail')(e.target.value)}
+                    />
+                  )}
+                </FormField>
+              )}
+            </div>
+
+            <FormField label="Description" optionalText="Optional" error={errors.description}>
+              {(field) => (
+                <Textarea
+                  {...field}
+                  rows={3}
+                  value={form.description}
+                  maxLength={LIMITS.description}
+                  onChange={(e) => set('description')(e.target.value)}
+                />
+              )}
+            </FormField>
+
+            <FormField label="Internal notes" optionalText="Optional" error={errors.notes}>
+              {(field) => (
+                <Textarea
+                  {...field}
+                  rows={2}
+                  value={form.notes}
+                  maxLength={LIMITS.notes}
+                  onChange={(e) => set('notes')(e.target.value)}
+                />
+              )}
+            </FormField>
+
+            <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
+              <FormField label="Repeats">
+                {(field) => (
+                  <Select
+                    {...field}
+                    value={form.isRecurring ? 'yes' : 'no'}
+                    options={[
+                      { value: 'no', label: 'Does not repeat' },
+                      { value: 'yes', label: 'Repeats on a schedule' },
+                    ]}
+                    onChange={(e) => set('isRecurring')(e.target.value === 'yes')}
+                  />
+                )}
+              </FormField>
+              {form.isRecurring ? (
+                <FormField label="Frequency">
+                  {(field) => (
+                    <Select
+                      {...field}
+                      value={form.recurrence}
+                      options={RECURRENCES.map((r) => ({ value: r, label: r }))}
+                      onChange={(e) => set('recurrence')(e.target.value)}
+                    />
+                  )}
+                </FormField>
+              ) : null}
+            </div>
+          </form>
+        </DialogContent>
+      ) : null}
+    </Dialog>
+  )
+}
+
+/* -------------------------------------------------------------------------- */
+/* Page                                                                        */
+/* -------------------------------------------------------------------------- */
+
+export default function TaskList() {
+  const { user, isAdmin, isHead } = useAuth()
+  const confirm = useConfirm()
+  const [query, setQuery] = useQueryState()
+  const now = useNow()
+
+  const canAssign = isAdmin || isHead
+  const [selection, setSelection] = useState({})
+  const [saving, setSaving] = useState(false)
+  const [bulkBusy, setBulkBusy] = useState(false)
+  const [editing, setEditing] = useState(null)
+  /* Deadline pre-filled by clicking a calendar day. */
+  const [dayPrefill, setDayPrefill] = useState('')
+
+  const options = useTaskOptions(canAssign)
+
+  const wideView = query.view !== 'list'
+  const requestParams = useMemo(
+    () => ({
+      page: wideView ? 1 : query.page,
+      limit: wideView ? WIDE_VIEW_LIMIT : query.limit,
+      sort: query.sort,
+      ...(query.status ? { status: query.status } : {}),
+      ...(query.priority ? { priority: query.priority } : {}),
+      ...(query.assignee ? { assignedTo: query.assignee } : {}),
+      ...(query.creator ? { createdBy: query.creator } : {}),
+      ...(query.client ? { clientName: query.client } : {}),
+      ...(query.q ? { q: query.q } : {}),
+    }),
+    [wideView, query.page, query.limit, query.sort, query.status, query.priority, query.assignee, query.creator, query.client, query.q]
+  )
+
+  const { rows, total, loading, error, reload, patchRow } = useTaskQuery(requestParams)
+
+  /* ---- permissions, mirrored from taskController.js ---- */
+  const perms = useMemo(() => {
+    const me = user?._id
+    const owns = (t) => idOf(t.createdBy) === me
+    const assigned = (t) => idOf(t.assignedTo) === me
+    return {
+      isAdmin,
+      isHead,
+      canCreate: isAdmin || isHead,
+      canEdit: (t) => isAdmin || (isHead && (owns(t) || assigned(t))),
+      canDelete: (t) => isAdmin || (isHead && owns(t)),
+      canComplete: (t) =>
+        t.status !== 'Completed' &&
+        (isAdmin || (isHead && (owns(t) || assigned(t))) || (!isAdmin && !isHead && assigned(t))),
+      canBulk: (t) => isAdmin || (isHead && owns(t)),
     }
-    if (statusFilter !== 'All' && task.status !== statusFilter) {
-      return false;
+  }, [user, isAdmin, isHead])
+
+  /* Scoped to the rows actually on screen, so a selection made on page 1 can
+     never be acted on invisibly from page 2. */
+  const selectedTasks = useMemo(() => rows.filter((t) => selection[t._id]), [rows, selection])
+  const selectedIds = useMemo(() => selectedTasks.map((t) => t._id), [selectedTasks])
+  const bulkBlocked = selectedTasks.some((t) => !perms.canBulk(t))
+
+  /* ---- mutations ---- */
+  const openTask = useCallback((task) => setQuery({ task: task._id, expandTaskId: null }), [setQuery])
+  const closeTask = useCallback(() => setQuery({ task: null, expandTaskId: null }), [setQuery])
+
+  /* Editing replaces the drawer rather than stacking two focus traps. */
+  const startEdit = useCallback(
+    (task) => {
+      setDayPrefill('')
+      setEditing(task)
+      setQuery({ task: null, expandTaskId: null })
+    },
+    [setQuery]
+  )
+
+  /** @returns {Promise<boolean>} so the drawer can undo its own optimistic edit. */
+  const completeTask = useCallback(
+    async (task) => {
+      patchRow(task._id, { status: 'Completed' })
+      try {
+        const res = await api.put(`/tasks/${task._id}`, { status: 'Completed' })
+        patchRow(task._id, res.data)
+        toast.success('Task marked complete')
+        return true
+      } catch (err) {
+        patchRow(task._id, { status: task.status })
+        reportError(err, 'Could not update the task')
+        return false
+      }
+    },
+    [patchRow]
+  )
+
+  const moveTask = useCallback(
+    async (taskId, status) => {
+      const task = rows.find((t) => t._id === taskId)
+      if (!task || task.status === status) return
+      patchRow(taskId, { status })
+      try {
+        const res = await api.put(`/tasks/${taskId}`, { status })
+        patchRow(taskId, res.data)
+      } catch (err) {
+        /* Roll back only this task — concurrent updates to others survive. */
+        patchRow(taskId, { status: task.status })
+        reportError(err, `Could not move “${task.title}” to ${status}`)
+      }
+    },
+    [rows, patchRow]
+  )
+
+  const deleteTask = useCallback(
+    async (task) => {
+      const ok = await confirm({
+        title: `Delete “${task.title}”?`,
+        description: 'The task, its comments and its link to any email are removed permanently.',
+        confirmLabel: 'Delete task',
+        cancelLabel: 'Keep task',
+        tone: 'danger',
+      })
+      if (!ok) return
+      try {
+        await api.delete(`/tasks/${task._id}`)
+        toast.success('Task deleted')
+        closeTask()
+        reload()
+        options.reload()
+      } catch (err) {
+        reportError(err, 'Could not delete the task')
+      }
+    },
+    [confirm, closeTask, reload, options]
+  )
+
+  const runBulk = useCallback(
+    async (action, value) => {
+      if (selectedIds.length === 0) return
+      if (action === 'delete') {
+        const ok = await confirm({
+          title: `Delete ${selectedIds.length} task${selectedIds.length === 1 ? '' : 's'}?`,
+          description: 'The tasks, their comments and their email links are removed permanently.',
+          confirmLabel: 'Delete tasks',
+          cancelLabel: 'Keep tasks',
+          tone: 'danger',
+        })
+        if (!ok) return
+      }
+      setBulkBusy(true)
+      try {
+        await api.post('/tasks/bulk', { taskIds: selectedIds, action, ...(value ? { value } : {}) })
+        toast.success(
+          action === 'delete'
+            ? `${selectedIds.length} tasks deleted`
+            : action === 'status'
+              ? `${selectedIds.length} tasks set to ${value}`
+              : `${selectedIds.length} tasks reassigned`
+        )
+        setSelection({})
+        reload()
+        options.reload()
+      } catch (err) {
+        reportError(err, 'The bulk action did not complete')
+      } finally {
+        setBulkBusy(false)
+      }
+    },
+    [selectedIds, confirm, reload, options]
+  )
+
+  const saveTask = useCallback(
+    async (form) => {
+      setSaving(true)
+      const payload = {
+        title: form.title.trim(),
+        description: form.description,
+        clientName: form.clientName.trim(),
+        assignedTo: form.assignedTo,
+        deadline: form.deadline,
+        notes: form.notes,
+        priority: form.priority,
+        isRecurring: form.isRecurring,
+        recurrence: form.isRecurring ? form.recurrence : null,
+      }
+      try {
+        if (editing) {
+          await api.put(`/tasks/${editing._id}`, { ...payload, status: form.status })
+          toast.success('Task updated')
+        } else {
+          await api.post('/tasks', {
+            ...payload,
+            ...(form.linkedEmail ? { linkedEmail: form.linkedEmail } : {}),
+          })
+          toast.success('Task created')
+        }
+        setEditing(null)
+        setQuery({ compose: null, linkEmail: null, title: null, clientName: null })
+        reload()
+        options.reload()
+      } catch (err) {
+        reportError(err, editing ? 'Could not save the task' : 'Could not create the task')
+      } finally {
+        setSaving(false)
+      }
+    },
+    [editing, setQuery, reload, options]
+  )
+
+  /* ---- dialog wiring ---- */
+  const composing = query.composing || Boolean(editing)
+  const dialogInitial = useMemo(() => {
+    if (editing) {
+      return {
+        title: editing.title || '',
+        description: editing.description || '',
+        clientName: editing.clientName || '',
+        assignedTo: idOf(editing.assignedTo),
+        deadline: toLocalInput(editing.deadline),
+        notes: editing.notes || '',
+        status: editing.status || 'Pending',
+        priority: editing.priority || 'Medium',
+        isRecurring: Boolean(editing.isRecurring),
+        recurrence: editing.recurrence || 'Weekly',
+      }
     }
-    if (priorityFilter !== 'All' && (task.priority || 'Medium') !== priorityFilter) {
-      return false;
+    return {
+      title: query.linkTitle,
+      clientName: query.linkClient,
+      linkedEmail: query.linkEmail,
+      deadline: dayPrefill,
     }
-    return true;
-  });
+  }, [editing, query.linkTitle, query.linkClient, query.linkEmail, dayPrefill])
 
-  const getInitials = (name) => {
-    if (!name) return '?';
-    return name.split(' ').map(n => n[0]).join('').toUpperCase().slice(0, 2);
-  };
+  const closeDialog = useCallback(() => {
+    setEditing(null)
+    setDayPrefill('')
+    setQuery({ compose: null, linkEmail: null, title: null, clientName: null })
+  }, [setQuery])
 
-  const getDeadlineInfo = (deadlineString) => {
-    if (!deadlineString) return { text: 'No Deadline', badgeClass: 'bg-slate-100 text-slate-500 border border-slate-200' };
-    const deadline = new Date(deadlineString);
-    const now = new Date();
-    const diffMs = deadline - now;
-    const diffDays = diffMs / (1000 * 60 * 60 * 24);
+  /* ---- table ----
+   * Sorting is server-side and lives in `?sort=`; `DataTable` gets the same
+   * state through `sorting`/`onSortingChange`, so headers are real and the
+   * visible page is never re-ordered locally. Only the columns in
+   * `TASK_SORT_FIELDS` (taskController.js) get a sortable header — "Assignee"
+   * deliberately does not, because the server cannot sort on it. */
+  const sorting = useMemo(
+    () => [
+      {
+        id: query.sort.startsWith('-') ? query.sort.slice(1) : query.sort,
+        desc: query.sort.startsWith('-'),
+      },
+    ],
+    [query.sort]
+  )
 
-    if (diffMs < 0) {
-      return { text: 'Overdue', badgeClass: 'bg-red-50 border border-red-150 text-red-650' };
-    } else if (diffDays < 2) {
-      const hours = Math.floor(diffMs / (1000 * 60 * 60));
-      const text = hours > 24 ? `1 day left` : `${hours}h left`;
-      return { text, badgeClass: 'bg-amber-50 border border-amber-150 text-amber-600' };
-    } else {
-      const text = `${Math.floor(diffDays)} days left`;
-      return { text, badgeClass: 'bg-emerald-50 border border-emerald-150 text-emerald-600' };
-    }
-  };
+  const handleSortingChange = useCallback(
+    (next) => {
+      const [s] = next
+      setQuery({ sort: s ? `${s.desc ? '-' : ''}${s.id}` : QUERY_DEFAULTS.sort, page: 1 })
+    },
+    [setQuery]
+  )
 
-  const getStatusBorder = (status) => {
-    switch (status) {
-      case 'Completed': return 'border-l-4 border-l-emerald-500';
-      case 'Late': return 'border-l-4 border-l-red-500';
-      case 'Pending': return 'border-l-4 border-l-amber-500';
-      default: return 'border-l-4 border-l-slate-400';
-    }
-  };
+  const columns = useMemo(
+    () => [
+      {
+        accessorKey: 'title',
+        header: 'Task',
+        /* The row opener — DataTable wraps this cell in a real
+         * <button data-row-open>, so the list is keyboard-operable. */
+        meta: { primary: true, rowOpener: true },
+        cell: ({ row }) => (
+          <span className="block min-w-0">
+            <span className="block truncate text-sm font-medium leading-4 text-fg">
+              {row.original.title}
+            </span>
+            <span className="block truncate text-2xs leading-4 text-fg-3">
+              {row.original.clientName || 'No client'}
+            </span>
+          </span>
+        ),
+      },
+      {
+        id: 'assignedTo',
+        /* Not in TASK_SORT_FIELDS — a header here would silently do nothing. */
+        enableSorting: false,
+        header: 'Assignee',
+        meta: { width: '180px' },
+        cell: ({ row }) => <AssigneeCell user={row.original.assignedTo} />,
+      },
+      {
+        accessorKey: 'priority',
+        header: 'Priority',
+        meta: { width: '110px', truncate: false },
+        cell: ({ row }) => (
+          <Badge size="sm" variant={priorityVariant(row.original.priority)}>
+            {row.original.priority || 'Medium'}
+          </Badge>
+        ),
+      },
+      {
+        accessorKey: 'status',
+        header: 'Status',
+        meta: { width: '110px', truncate: false },
+        cell: ({ row }) => (
+          <Badge size="sm" variant={statusVariant(row.original.status)}>
+            {row.original.status}
+          </Badge>
+        ),
+      },
+      {
+        accessorKey: 'deadline',
+        header: 'Due',
+        meta: { width: '130px', truncate: false },
+        cell: ({ row }) => <DueCell task={row.original} now={now} />,
+      },
+      {
+        id: 'flags',
+        header: () => <span className="sr-only">Attributes</span>,
+        enableSorting: false,
+        meta: { width: '64px', truncate: false },
+        cell: ({ row }) => <TaskFlags task={row.original} />,
+      },
+      {
+        id: 'actions',
+        header: () => <span className="sr-only">Actions</span>,
+        enableSorting: false,
+        meta: { width: '56px', truncate: false },
+        cell: ({ row }) => (
+          <RowMenu
+            task={row.original}
+            perms={perms}
+            onOpen={openTask}
+            onEdit={startEdit}
+            onComplete={completeTask}
+            onDelete={deleteTask}
+          />
+        ),
+      },
+    ],
+    [perms, now, openTask, startEdit, completeTask, deleteTask]
+  )
 
-  const toggleExpand = (id) => {
-    setExpandedTaskId(expandedTaskId === id ? null : id);
-    if (id !== expandedTaskId && !commentMap[id]) {
-      loadComments(id);
-    }
-  };
+  /* ---- filters ---- */
+  const hasFilters = FILTER_KEYS.some((key) => query[key])
+  const clearFilters = useCallback(
+    () =>
+      setQuery({
+        status: null,
+        priority: null,
+        assignee: null,
+        creator: null,
+        client: null,
+        q: null,
+        page: 1,
+      }),
+    [setQuery]
+  )
 
-  const canDragTask = (task) => {
-    if (currentUser.role === 'Admin' || currentUser.role === 'Head') return true;
-    const assigneeId = task.assignedTo?._id || task.assignedTo;
-    return assigneeId === currentUser._id;
-  };
+  /* ---- command palette ---- */
+  const startCompose = useCallback(() => {
+    setEditing(null)
+    setDayPrefill('')
+    setQuery({ compose: '1' })
+  }, [setQuery])
 
-  const canDropInColumn = (task, targetStatus) => {
-    if (currentUser.role === 'Admin' || currentUser.role === 'Head') return true;
-    return targetStatus === 'Completed';
-  };
+  const showMyOverdue = useCallback(
+    () => setQuery({ assignee: user?._id || null, status: 'Late', page: 1 }),
+    [setQuery, user]
+  )
 
-  const handleDragStart = (e, task) => {
-    if (!canDragTask(task)) { e.preventDefault(); return; }
-    setDraggedTaskId(task._id);
-    e.dataTransfer.effectAllowed = 'move';
-  };
+  useRegisterCommands(
+    [
+      ...(perms.canCreate
+        ? [
+            {
+              id: 'tasks-new',
+              label: 'New task',
+              group: 'Tasks',
+              icon: <Plus className="h-4 w-4" />,
+              keywords: ['create', 'add', 'assign'],
+              onSelect: startCompose,
+            },
+          ]
+        : []),
+      ...VIEW_OPTIONS.map((option) => ({
+        id: `tasks-view-${option.value}`,
+        label: `Switch to ${option.label} view`,
+        group: 'Tasks',
+        icon: <LayoutList className="h-4 w-4" />,
+        keywords: ['view', 'layout'],
+        onSelect: () => setQuery({ view: option.value, page: 1 }),
+      })),
+      {
+        id: 'tasks-my-overdue',
+        label: 'Show my overdue tasks',
+        group: 'Tasks',
+        icon: <ClipboardList className="h-4 w-4" />,
+        keywords: ['late', 'mine', 'due'],
+        onSelect: showMyOverdue,
+      },
+      {
+        id: 'tasks-clear-filters',
+        label: 'Clear task filters',
+        group: 'Tasks',
+        icon: <X className="h-4 w-4" />,
+        keywords: ['reset', 'all tasks'],
+        onSelect: clearFilters,
+      },
+    ],
+    [perms.canCreate, startCompose, setQuery, showMyOverdue, clearFilters]
+  )
 
-  const handleDragEnd = () => {
-    setDraggedTaskId(null);
-    setDragOverColumn(null);
-  };
+  const monthAnchor = useMemo(() => {
+    const parsed = /^(\d{4})-(\d{2})$/.exec(query.month || '')
+    if (!parsed) return new Date(new Date().getFullYear(), new Date().getMonth(), 1)
+    return new Date(Number(parsed[1]), Number(parsed[2]) - 1, 1)
+  }, [query.month])
 
-  const handleColumnDragOver = (e, columnStatus) => {
-    e.preventDefault();
-    e.dataTransfer.dropEffect = 'move';
-    if (dragOverColumn !== columnStatus) setDragOverColumn(columnStatus);
-  };
+  const shiftMonth = (delta) => {
+    const base = delta === 0 ? new Date() : new Date(monthAnchor.getFullYear(), monthAnchor.getMonth() + delta, 1)
+    setQuery({ month: `${base.getFullYear()}-${String(base.getMonth() + 1).padStart(2, '0')}` })
+  }
 
-  const handleColumnDrop = async (e, targetStatus) => {
-    e.preventDefault();
-    setDragOverColumn(null);
-    const task = filteredTasks.find(t => t._id === draggedTaskId);
-    setDraggedTaskId(null);
-    if (!task || task.status === targetStatus) return;
+  const emptyState = hasFilters
+    ? {
+        icon: Search,
+        title: 'No tasks match these filters',
+        description: 'Try a wider status or priority, or clear the filters to see everything.',
+        secondaryAction: { label: 'Clear filters', onClick: clearFilters },
+      }
+    : {
+        icon: ClipboardList,
+        title: 'No tasks yet',
+        description: perms.canCreate
+          ? 'Create the first task, or turn an email in the inbox into one.'
+          : 'Work assigned to you will appear here.',
+      }
 
-    if (!canDropInColumn(task, targetStatus)) {
-      triggerAlert ? triggerAlert('error', 'You can only move your own tasks to Completed.') : alert('You can only move your own tasks to Completed.');
-      return;
-    }
-
-    const prevTasks = tasks;
-    setTasks(prevTasks.map(t => t._id === task._id ? { ...t, status: targetStatus } : t));
-
-    try {
-      await api.put(`/tasks/${task._id}`, { status: targetStatus });
-    } catch (err) {
-      setTasks(prevTasks); // revert on failure
-      triggerAlert ? triggerAlert('error', err.response?.data?.message || 'Failed to update status.') : alert('Failed to update status.');
-    }
-  };
+  const truncatedWideView = wideView && total > rows.length
 
   return (
     <>
-      <main className="flex-grow max-w-7xl w-full mx-auto px-4 sm:px-6 lg:px-8 py-8 relative animate-fade-in select-none">
-        {/* Floating alerts */}
-        {alert.message && (
-          <div className={`fixed top-20 right-4 z-50 p-4 rounded-xl border flex items-start space-x-3 shadow-2xl transition-all duration-300 max-w-md animate-slide-in ${
-            alert.type === 'success'
-              ? 'bg-emerald-50 border-emerald-100 text-emerald-600'
-              : 'bg-red-50 border-red-100 text-red-500'
-          }`}>
-            <svg className="h-5 w-5 shrink-0 mt-0.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-              {alert.type === 'success' ? (
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z" />
-              ) : (
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" />
-              )}
-            </svg>
-            <span className="text-xs font-semibold">{alert.message}</span>
-          </div>
-        )}
+      <PageHeader
+        title="Tasks"
+        description={
+          perms.canCreate ? 'Assign, track and close office work.' : 'Work assigned to you.'
+        }
+        actions={
+          perms.canCreate ? (
+            <Button
+              variant="primary"
+              leftIcon={<Plus className="h-4 w-4" />}
+              onClick={startCompose}
+            >
+              New task
+            </Button>
+          ) : null
+        }
+      />
 
-        <div className="sm:flex sm:items-center sm:justify-between mb-8 gap-4">
-          <div>
-            <h1 className="text-3xl font-extrabold tracking-tight text-slate-800">Tasks</h1>
-            <p className="mt-1 text-sm text-slate-550">
-              {currentUser?.role === 'Employee'
-                ? 'Displaying task records assigned directly to you.'
-                : 'Monitor, assign, update, and manage workspace operations tasks.'}
-            </p>
-          </div>
-          <div className="flex flex-col sm:flex-row gap-3 mt-4 sm:mt-0 items-start sm:items-center">
-            {currentUser.role !== 'Employee' && taskCreators.length > 0 && (
-              <div className="flex items-center space-x-2">
-                <span className="text-xs text-slate-400 font-semibold uppercase tracking-wider">Creator:</span>
-                <select
-                  value={creatorFilter}
-                  onChange={(e) => {
-                    setCreatorFilter(e.target.value);
-                    setSelectedTaskIds(new Set());
-                    setSelectAll(false);
-                  }}
-                  className="px-4 py-2 bg-white border border-slate-200 rounded-xl text-xs text-slate-700 focus:outline-none focus:ring-2 focus:ring-indigo-150 focus:border-indigo-550 transition-all cursor-pointer"
-                >
-                  <option value="">All Creators</option>
-                  {taskCreators.map((creator) => (
-                    <option key={creator._id} value={creator._id}>
-                      {creator.name}
-                    </option>
-                  ))}
-                </select>
-              </div>
-            )}
-            <div className="flex items-center space-x-2">
-              <span className="text-xs text-slate-400 font-semibold uppercase tracking-wider">Priority:</span>
-              <select
-                value={priorityFilter}
-                onChange={e => {
-                  setPriorityFilter(e.target.value);
-                  setSelectedTaskIds(new Set());
-                  setSelectAll(false);
-                }}
-                style={{ padding: '7px 10px', fontSize: '13px', borderRadius: '6px', border: '1px solid #e2e8f0', background: 'white', cursor: 'pointer' }}
-                className="text-xs font-semibold text-slate-700"
-              >
-                <option value="All">All priorities</option>
-                <option value="Urgent">Urgent</option>
-                <option value="High">High</option>
-                <option value="Medium">Medium</option>
-                <option value="Low">Low</option>
-              </select>
-            </div>
-            {(currentUser?.role === 'Admin' || currentUser?.role === 'Head') && (
-              <button
-                onClick={() => setIsCreateOpen(true)}
-                className="px-5 py-3 rounded-xl bg-gradient-to-r from-indigo-600 to-purple-600 text-xs font-bold text-white shadow-md shadow-indigo-600/10 transition-all duration-200 flex items-center space-x-2 active:scale-[0.98] select-none"
-              >
-                <svg className="h-4 w-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M12 6v6m0 0v6m0-6h6m-6 0H6" />
-                </svg>
-                <span>Create Task</span>
-              </button>
-            )}
-          </div>
-        </div>
+      <TaskFilters
+        query={query}
+        setQuery={setQuery}
+        options={options}
+        canAssign={canAssign}
+        hasFilters={hasFilters}
+        onClear={clearFilters}
+      />
 
-        {/* View mode toggle & Filter tabs */}
-        <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4 mb-6">
-          <div className="flex flex-wrap gap-2">
-            {['All', 'Pending', 'Completed', 'Late'].map((filter) => (
-              <button
-                key={filter}
-                onClick={() => {
-                  setStatusFilter(filter);
-                  setSelectedTaskIds(new Set());
-                  setSelectAll(false);
-                }}
-                className={`px-4 py-2 text-xs font-bold rounded-full border transition-all ${
-                  statusFilter === filter
-                    ? 'bg-gradient-to-r from-indigo-600 to-purple-600 border-transparent text-white shadow-md shadow-indigo-600/10'
-                    : 'bg-white border-slate-200 text-slate-500 hover:bg-slate-55 hover:text-slate-700'
-                }`}
-              >
-                {filter}
-              </button>
+      <PageBody>
+        {error ? (
+          <Alert
+            variant="danger"
+            title="Could not load tasks"
+            className="mb-4"
+            action={
+              <Button size="sm" onClick={reload}>
+                Retry
+              </Button>
+            }
+          >
+            {error}
+          </Alert>
+        ) : null}
+
+        {truncatedWideView ? (
+          <Alert variant="info" title="Showing the first 100 tasks" className="mb-4">
+            {formatNumber(total)} tasks match these filters. Narrow the filters, or switch to the
+            list view to page through all of them.
+          </Alert>
+        ) : null}
+
+        {query.view === 'list' ? (
+          <>
+            {selectedIds.length > 0 && canAssign ? (
+              <BulkBar
+                selected={selectedIds}
+                users={options.users}
+                busy={bulkBusy}
+                blocked={bulkBlocked}
+                onClear={() => setSelection({})}
+                onAction={runBulk}
+              />
+            ) : null}
+            <DataTable
+              ariaLabel="Tasks"
+              data={rows}
+              columns={columns}
+              loading={loading}
+              enableSelection={canAssign}
+              rowSelection={selection}
+              onRowSelectionChange={setSelection}
+              getRowId={(row) => row._id}
+              onRowClick={openTask}
+              rowActivation="cell"
+              sorting={sorting}
+              onSortingChange={handleSortingChange}
+              emptyState={emptyState}
+              pagination={{
+                page: query.page,
+                pageSize: query.limit,
+                total,
+                itemLabel: 'tasks',
+                onPageChange: (page) => setQuery({ page }),
+                onPageSizeChange: (limit) => setQuery({ limit, page: 1 }),
+              }}
+            />
+          </>
+        ) : loading ? (
+          <div
+            className={cn(
+              'grid gap-3',
+              query.view === 'board' ? 'grid-cols-1 md:grid-cols-3' : 'grid-cols-1'
+            )}
+            aria-busy="true"
+          >
+            {Array.from({ length: query.view === 'board' ? 3 : 1 }, (_, i) => (
+              <Skeleton key={i} className={query.view === 'board' ? 'h-[420px]' : 'h-[640px]'} />
             ))}
           </div>
-
-          <div className="flex bg-slate-100 p-1 rounded-xl border border-slate-200 self-start sm:self-auto">
-            <button
-              onClick={() => setViewMode('list')}
-              className={`px-4 py-2 text-xs font-bold rounded-lg flex items-center gap-1.5 transition-all ${
-                viewMode === 'list'
-                  ? 'bg-white text-slate-800 shadow-sm border border-slate-200/50'
-                  : 'text-slate-500 hover:text-slate-700'
-              }`}
-            >
-              <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2.5" d="M4 6h16M4 12h16M4 18h16" />
-              </svg>
-              <span>List View</span>
-            </button>
-            <button
-              onClick={() => setViewMode('kanban')}
-              className={`px-4 py-2 text-xs font-bold rounded-lg flex items-center gap-1.5 transition-all ${
-                viewMode === 'kanban'
-                  ? 'bg-white text-slate-800 shadow-sm border border-slate-200/50'
-                  : 'text-slate-500 hover:text-slate-700'
-              }`}
-            >
-              <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M9 17V7m0 10a2 2 0 01-2 2H5a2 2 0 01-2-2V7a2 2 0 012-2h2a2 2 0 012 2m0 10a2 2 0 002 2h2a2 2 0 002-2M9 7a2 2 0 012-2h2a2 2 0 012 2m0 10V7m0 10a2 2 0 002 2h2a2 2 0 002-2V7a2 2 0 00-2-2h-2a2 2 0 00-2 2" />
-              </svg>
-              <span>Kanban</span>
-            </button>
-            <button
-              onClick={() => setViewMode('calendar')}
-              className={`px-4 py-2 text-xs font-bold rounded-lg flex items-center gap-1.5 transition-all ${
-                viewMode === 'calendar'
-                  ? 'bg-white text-slate-800 shadow-sm border border-slate-200/50'
-                  : 'text-slate-500 hover:text-slate-700'
-              }`}
-            >
-              <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M8 7V3m8 4V3m-9 8h10M5 21h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z" />
-              </svg>
-              <span>Calendar View</span>
-            </button>
+        ) : rows.length === 0 ? (
+          <div className="rounded-lg border border-line bg-surface">
+            <EmptyState {...emptyState} />
           </div>
-        </div>
-
-        {/* Task List Cards / Calendar View */}
-        {loading ? (
-          <div className="space-y-4">
-            {[...Array(5)].map((_, i) => (
-              <div key={i} className="h-20 bg-white border border-slate-200/80 rounded-2xl p-5 skeleton-shimmer" />
-            ))}
-          </div>
-        ) : viewMode === 'calendar' ? (
-          <div className="bg-white border border-slate-200 rounded-3xl p-6 shadow-sm select-none animate-fade-in">
-            {/* Calendar Header */}
-            <div className="flex items-center justify-between mb-6">
-              <div className="flex items-center gap-2">
-                <h3 className="text-lg font-bold text-slate-850">
-                  {currentDate.toLocaleString('default', { month: 'long', year: 'numeric' })}
-                </h3>
-                <span className="text-xs text-slate-400 font-semibold px-2.5 py-1 bg-slate-50 rounded-full border border-slate-100/80">
-                  {filteredTasks.length} {filteredTasks.length === 1 ? 'Task' : 'Tasks'}
-                </span>
-              </div>
-              <div className="flex items-center gap-2">
-                <button
-                  onClick={handlePrevMonth}
-                  className="p-2 border border-slate-200 rounded-xl hover:bg-slate-50 active:scale-95 transition-all text-slate-500"
-                >
-                  <svg className="w-4.5 h-4.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2.5" d="M15 19l-7-7 7-7" />
-                  </svg>
-                </button>
-                <button
-                  onClick={handleGoToday}
-                  className="px-3.5 py-1.5 border border-slate-200 rounded-xl hover:bg-slate-50 active:scale-95 transition-all text-xs font-bold text-slate-650"
-                >
-                  Today
-                </button>
-                <button
-                  onClick={handleNextMonth}
-                  className="p-2 border border-slate-200 rounded-xl hover:bg-slate-50 active:scale-95 transition-all text-slate-500"
-                >
-                  <svg className="w-4.5 h-4.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2.5" d="M9 5l7 7-7 7" />
-                  </svg>
-                </button>
-              </div>
-            </div>
-
-            {/* Week Headers */}
-            <div className="grid grid-cols-7 gap-2 mb-2">
-              {['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'].map((day) => (
-                <div key={day} className="text-center text-[10px] font-bold text-slate-400 uppercase tracking-wider py-2">
-                  {day}
-                </div>
-              ))}
-            </div>
-
-            {/* Days Grid */}
-            <div className="grid grid-cols-7 gap-2">
-              {getDaysInMonth(currentDate).map(({ day, month, year, isCurrentMonth }, idx) => {
-                const dayTasks = filteredTasks.filter((task) => isSameDay(task.deadline, year, month, day));
-                const isToday = isSameDay(new Date().toISOString(), year, month, day);
-
-                return (
-                  <div
-                    key={idx}
-                    onClick={() => {
-                      if (currentUser.role === 'Admin' || currentUser.role === 'Head') {
-                        // Prefill deadline with selected date at 12:00 PM local
-                        const pad = (n) => String(n).padStart(2, '0');
-                        const dateStr = `${year}-${pad(month + 1)}-${pad(day)}T12:00`;
-                        setNewTask({
-                          title: '',
-                          description: '',
-                          clientName: '',
-                          assignedTo: '',
-                          linkedEmail: '',
-                          deadline: dateStr,
-                          notes: '',
-                          priority: 'Medium'
-                        });
-                        setClientSearchQuery('');
-                        setIsCreateOpen(true);
-                      }
-                    }}
-                    className={`min-h-[110px] p-2 border rounded-2xl flex flex-col justify-between transition-all select-none relative ${
-                      isCurrentMonth
-                        ? 'bg-white border-slate-100 hover:shadow-md cursor-pointer'
-                        : 'bg-slate-50/50 border-slate-100/60 text-slate-400'
-                    } ${isToday ? 'ring-2 ring-indigo-650 bg-indigo-50/5 border-transparent' : ''}`}
-                  >
-                    {/* Day Number Header */}
-                    <div className="flex items-center justify-between mb-1.5">
-                      <span className={`text-xs font-extrabold ${isToday ? 'text-indigo-600' : isCurrentMonth ? 'text-slate-800' : 'text-slate-400'}`}>
-                        {day}
-                      </span>
-                      {isToday && (
-                        <span className="w-1.5 h-1.5 bg-indigo-600 rounded-full" />
-                      )}
-                    </div>
-
-                    {/* Tasks container */}
-                    <div className="flex-grow overflow-y-auto max-h-[70px] space-y-1 pr-1 custom-scrollbar">
-                      {dayTasks.map((task) => {
-                        let statusColor = 'bg-amber-50 border-amber-200 text-amber-700 hover:bg-amber-100/80';
-                        if (task.status === 'Completed') {
-                          statusColor = 'bg-emerald-50 border-emerald-250 text-emerald-700 hover:bg-emerald-100/80';
-                        } else if (task.status === 'Late' || new Date(task.deadline) < new Date()) {
-                          statusColor = 'bg-red-50 border-red-200 text-red-700 hover:bg-red-100/80';
-                        }
-
-                        return (
-                          <div
-                            key={task._id}
-                            onClick={(e) => {
-                              e.stopPropagation();
-                              openEditModal(task);
-                            }}
-                            className={`text-[10px] px-2 py-1 rounded-lg font-bold border truncate hover:scale-[1.02] active:scale-[0.98] transition-all text-left block w-full select-none cursor-pointer ${statusColor}`}
-                            title={`${task.title} - ${task.clientName}`}
-                          >
-                            {task.title}
-                          </div>
-                        );
-                      })}
-                    </div>
-                  </div>
-                );
-              })}
-            </div>
-          </div>
-        ) : viewMode === 'kanban' ? (
-          <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
-            {['Pending', 'Completed', 'Late'].map((columnStatus) => {
-              const columnTasks = filteredTasks.filter((t) => t.status === columnStatus);
-              const columnStyles = {
-                Pending:   { header: 'bg-amber-50 border-amber-200 text-amber-700', dot: 'bg-amber-500' },
-                Completed: { header: 'bg-emerald-50 border-emerald-200 text-emerald-700', dot: 'bg-emerald-500' },
-                Late:      { header: 'bg-red-50 border-red-200 text-red-700', dot: 'bg-red-500' },
-              };
-              const style = columnStyles[columnStatus];
-              const isDragOver = dragOverColumn === columnStatus;
-
-              return (
-                <div
-                  key={columnStatus}
-                  onDragOver={(e) => handleColumnDragOver(e, columnStatus)}
-                  onDragLeave={() => setDragOverColumn(null)}
-                  onDrop={(e) => handleColumnDrop(e, columnStatus)}
-                  className={`rounded-2xl border-2 border-dashed p-3 min-h-[480px] transition-colors ${
-                    isDragOver ? 'border-indigo-400 bg-indigo-50/40' : 'border-slate-200 bg-slate-50/60'
-                  }`}
-                >
-                  <div className={`flex items-center gap-2 px-3 py-2 rounded-xl border mb-3 ${style.header}`}>
-                    <span className={`w-2 h-2 rounded-full ${style.dot}`} />
-                    <span className="text-xs font-bold uppercase tracking-wide">{columnStatus}</span>
-                    <span className="ml-auto text-xs font-bold bg-white/70 px-2 py-0.5 rounded-full">
-                      {columnTasks.length}
-                    </span>
-                  </div>
-
-                  <div className="space-y-2.5 max-h-[700px] overflow-y-auto pr-1 custom-scrollbar">
-                    {columnTasks.length === 0 && (
-                      <p className="text-[11px] text-slate-400 text-center py-10">No tasks</p>
-                    )}
-                    {columnTasks.map((task) => {
-                      const assigneeName = task.assignedTo?.name || 'Unassigned';
-                      const draggable = canDragTask(task);
-
-                      return (
-                        <div
-                          key={task._id}
-                          draggable={draggable}
-                          onDragStart={(e) => handleDragStart(e, task)}
-                          onDragEnd={handleDragEnd}
-                          onClick={() => {
-                            if (currentUser.role === 'Admin' || currentUser.role === 'Head') {
-                              openEditModal(task);
-                            }
-                          }}
-                          className={`bg-white rounded-xl border border-slate-200 p-3 shadow-sm hover:shadow-md transition-all select-none ${
-                            draggable
-                              ? 'cursor-grab active:cursor-grabbing'
-                              : (currentUser.role === 'Admin' || currentUser.role === 'Head')
-                              ? 'cursor-pointer'
-                              : 'cursor-default'
-                          } ${draggedTaskId === task._id ? 'opacity-40' : 'opacity-100'}`}
-                        >
-                          <p className="text-xs font-bold text-slate-800 mb-1 line-clamp-2">{task.title}</p>
-                          <p className="text-[11px] text-slate-500 mb-2">{task.clientName}</p>
-                          <div className="flex items-center justify-between">
-                            <span className="text-[10px] font-semibold text-slate-500 bg-slate-100 px-2 py-0.5 rounded-full">
-                              {assigneeName}
-                            </span>
-                            <span className="text-[10px] text-slate-400">
-                              {new Date(task.deadline).toLocaleDateString('en-IN', { day: '2-digit', month: 'short' })}
-                            </span>
-                          </div>
-                        </div>
-                      );
-                    })}
-                  </div>
-                </div>
-              );
-            })}
-          </div>
-        ) : filteredTasks.length === 0 ? (
-          <div className="text-center py-20 bg-white border border-slate-200/80 rounded-3xl shadow-sm">
-            <div className="w-14 h-14 mx-auto bg-slate-50 rounded-2xl flex items-center justify-center mb-4 border border-slate-100">
-              <svg className="h-6 w-6 text-slate-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2" />
-              </svg>
-            </div>
-            <h3 className="text-md font-bold text-slate-800 mb-1">No Tasks Found</h3>
-            <p className="text-xs text-slate-500 max-w-xs mx-auto">
-              No active tasks meet your filter criteria. Try changing status or create a new record.
-            </p>
-          </div>
+        ) : query.view === 'board' ? (
+          <TaskBoard
+            tasks={rows}
+            onOpen={openTask}
+            onMove={moveTask}
+            canMoveTo={(task, status) =>
+              perms.canEdit(task) || (status === 'Completed' && perms.canComplete(task))
+            }
+          />
         ) : (
-          <div className="space-y-3.5">
-
-
-            {filteredTasks.map((task) => {
-              const isExpanded = expandedTaskId === task._id;
-              const assigneeName = task.assignedTo?.name || 'Unassigned';
-              const assigneeInitials = getInitials(assigneeName);
-              const deadlineInfo = getDeadlineInfo(task.deadline);
-              
-              return (
-                <div
-                  key={task._id}
-                  className={`bg-white border border-slate-200 rounded-2xl overflow-hidden shadow-sm hover-glow-card transition-all duration-300 ${getStatusBorder(task.status)}`}
-                >
-                  {/* Header Summary click section */}
-                  <div
-                    onClick={() => toggleExpand(task._id)}
-                    className="p-5 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4 cursor-pointer select-none"
-                  >
-                    <div className="flex items-center space-x-3.5 min-w-0">
-                      {/* Avatar circle */}
-                      <div className="h-9 w-9 rounded-full bg-indigo-50 border border-indigo-100 flex items-center justify-center text-indigo-600 font-extrabold text-sm shrink-0" title={`Assigned to ${assigneeName}`}>
-                        {assigneeInitials}
-                      </div>
-                      {/* Info */}
-                      <div className="min-w-0">
-                        <h4 className="text-sm font-bold text-slate-800 truncate max-w-[240px] sm:max-w-[480px] leading-snug">
-                          {task.title}
-                        </h4>
-                        <div className="flex flex-wrap items-center gap-2 mt-1">
-                          <span className="inline-flex items-center px-2.5 py-0.5 rounded-full text-[10px] font-bold bg-indigo-50 text-indigo-650 border border-indigo-100">
-                            {task.clientName}
-                          </span>
-                          {task.linkedEmail && (
-                            <span className="inline-flex items-center text-[10px] text-indigo-550 font-medium">
-                              ✉️ Linked Email
-                            </span>
-                          )}
-                        </div>
-                      </div>
-                    </div>
-
-                    <div className="flex items-center justify-between sm:justify-end gap-3 shrink-0">
-                      <span className={`px-2.5 py-0.5 rounded-full text-[10px] font-bold ${deadlineInfo.badgeClass}`}>
-                        {deadlineInfo.text}
-                      </span>
-                      <span className={`px-2.5 py-0.5 rounded-full text-[10px] font-bold border ${
-                        task.status === 'Completed'
-                          ? 'bg-emerald-50 border-emerald-100 text-emerald-600'
-                          : task.status === 'Late'
-                          ? 'bg-red-50 border-red-100 text-red-650'
-                          : 'bg-amber-50 border-amber-100 text-amber-600'
-                      }`}>
-                        {task.status}
-                      </span>
-                      {task.isRecurring && task.recurrence && (
-                        <span style={{
-                          fontSize: '10px', fontWeight: 700, padding: '2px 8px', borderRadius: '20px',
-                          background: '#f0fdf4', color: '#166534', border: '1px solid #bbf7d0',
-                          display: 'inline-flex', alignItems: 'center'
-                        }}>
-                          🔁 {task.recurrence}
-                        </span>
-                      )}
-                      <span style={{
-                        fontSize: '11px', fontWeight: 600, padding: '2px 8px', borderRadius: '20px',
-                        ...getPriorityStyle(task.priority)
-                      }}>
-                        {task.priority || 'Medium'}
-                      </span>
-                      <svg
-                        className={`h-4 w-4 text-slate-400 transform transition-transform duration-200 ${
-                          isExpanded ? 'rotate-180 text-indigo-600' : ''
-                        }`}
-                        fill="none"
-                        stroke="currentColor"
-                        viewBox="0 0 24 24"
-                      >
-                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M19 9l-7 7-7-7" />
-                      </svg>
-                    </div>
-                  </div>
-
-                  {/* Expanded Accordion Area */}
-                  {isExpanded && (
-                    <div className="px-5 pb-5 border-t border-slate-100 bg-slate-50/20 pt-4 animate-fade-in space-y-4">
-                      <div className="grid grid-cols-1 md:grid-cols-2 gap-4 text-xs">
-                        <div className="space-y-2">
-                          <p className="text-slate-500 font-semibold uppercase tracking-wider text-[10px]">Description</p>
-                          <div className="bg-white border border-slate-200 rounded-xl p-4 text-slate-700 leading-relaxed whitespace-pre-wrap select-text">
-                            {task.description ? task.description : <span className="italic text-slate-400">No description provided.</span>}
-                          </div>
-                        </div>
-                        
-                        <div className="space-y-2">
-                          <p className="text-slate-500 font-semibold uppercase tracking-wider text-[10px]">Notes</p>
-                          <div className="bg-white border border-slate-200 rounded-xl p-4 text-slate-700 leading-relaxed whitespace-pre-wrap select-text">
-                            {task.notes ? task.notes : <span className="italic text-slate-400">No internal notes.</span>}
-                          </div>
-                        </div>
-                      </div>
-
-                      <div className="grid grid-cols-1 sm:grid-cols-4 gap-4 border-t border-slate-100 pt-4 text-xs text-slate-500">
-                        <div>
-                          <span className="font-semibold text-slate-400 uppercase tracking-wider text-[10px] block">Assigned To</span>
-                          <span className="text-slate-750 font-medium">{task.assignedTo ? `${task.assignedTo.name} (${task.assignedTo.email})` : 'Unassigned'}</span>
-                        </div>
-                        <div>
-                          <span className="font-semibold text-slate-400 uppercase tracking-wider text-[10px] block">Created By</span>
-                          <span className="text-slate-750 font-medium">{task.createdBy ? task.createdBy.name : 'System'}</span>
-                        </div>
-                        <div>
-                          <span className="font-semibold text-slate-400 uppercase tracking-wider text-[10px] block">Deadline</span>
-                          <span className="text-slate-750 font-medium">{formatDate(task.deadline)}</span>
-                        </div>
-                        <div>
-                          <span className="font-semibold text-slate-400 uppercase tracking-wider text-[10px] block">Priority</span>
-                          <span style={{
-                            display: 'inline-block', fontSize: '11px', fontWeight: 600, padding: '2px 8px', borderRadius: '20px', marginTop: '2px',
-                            ...getPriorityStyle(task.priority)
-                          }}>
-                            {task.priority || 'Medium'}
-                          </span>
-                        </div>
-                      </div>
-
-                      {task.linkedEmail && (
-                        <div className="bg-white p-4 border border-slate-200 rounded-xl space-y-2">
-                          <h5 className="text-[10px] font-bold text-indigo-600 uppercase tracking-wider">🔗 Linked Email Payload</h5>
-                          <p className="text-xs font-semibold text-slate-800">{task.linkedEmail.subject}</p>
-                          <p className="text-[10px] text-slate-455">From: {task.linkedEmail.from}</p>
-                          {task.linkedEmail.body && (
-                            <div className="mt-1">
-                              <iframe
-                                srcDoc={renderEmailContent(task.linkedEmail.body)}
-                                title="Email Body"
-                                sandbox="allow-scripts allow-same-origin allow-popups allow-popups-to-escape-sandbox"
-                                className="w-full border border-slate-150 rounded-xl bg-slate-50/50"
-                                style={{ minHeight: '120px', resize: 'vertical' }}
-                                onLoad={(e) => {
-                                  try {
-                                    const doc = e.target.contentDocument || e.target.contentWindow.document;
-                                    if (doc && doc.body) {
-                                      e.target.style.height = `${doc.body.scrollHeight + 24}px`;
-                                    }
-                                  } catch (err) {
-                                    console.error(err);
-                                  }
-                                }}
-                              />
-                            </div>
-                          )}
-
-                          {/* Attachments rendering inside Task list details */}
-                          {task.linkedEmail.attachments && task.linkedEmail.attachments.length > 0 && (
-                            <div className="pt-2 border-t border-slate-100 mt-2">
-                              <span className="font-semibold text-slate-400 uppercase tracking-wider text-[10px] block mb-1">Attachments ({task.linkedEmail.attachments.length})</span>
-                              <div className="flex flex-wrap gap-1.5">
-                                {task.linkedEmail.attachments.map((att) => (
-                                  <button
-                                    key={att.attachmentId}
-                                    onClick={() => handleDownloadAttachment(task.linkedEmail._id, att.attachmentId, att.filename)}
-                                    className="flex items-center gap-1.5 px-2.5 py-1.5 bg-slate-50 hover:bg-indigo-50 border border-slate-200 hover:border-indigo-200 rounded-lg text-[11px] font-bold text-slate-700 hover:text-indigo-700 transition-colors"
-                                  >
-                                    <svg className="w-3.5 h-3.5 text-slate-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" />
-                                    </svg>
-                                    <span>{att.filename}</span>
-                                    <span className="text-[9px] text-slate-400 font-semibold">({Math.round(att.size / 1024)} KB)</span>
-                                  </button>
-                                ))}
-                              </div>
-                            </div>
-                          )}
-                        </div>
-                      )}
-
-                      {/* Comments section */}
-                      <div style={{ marginTop: '16px', borderTop: '1px solid #e2e8f0', paddingTop: '14px' }}>
-                        <p style={{ fontSize: '12px', fontWeight: 600, color: '#64748b', marginBottom: '10px' }}>
-                          COMMENTS {commentMap[task._id]?.length ? `(${commentMap[task._id].length})` : ''}
-                        </p>
-
-                        {commentLoadingId === task._id ? (
-                          <p style={{ fontSize: '13px', color: '#94a3b8' }}>Loading comments...</p>
-                        ) : (
-                          <div style={{ display: 'flex', flexDirection: 'column', gap: '8px', marginBottom: '12px', maxHeight: '220px', overflowY: 'auto' }}>
-                            {(commentMap[task._id] || []).length === 0 && (
-                              <p style={{ fontSize: '13px', color: '#94a3b8', fontStyle: 'italic' }}>No comments yet. Be the first to comment.</p>
-                            )}
-                            {(commentMap[task._id] || []).map(comment => (
-                              <div key={comment._id} style={{ background: '#f8fafc', borderRadius: '8px', padding: '10px 12px', border: '1px solid #e2e8f0' }}>
-                                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: '4px' }}>
-                                  <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
-                                    <span style={{ fontSize: '13px', fontWeight: 600, color: '#334155' }}>{comment.author?.name}</span>
-                                    <span style={{ fontSize: '11px', color: '#94a3b8', padding: '1px 6px', background: '#f1f5f9', borderRadius: '10px' }}>{comment.author?.role}</span>
-                                  </div>
-                                  <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
-                                    <span style={{ fontSize: '11px', color: '#94a3b8' }}>
-                                      {new Date(comment.createdAt).toLocaleString('en-IN', { day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit' })}
-                                    </span>
-                                    {(currentUser.role === 'Admin' || currentUser.role === 'Head' || comment.author?._id === currentUser._id) && (
-                                      <button
-                                        onClick={() => handleDeleteComment(task._id, comment._id)}
-                                        style={{ background: 'none', border: 'none', cursor: 'pointer', color: '#94a3b8', fontSize: '14px', lineHeight: 1, padding: '0 2px' }}
-                                        title="Delete comment"
-                                      >×</button>
-                                    )}
-                                  </div>
-                                </div>
-                                <p style={{ fontSize: '13px', color: '#475569', margin: 0, lineHeight: '1.5', whiteSpace: 'pre-wrap' }}>{comment.message}</p>
-                              </div>
-                            ))}
-                          </div>
-                        )}
-
-                        {/* Comment input */}
-                        <div style={{ display: 'flex', gap: '8px', alignItems: 'flex-end' }}>
-                          <textarea
-                            value={commentInput}
-                            onChange={e => setCommentInput(e.target.value)}
-                            onKeyDown={e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); handlePostComment(task._id); } }}
-                            placeholder="Add a comment... (Enter to send, Shift+Enter for new line)"
-                            rows={2}
-                            style={{
-                              flex: 1, resize: 'none', padding: '8px 12px', fontSize: '13px',
-                              borderRadius: '8px', border: '1px solid #e2e8f0', outline: 'none',
-                              fontFamily: 'inherit', lineHeight: '1.5'
-                            }}
-                          />
-                          <button
-                            onClick={() => handlePostComment(task._id)}
-                            disabled={commentSubmitting || !commentInput.trim()}
-                            style={{
-                              padding: '8px 16px', fontSize: '13px', borderRadius: '8px',
-                              border: 'none', background: commentSubmitting ? '#94a3b8' : '#4f46e5',
-                              color: 'white', cursor: commentSubmitting ? 'not-allowed' : 'pointer',
-                              whiteSpace: 'nowrap', alignSelf: 'flex-end'
-                            }}
-                          >
-                            {commentSubmitting ? '...' : 'Post'}
-                          </button>
-                        </div>
-                      </div>
-
-                      {/* Actions */}
-                      <div className="flex items-center justify-end space-x-2 pt-2 border-t border-slate-100">
-                        {currentUser.role === 'Admin' || currentUser.role === 'Head' ? (
-                          <>
-                            {task.status === 'Pending' && (task.assignedTo?._id || task.assignedTo) === currentUser._id && (
-                              <button
-                                type="button"
-                                disabled={actionLoading}
-                                onClick={(event) => {
-                                  event.stopPropagation();
-                                  handleMarkComplete(task._id);
-                                }}
-                                className="px-4 py-2 bg-emerald-500 text-white rounded-xl text-xs font-bold hover:bg-emerald-600 transition-all duration-200 ease-in-out disabled:opacity-50"
-                              >
-                                Mark Complete
-                              </button>
-                            )}
-                            <button
-                              type="button"
-                              onClick={(event) => {
-                                event.stopPropagation();
-                                openEditModal(task);
-                              }}
-                              className="px-4 py-2 border-2 border-indigo-600 text-indigo-600 rounded-xl text-xs font-bold hover:bg-indigo-50 transition-all duration-200 ease-in-out"
-                            >
-                              Edit Task
-                            </button>
-                            <button
-                              type="button"
-                              onClick={(event) => {
-                                event.stopPropagation();
-                                handleDeleteTask(task._id);
-                              }}
-                              className="px-4 py-2 bg-red-500 text-white rounded-xl text-xs font-bold hover:bg-red-600 transition-all duration-200 ease-in-out"
-                            >
-                              Delete Task
-                            </button>
-                          </>
-                        ) : (
-                          task.status === 'Pending' && (
-                            <button
-                              type="button"
-                              disabled={actionLoading}
-                              onClick={(event) => {
-                                event.stopPropagation();
-                                handleMarkComplete(task._id);
-                              }}
-                              className="px-4 py-2 bg-emerald-500 text-white rounded-xl text-xs font-bold hover:bg-emerald-600 transition-all duration-200 ease-in-out disabled:opacity-50"
-                            >
-                              Mark Complete
-                            </button>
-                          )
-                        )}
-                        <button
-                          type="button"
-                          onClick={(event) => {
-                            event.stopPropagation();
-                            toggleExpand(task._id);
-                          }}
-                          className="px-4 py-2 border border-slate-250 text-slate-500 bg-white rounded-xl text-xs font-bold hover:bg-slate-55 transition-all duration-200"
-                        >
-                          Close
-                        </button>
-                      </div>
-                    </div>
-                  )}
-                </div>
-              );
-            })}
-          </div>
+          <TaskCalendar
+            anchor={monthAnchor}
+            tasks={rows}
+            now={now}
+            onOpen={openTask}
+            onMonthChange={shiftMonth}
+            onPickDay={(date) => {
+              if (!perms.canCreate) return
+              const at = new Date(date)
+              at.setHours(12, 0, 0, 0)
+              setEditing(null)
+              setDayPrefill(toLocalInput(at))
+              setQuery({ compose: '1' })
+            }}
+          />
         )}
-      </main>
+      </PageBody>
 
-      {/* MODAL: CREATE TASK */}
-      {isCreateOpen && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 backdrop-blur-md p-4 overflow-y-auto">
-          <div className="bg-white/95 backdrop-blur-2xl border border-indigo-100 rounded-3xl max-w-lg w-full p-6 relative shadow-[0_25px_80px_rgba(99,102,241,0.2)] animate-fade-in my-8 max-h-[90vh] overflow-y-auto select-none">
-            <div className="flex items-center justify-between mb-4">
-              <div>
-                <h3 className="text-xl font-bold text-slate-800">Create New Task</h3>
-                <p className="text-xs text-slate-500 mt-1">Create a task and link a Gmail record if available.</p>
-              </div>
-              <button onClick={() => setIsCreateOpen(false)} className="text-slate-400 hover:text-slate-600 transition-colors">
-                <svg className="h-5 w-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M6 18L18 6M6 6l12 12" />
-                </svg>
-              </button>
-            </div>
+      <Drawer open={Boolean(query.task)} onOpenChange={(next) => !next && closeTask()}>
+        {query.task ? (
+          <TaskDrawerBody
+            key={query.task}
+            taskId={query.task}
+            perms={perms}
+            user={user}
+            users={options.users}
+            now={now}
+            onEdit={startEdit}
+            onComplete={completeTask}
+            onDelete={deleteTask}
+            onClose={closeTask}
+            onTasksCreated={reload}
+          />
+        ) : null}
+      </Drawer>
 
-            <form onSubmit={handleCreateTask} className="space-y-4">
-              <div>
-                <label className="block text-xs font-semibold text-slate-500 uppercase tracking-wider mb-1">Task Title <span className="text-red-500">*</span></label>
-                <input
-                  type="text"
-                  required
-                  placeholder="e.g. Process Refund Request"
-                  className="block w-full px-4 py-3 bg-white border border-slate-200 rounded-xl text-slate-800 placeholder-slate-400 focus:outline-none focus:ring-2 focus:ring-indigo-150 focus:border-indigo-500 text-sm transition-all duration-200"
-                  value={newTask.title}
-                  onChange={(e) => setNewTask({ ...newTask, title: e.target.value })}
-                />
-              </div>
-
-              <div>
-                <label className="block text-xs font-semibold text-slate-500 uppercase tracking-wider mb-1">Description</label>
-                <textarea
-                  placeholder="Details of the task assignment..."
-                  rows={2}
-                  className="block w-full px-4 py-3 bg-white border border-slate-200 rounded-xl text-slate-800 placeholder-slate-400 focus:outline-none focus:ring-2 focus:ring-indigo-150 focus:border-indigo-500 text-sm resize-none transition-all duration-200"
-                  value={newTask.description}
-                  onChange={(e) => setNewTask({ ...newTask, description: e.target.value })}
-                />
-              </div>
-
-              {/* SEARCHABLE CLIENT DROPDOWN */}
-              <div className="relative" ref={clientSuggestionsRef}>
-                <label className="block text-xs font-semibold text-slate-500 uppercase tracking-wider mb-1">Client Name <span className="text-red-500">*</span></label>
-                <input
-                  type="text"
-                  required
-                  placeholder="Search and select client..."
-                  className="block w-full px-4 py-3 bg-white border border-slate-200 rounded-xl text-slate-800 placeholder-slate-400 focus:outline-none focus:ring-2 focus:ring-indigo-150 focus:border-indigo-500 text-sm transition-all duration-200"
-                  value={clientSearchQuery}
-                  onFocus={() => setShowClientSuggestions(true)}
-                  onChange={(e) => {
-                    setClientSearchQuery(e.target.value);
-                    setNewTask({ ...newTask, clientName: e.target.value });
-                    setShowClientSuggestions(true);
-                  }}
-                />
-                {showClientSuggestions && (
-                  <div className="absolute left-0 right-0 mt-1 bg-white border border-slate-200 rounded-xl max-h-40 overflow-y-auto z-50 shadow-lg">
-                    {filteredClients.length === 0 ? (
-                      <div className="px-4 py-3 text-xs text-slate-500 italic">No matching clients found. Type to use this name.</div>
-                    ) : (
-                      filteredClients.map((client) => (
-                        <div
-                          key={client._id}
-                          onClick={() => {
-                            setClientSearchQuery(client.name);
-                            setNewTask({ ...newTask, clientName: client.name });
-                            setShowClientSuggestions(false);
-                          }}
-                          className="px-4 py-2 text-sm text-slate-755 hover:bg-indigo-50 cursor-pointer transition-colors"
-                        >
-                          {client.name}
-                        </div>
-                      ))
-                    )}
-                  </div>
-                )}
-              </div>
-
-              <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-                <div>
-                  <label className="block text-xs font-semibold text-slate-500 uppercase tracking-wider mb-1">Assign To <span className="text-red-500">*</span></label>
-                  <select
-                    required
-                    className="block w-full px-4 py-3 bg-white border border-slate-200 rounded-xl text-slate-805 focus:outline-none focus:ring-2 focus:ring-indigo-150 focus:border-indigo-500 text-sm transition-all duration-200"
-                    value={newTask.assignedTo}
-                    onChange={(e) => setNewTask({ ...newTask, assignedTo: e.target.value })}
-                  >
-                    <option value="">-- Choose User --</option>
-                    {users.map((u) => (
-                      <option key={u._id} value={u._id}>
-                        {u.name} ({u.role})
-                      </option>
-                    ))}
-                  </select>
-                </div>
-
-                <div>
-                  <label className="block text-xs font-semibold text-slate-500 uppercase tracking-wider mb-1">Link Email (Optional)</label>
-                  <select
-                    className="block w-full px-4 py-3 bg-white border border-slate-200 rounded-xl text-slate-805 focus:outline-none focus:ring-2 focus:ring-indigo-150 focus:border-indigo-500 text-sm truncate transition-all duration-200"
-                    value={newTask.linkedEmail}
-                    onChange={(e) => setNewTask({ ...newTask, linkedEmail: e.target.value })}
-                  >
-                    <option value="">-- No linked email --</option>
-                    {unassignedEmails.map((email) => (
-                      <option key={email._id} value={email._id}>
-                        {email.subject} (from: {email.from})
-                      </option>
-                    ))}
-                  </select>
-                </div>
-              </div>
-
-              <div>
-                <label className="block text-xs font-semibold text-slate-500 uppercase tracking-wider mb-1">Deadline <span className="text-red-500">*</span></label>
-                <input
-                  type="datetime-local"
-                  required
-                  className="block w-full px-4 py-3 bg-white border border-slate-200 rounded-xl text-slate-805 focus:outline-none focus:ring-2 focus:ring-indigo-150 focus:border-indigo-500 text-sm transition-all duration-200"
-                  value={newTask.deadline}
-                  onChange={(e) => setNewTask({ ...newTask, deadline: e.target.value })}
-                />
-              </div>
-
-              <div className="bg-slate-50/50 p-3 rounded-xl border border-slate-150 space-y-2">
-                <label className="inline-flex items-center text-xs font-semibold text-slate-600 uppercase tracking-wider cursor-pointer">
-                  <input
-                    type="checkbox"
-                    checked={newTask.isRecurring}
-                    onChange={e => setNewTask(prev => ({ ...prev, isRecurring: e.target.checked }))}
-                    className="mr-2 rounded border-slate-300 text-indigo-600 focus:ring-indigo-500 h-4 w-4"
-                  />
-                  Recurring Task
-                </label>
-                {newTask.isRecurring && (
-                  <div>
-                    <label className="block text-[10px] font-bold text-slate-450 uppercase mb-1">Recurrence Frequency</label>
-                    <select
-                      value={newTask.recurrence}
-                      onChange={e => setNewTask(prev => ({ ...prev, recurrence: e.target.value }))}
-                      className="block w-full px-3 py-2 bg-white border border-slate-200 rounded-lg text-slate-805 focus:outline-none focus:ring-2 focus:ring-indigo-150 focus:border-indigo-500 text-xs transition-all duration-200"
-                    >
-                      <option value="Daily">Daily</option>
-                      <option value="Weekly">Weekly</option>
-                      <option value="Monthly">Monthly</option>
-                    </select>
-                  </div>
-                )}
-              </div>
-
-              <div>
-                <label className="block text-xs font-semibold text-slate-500 uppercase tracking-wider mb-1">Priority</label>
-                <select
-                  value={newTask.priority}
-                  onChange={e => setNewTask(prev => ({ ...prev, priority: e.target.value }))}
-                  className="block w-full px-4 py-3 bg-white border border-slate-200 rounded-xl text-slate-805 focus:outline-none focus:ring-2 focus:ring-indigo-150 focus:border-indigo-500 text-sm transition-all duration-200"
-                >
-                  <option value="Low">Low</option>
-                  <option value="Medium">Medium</option>
-                  <option value="High">High</option>
-                  <option value="Urgent">Urgent</option>
-                </select>
-              </div>
-
-              <div>
-                <label className="block text-xs font-semibold text-slate-500 uppercase tracking-wider mb-1">Notes</label>
-                <textarea
-                  placeholder="Internal notes or pointers..."
-                  rows={2}
-                  className="block w-full px-4 py-3 bg-white border border-slate-200 rounded-xl text-slate-855 placeholder-slate-400 focus:outline-none focus:ring-2 focus:ring-indigo-150 focus:border-indigo-500 text-sm resize-none transition-all duration-200"
-                  value={newTask.notes}
-                  onChange={(e) => setNewTask({ ...newTask, notes: e.target.value })}
-                />
-              </div>
-
-              <div className="flex space-x-3 pt-4 border-t border-slate-100 mt-6">
-                <button
-                  type="button"
-                  onClick={() => setIsCreateOpen(false)}
-                  className="w-1/2 py-3 px-4 border border-slate-200 hover:bg-slate-50 rounded-xl text-sm font-semibold text-slate-500 transition-colors"
-                >
-                  Cancel
-                </button>
-                <button
-                  type="submit"
-                  disabled={actionLoading}
-                  className="w-1/2 py-3 px-4 bg-gradient-to-r from-indigo-600 to-purple-600 rounded-xl text-sm font-semibold transition-all text-white disabled:opacity-50 flex items-center justify-center space-x-2 shadow-md hover:translate-y-[-2px] active:translate-y-0 active:scale-98"
-                >
-                  {actionLoading ? (
-                    <svg className="animate-spin h-5 w-5 text-white" fill="none" viewBox="0 0 24 24">
-                      <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
-                      <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z" />
-                    </svg>
-                  ) : (
-                    'Create'
-                  )}
-                </button>
-              </div>
-            </form>
-          </div>
-        </div>
-      )}
-
-      {/* MODAL: EDIT TASK / DETAILS */}
-      {isEditOpen && selectedTask && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 backdrop-blur-md p-4 overflow-y-auto">
-          <div className="bg-white/95 backdrop-blur-2xl border border-indigo-100 rounded-3xl max-w-lg w-full p-6 relative shadow-[0_25px_80px_rgba(99,102,241,0.2)] animate-fade-in my-8 max-h-[90vh] overflow-y-auto select-none">
-            <div className="flex items-center justify-between mb-4">
-              <div>
-                <h3 className="text-xl font-bold text-slate-800">
-                  {currentUser.role === 'Admin' || currentUser.role === 'Head' ? 'Edit Task Records' : 'Task Details'}
-                </h3>
-                <p className="text-xs text-slate-500 mt-1">
-                  {currentUser.role === 'Admin' || currentUser.role === 'Head'
-                    ? 'Update parameters or assign status changes.'
-                    : 'Review assignment details below.'}
-                </p>
-                <div className="mt-2" style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
-                  <span style={{ fontSize: '12px', color: '#64748b' }}>Priority:</span>
-                  <span style={{ fontSize: '12px', fontWeight: 600, padding: '2px 10px', borderRadius: '20px', ...getPriorityStyle(selectedTask?.priority) }}>
-                    {selectedTask?.priority || 'Medium'}
-                  </span>
-                </div>
-              </div>
-              <button onClick={() => { setIsEditOpen(false); setSelectedTask(null); }} className="text-slate-400 hover:text-slate-600 transition-colors">
-                <svg className="h-5 w-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M6 18L18 6M6 6l12 12" />
-                </svg>
-              </button>
-            </div>
-
-            <form onSubmit={handleEditTask} className="space-y-4">
-              <div>
-                <label className="block text-xs font-semibold text-slate-500 uppercase tracking-wider mb-1">Task Title</label>
-                <input
-                  type="text"
-                  required
-                  disabled={currentUser.role === 'Employee'}
-                  className="block w-full px-4 py-3 bg-white border border-slate-200 rounded-xl text-slate-800 focus:outline-none focus:ring-2 focus:ring-indigo-150 focus:border-indigo-500 text-sm disabled:bg-slate-50 disabled:text-slate-500 transition-all duration-200"
-                  value={editForm.title}
-                  onChange={(e) => setEditForm({ ...editForm, title: e.target.value })}
-                />
-              </div>
-
-              <div>
-                <label className="block text-xs font-semibold text-slate-500 uppercase tracking-wider mb-1">Description</label>
-                <textarea
-                  disabled={currentUser.role === 'Employee'}
-                  rows={2}
-                  className="block w-full px-4 py-3 bg-white border border-slate-200 rounded-xl text-slate-800 focus:outline-none focus:ring-2 focus:ring-indigo-150 focus:border-indigo-500 text-sm resize-none disabled:bg-slate-50 disabled:text-slate-550 transition-all duration-200"
-                  value={editForm.description}
-                  onChange={(e) => setEditForm({ ...editForm, description: e.target.value })}
-                />
-              </div>
-
-              {/* SEARCHABLE CLIENT DROPDOWN (EDIT) */}
-              <div className="relative" ref={editClientSuggestionsRef}>
-                <label className="block text-xs font-semibold text-slate-500 uppercase tracking-wider mb-1">Client Name</label>
-                <input
-                  type="text"
-                  required
-                  disabled={currentUser.role === 'Employee'}
-                  className="block w-full px-4 py-3 bg-white border border-slate-200 rounded-xl text-slate-800 focus:outline-none focus:ring-2 focus:ring-indigo-150 focus:border-indigo-500 text-sm disabled:bg-slate-50 disabled:text-slate-500 transition-all duration-200"
-                  value={editClientSearchQuery}
-                  onFocus={() => currentUser.role !== 'Employee' && setShowEditClientSuggestions(true)}
-                  onChange={(e) => {
-                    setEditClientSearchQuery(e.target.value);
-                    setEditForm({ ...editForm, clientName: e.target.value });
-                    setShowEditClientSuggestions(true);
-                  }}
-                />
-                {showEditClientSuggestions && currentUser.role !== 'Employee' && (
-                  <div className="absolute left-0 right-0 mt-1 bg-white border border-slate-200 rounded-xl max-h-40 overflow-y-auto z-50 shadow-lg">
-                    {filteredEditClients.length === 0 ? (
-                      <div className="px-4 py-3 text-xs text-slate-500 italic">No matching clients found. Type to use this name.</div>
-                    ) : (
-                      filteredEditClients.map((client) => (
-                        <div
-                          key={client._id}
-                          onClick={() => {
-                            setEditClientSearchQuery(client.name);
-                            setEditForm({ ...editForm, clientName: client.name });
-                            setShowEditClientSuggestions(false);
-                          }}
-                          className="px-4 py-2 text-sm text-slate-755 hover:bg-indigo-50 cursor-pointer transition-colors"
-                        >
-                          {client.name}
-                        </div>
-                      ))
-                    )}
-                  </div>
-                )}
-              </div>
-
-              <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-                <div>
-                  <label className="block text-xs font-semibold text-slate-500 uppercase tracking-wider mb-1">Assignee</label>
-                  <select
-                    disabled={currentUser.role === 'Employee'}
-                    className="block w-full px-4 py-3 bg-white border border-slate-200 rounded-xl text-slate-805 focus:outline-none focus:ring-2 focus:ring-indigo-150 focus:border-indigo-505 text-sm disabled:bg-slate-50 disabled:text-slate-500 transition-all duration-200"
-                    value={editForm.assignedTo}
-                    onChange={(e) => setEditForm({ ...editForm, assignedTo: e.target.value })}
-                  >
-                    <option value="">-- Choose User --</option>
-                    {users.map((u) => (
-                      <option key={u._id} value={u._id}>
-                        {u.name} ({u.role})
-                      </option>
-                    ))}
-                  </select>
-                </div>
-
-                <div>
-                  <label className="block text-xs font-semibold text-slate-500 uppercase tracking-wider mb-1">Status</label>
-                  <select
-                    disabled={currentUser.role === 'Employee'}
-                    className="block w-full px-4 py-3 bg-white border border-slate-200 rounded-xl text-slate-805 focus:outline-none focus:ring-2 focus:ring-indigo-150 focus:border-indigo-505 text-sm disabled:bg-slate-50 disabled:text-slate-500 transition-all duration-200"
-                    value={editForm.status}
-                    onChange={(e) => setEditForm({ ...editForm, status: e.target.value })}
-                  >
-                    <option value="Pending">Pending</option>
-                    <option value="Completed">Completed</option>
-                    <option value="Late">Late</option>
-                  </select>
-                </div>
-              </div>
-
-              <div>
-                <label className="block text-xs font-semibold text-slate-500 uppercase tracking-wider mb-1">Deadline</label>
-                <input
-                  type="datetime-local"
-                  required
-                  disabled={currentUser.role === 'Employee'}
-                  className="block w-full px-4 py-3 bg-white border border-slate-200 rounded-xl text-slate-805 focus:outline-none focus:ring-2 focus:ring-indigo-150 focus:border-indigo-505 text-sm disabled:bg-slate-50 disabled:text-slate-500 transition-all duration-200"
-                  value={editForm.deadline}
-                  onChange={(e) => setEditForm({ ...editForm, deadline: e.target.value })}
-                />
-              </div>
-
-              <div className="bg-slate-50/50 p-3 rounded-xl border border-slate-150 space-y-2">
-                <label className="inline-flex items-center text-xs font-semibold text-slate-600 uppercase tracking-wider cursor-pointer">
-                  <input
-                    type="checkbox"
-                    disabled={currentUser.role === 'Employee'}
-                    checked={editForm.isRecurring}
-                    onChange={e => setEditForm(prev => ({ ...prev, isRecurring: e.target.checked }))}
-                    className="mr-2 rounded border-slate-300 text-indigo-600 focus:ring-indigo-500 h-4 w-4 disabled:opacity-50"
-                  />
-                  Recurring Task
-                </label>
-                {editForm.isRecurring && (
-                  <div>
-                    <label className="block text-[10px] font-bold text-slate-450 uppercase mb-1">Recurrence Frequency</label>
-                    <select
-                      disabled={currentUser.role === 'Employee'}
-                      value={editForm.recurrence}
-                      onChange={e => setEditForm(prev => ({ ...prev, recurrence: e.target.value }))}
-                      className="block w-full px-3 py-2 bg-white border border-slate-200 rounded-lg text-slate-805 focus:outline-none focus:ring-2 focus:ring-indigo-150 focus:border-indigo-500 text-xs transition-all duration-200 disabled:opacity-50"
-                    >
-                      <option value="Daily">Daily</option>
-                      <option value="Weekly">Weekly</option>
-                      <option value="Monthly">Monthly</option>
-                    </select>
-                  </div>
-                )}
-              </div>
-
-              <div>
-                <label className="block text-xs font-semibold text-slate-500 uppercase tracking-wider mb-1">Priority</label>
-                <select
-                  disabled={currentUser.role === 'Employee'}
-                  value={editForm.priority}
-                  onChange={e => setEditForm(prev => ({ ...prev, priority: e.target.value }))}
-                  className="block w-full px-4 py-3 bg-white border border-slate-200 rounded-xl text-slate-805 focus:outline-none focus:ring-2 focus:ring-indigo-150 focus:border-indigo-505 text-sm disabled:bg-slate-50 disabled:text-slate-500 transition-all duration-200"
-                >
-                  <option value="Low">Low</option>
-                  <option value="Medium">Medium</option>
-                  <option value="High">High</option>
-                  <option value="Urgent">Urgent</option>
-                </select>
-              </div>
-
-              <div>
-                <label className="block text-xs font-semibold text-slate-500 uppercase tracking-wider mb-1">Notes</label>
-                <textarea
-                  disabled={currentUser.role === 'Employee'}
-                  rows={2}
-                  className="block w-full px-4 py-3 bg-white border border-slate-200 rounded-xl text-slate-805 focus:outline-none focus:ring-2 focus:ring-indigo-150 focus:border-indigo-505 text-sm resize-none disabled:bg-slate-50 disabled:text-slate-550 transition-all duration-200"
-                  value={editForm.notes}
-                  onChange={(e) => setEditForm({ ...editForm, notes: e.target.value })}
-                />
-              </div>
-
-              {selectedTask.linkedEmail && (
-                <div className="bg-slate-50 p-4 border border-slate-200 rounded-2xl space-y-2">
-                  <h4 className="text-xs font-bold text-indigo-600 uppercase tracking-wider">🔗 Linked Email Payload</h4>
-                  <p className="text-xs font-semibold text-slate-800">{selectedTask.linkedEmail.subject}</p>
-                  <p className="text-[10px] text-slate-455">From: {selectedTask.linkedEmail.from}</p>
-                  {selectedTask.linkedEmail.body && (
-                    <div className="mt-2">
-                      <iframe
-                        srcDoc={renderEmailContent(selectedTask.linkedEmail.body)}
-                        title="Linked Email Body"
-                        sandbox="allow-scripts allow-same-origin allow-popups allow-popups-to-escape-sandbox"
-                        className="w-full border border-slate-250 rounded-xl bg-white shadow-inner"
-                        style={{ minHeight: '150px', resize: 'vertical' }}
-                        onLoad={(e) => {
-                          try {
-                            const doc = e.target.contentDocument || e.target.contentWindow.document;
-                            if (doc && doc.body) {
-                              e.target.style.height = `${doc.body.scrollHeight + 24}px`;
-                            }
-                          } catch (err) {
-                            console.error(err);
-                          }
-                        }}
-                      />
-                    </div>
-                  )}
-                </div>
-              )}
-
-              <div className="flex space-x-3 pt-4 border-t border-slate-100 mt-6">
-                <button
-                  type="button"
-                  onClick={() => {
-                    setIsEditOpen(false);
-                    setSelectedTask(null);
-                  }}
-                  className="w-1/2 py-3 px-4 border border-slate-200 hover:bg-slate-50 rounded-xl text-sm font-semibold text-slate-500 transition-colors"
-                >
-                  Close
-                </button>
-                {currentUser.role === 'Admin' || currentUser.role === 'Head' ? (
-                  <div className="w-1/2 flex space-x-2">
-                    {selectedTask && selectedTask.status === 'Pending' && (selectedTask.assignedTo?._id || selectedTask.assignedTo) === currentUser._id && (
-                      <button
-                        type="button"
-                        disabled={actionLoading}
-                        onClick={() => {
-                          handleMarkComplete(selectedTask._id);
-                          setIsEditOpen(false);
-                          setSelectedTask(null);
-                        }}
-                        className="w-1/2 py-3 px-4 bg-emerald-500 hover:bg-emerald-600 rounded-xl text-sm font-semibold transition-colors disabled:opacity-50 flex items-center justify-center space-x-2 text-white shadow-md hover:translate-y-[-2px] active:translate-y-0"
-                      >
-                        {actionLoading ? (
-                          <svg className="animate-spin h-5 w-5 text-white" fill="none" viewBox="0 0 24 24">
-                            <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
-                            <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z" />
-                          </svg>
-                        ) : (
-                          'Mark Complete'
-                        )}
-                      </button>
-                    )}
-                    <button
-                      type="submit"
-                      disabled={actionLoading}
-                      className={`${
-                        selectedTask && selectedTask.status === 'Pending' && (selectedTask.assignedTo?._id || selectedTask.assignedTo) === currentUser._id
-                          ? 'w-1/2'
-                          : 'w-full'
-                      } py-3 px-4 bg-gradient-to-r from-indigo-600 to-purple-600 text-white rounded-xl text-sm font-semibold transition-all disabled:opacity-50 flex items-center justify-center space-x-2 shadow-md hover:translate-y-[-2px] active:translate-y-0 active:scale-98`}
-                    >
-                      {actionLoading ? (
-                        <svg className="animate-spin h-5 w-5 text-white" fill="none" viewBox="0 0 24 24">
-                          <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
-                          <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z" />
-                        </svg>
-                      ) : (
-                        'Save Changes'
-                      )}
-                    </button>
-                  </div>
-                ) : (
-                  selectedTask.status === 'Pending' && (
-                    <button
-                      type="button"
-                      disabled={actionLoading}
-                      onClick={() => {
-                        handleMarkComplete(selectedTask._id);
-                        setIsEditOpen(false);
-                        setSelectedTask(null);
-                      }}
-                      className="w-1/2 py-3 px-4 bg-emerald-500 hover:bg-emerald-600 rounded-xl text-sm font-semibold transition-colors disabled:opacity-50 flex items-center justify-center space-x-2 text-white shadow-md hover:translate-y-[-2px] active:translate-y-0"
-                    >
-                      {actionLoading ? (
-                        <svg className="animate-spin h-5 w-5 text-white" fill="none" viewBox="0 0 24 24">
-                          <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
-                          <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z" />
-                        </svg>
-                      ) : (
-                        'Mark as Complete'
-                      )}
-                    </button>
-                  )
-                )}
-              </div>
-            </form>
-          </div>
-        </div>
-      )}
+      <TaskFormDialog
+        key={`${editing?._id || 'new'}-${composing ? 'open' : 'closed'}`}
+        open={composing}
+        mode={editing ? 'edit' : 'create'}
+        initial={dialogInitial}
+        options={options}
+        saving={saving}
+        onSubmit={saveTask}
+        onOpenChange={(next) => !next && closeDialog()}
+      />
     </>
-  );
-};
-
-export default TaskList;
+  )
+}

@@ -1,384 +1,373 @@
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800;900&family=Outfit:wght@300;400;500;600;700;800;900&display=swap');
+/* ---------------------------------------------------------------------------
+ * Inter — self-hosted via @fontsource, weights 400/500/600 only.
+ * (Replaces the render-blocking Google Fonts @import of Inter + Outfit at
+ * 14 weights.)
+ * ------------------------------------------------------------------------- */
+@import '@fontsource/inter/400.css';
+@import '@fontsource/inter/500.css';
+@import '@fontsource/inter/600.css';
 
 @tailwind base;
 @tailwind components;
 @tailwind utilities;
 
+/* ===========================================================================
+ * DESIGN TOKENS
+ * Values are space-separated RGB triplets so Tailwind opacity modifiers work
+ * (`bg-surface/80`).  Consume them through the Tailwind classes defined in
+ * tailwind.config.js — do not read the variables directly in JSX.
+ * ========================================================================= */
 @layer base {
-  html {
-    scroll-behavior: smooth;
+  :root {
+    /* surfaces */
+    --bg-canvas: 248 250 252;      /* #F8FAFC */
+    --bg-surface: 255 255 255;     /* #FFFFFF */
+    --bg-subtle: 241 245 249;      /* #F1F5F9 */
+    --bg-muted: 226 232 240;       /* #E2E8F0 */
+
+    /* borders */
+    --border-default: 226 232 240; /* #E2E8F0 */
+    --border-strong: 203 213 225;  /* #CBD5E1 */
+
+    /* text */
+    --text-primary: 15 23 42;      /* #0F172A */
+    --text-secondary: 71 85 105;   /* #475569 */
+    --text-tertiary: 100 116 139;  /* #64748B  4.76:1 — passes AA */
+    --text-disabled: 148 163 184;  /* #94A3B8  disabled ONLY */
+    --text-inverse: 255 255 255;
+
+    /* primary — blue */
+    --primary-50: 239 246 255;     /* #EFF6FF */
+    --primary-100: 219 234 254;    /* #DBEAFE */
+    --primary-200: 191 219 254;    /* #BFDBFE */
+    --primary-500: 59 130 246;     /* #3B82F6  focus ring */
+    --primary-600: 37 99 235;      /* #2563EB  primary action */
+    --primary-700: 29 78 216;      /* #1D4ED8  hover */
+    --primary-800: 30 64 175;      /* #1E40AF  active */
+    --primary-fg: 255 255 255;
+    --primary-subtle: 239 246 255;
+    --primary-border: 191 219 254;
+    --primary-text: 29 78 216;
+
+    /* semantic */
+    --success: 22 163 74;          /* #16A34A */
+    --success-bg: 240 253 244;     /* #F0FDF4 */
+    --success-border: 187 247 208; /* #BBF7D0 */
+    --success-text: 21 128 61;     /* #15803D */
+
+    --warning: 217 119 6;          /* #D97706 */
+    --warning-bg: 255 251 235;     /* #FFFBEB */
+    --warning-border: 253 230 138; /* #FDE68A */
+    --warning-text: 180 83 9;      /* #B45309 */
+
+    --danger: 220 38 38;           /* #DC2626 */
+    --danger-bg: 254 242 242;      /* #FEF2F2 */
+    --danger-border: 254 202 202;  /* #FECACA */
+    --danger-text: 185 28 28;      /* #B91C1C */
+
+    --info: 2 132 199;             /* #0284C7 */
+    --info-bg: 240 249 255;        /* #F0F9FF */
+    --info-border: 186 230 253;    /* #BAE6FD */
+    --info-text: 3 105 161;        /* #0369A1 */
+
+    --neutral: 100 116 139;        /* #64748B */
+    --neutral-bg: 241 245 249;     /* #F1F5F9 */
+    --neutral-border: 226 232 240; /* #E2E8F0 */
+    --neutral-text: 71 85 105;     /* #475569 */
+
+    /* categorical chart palette — colourblind-tested, ordered by first use.
+     * Consume as `text-chart-1` / `bg-chart-1` / `fill-chart-1`; the Tailwind
+     * names are unchanged, they are just variable-backed now so dark mode can
+     * lift them off the background. */
+    --chart-1: 37 99 235;          /* #2563EB blue   */
+    --chart-2: 13 148 136;         /* #0D9488 teal   */
+    --chart-3: 217 119 6;          /* #D97706 amber  */
+    --chart-4: 124 58 237;         /* #7C3AED violet */
+    --chart-5: 219 39 119;         /* #DB2777 pink   */
+    --chart-6: 8 145 178;          /* #0891B2 cyan   */
+
+    /* skeleton shimmer stops */
+    --skeleton-base: #f1f5f9;
+    --skeleton-highlight: #e9eef5;
+
+    color-scheme: light;
   }
-  body.custom-cursor-active,
-  body.custom-cursor-active button,
-  body.custom-cursor-active a,
-  body.custom-cursor-active select,
-  body.custom-cursor-active input,
-  body.custom-cursor-active textarea,
-  body.custom-cursor-active label {
-    cursor: none !important;
+
+  .dark {
+    --bg-canvas: 11 18 32;         /* #0B1220 */
+    --bg-surface: 17 24 39;        /* #111827 */
+    --bg-subtle: 27 36 50;         /* #1B2432 */
+    --bg-muted: 39 50 68;          /* #273244 */
+
+    --border-default: 39 50 68;    /* #273244 */
+    --border-strong: 58 70 90;     /* #3A465A */
+
+    --text-primary: 241 245 249;   /* #F1F5F9 */
+    --text-secondary: 203 213 225; /* #CBD5E1 */
+    --text-tertiary: 148 163 184;  /* #94A3B8 */
+    --text-disabled: 100 116 139;  /* #64748B */
+    --text-inverse: 15 23 42;
+
+    --primary-50: 22 35 60;
+    --primary-100: 27 45 78;
+    --primary-200: 33 58 103;
+    --primary-500: 59 130 246;     /* #3B82F6 */
+    --primary-600: 59 130 246;     /* dark-mode primary */
+    --primary-700: 96 165 250;     /* #60A5FA hover */
+    --primary-800: 147 197 253;
+    --primary-fg: 8 14 26;
+    --primary-subtle: 24 40 68;
+    --primary-border: 38 66 112;
+    --primary-text: 147 197 253;
+
+    --success: 34 197 94;
+    --success-bg: 15 40 26;
+    --success-border: 24 70 44;
+    --success-text: 134 239 172;
+
+    --warning: 245 158 11;
+    --warning-bg: 46 33 10;
+    --warning-border: 82 56 14;
+    --warning-text: 253 224 71;
+
+    --danger: 239 68 68;
+    --danger-bg: 48 20 22;
+    --danger-border: 87 32 34;
+    --danger-text: 252 165 165;
+
+    --info: 14 165 233;
+    --info-bg: 12 34 51;
+    --info-border: 20 58 87;
+    --info-text: 125 211 252;
+
+    --neutral: 148 163 184;
+    --neutral-bg: 27 36 50;
+    --neutral-border: 39 50 68;
+    --neutral-text: 203 213 225;
+
+    /* Chart palette, lifted for a #0B1220 canvas. Same hue order, so a legend
+     * swatch and its series still agree across a theme switch. */
+    --chart-1: 59 130 246;         /* #3B82F6 */
+    --chart-2: 45 212 191;         /* #2DD4BF */
+    --chart-3: 245 158 11;         /* #F59E0B */
+    --chart-4: 167 139 250;        /* #A78BFA */
+    --chart-5: 244 114 182;        /* #F472B6 */
+    --chart-6: 34 211 238;         /* #22D3EE */
+
+    --skeleton-base: #1b2432;
+    --skeleton-highlight: #273244;
+
+    color-scheme: dark;
   }
+
+  html,
+  body,
+  #root {
+    height: 100%;
+  }
+
   body {
-    @apply bg-white text-slate-900 antialiased;
-    font-family: 'Outfit', 'Inter', sans-serif;
+    @apply bg-canvas text-fg antialiased;
+    font-family: Inter, system-ui, -apple-system, 'Segoe UI', sans-serif;
+    font-size: 14px;
+    line-height: 20px;
+    font-feature-settings: 'cv05' 1, 'ss01' 1;
+    margin: 0;
+  }
+
+  /* Numbers must not jitter between rows. */
+  th,
+  td.numeric,
+  .tabular,
+  [data-numeric] {
+    font-variant-numeric: tabular-nums;
+  }
+
+  /* A visible focus indicator is guaranteed globally, so that any leftover
+   * `focus:outline-none` in the legacy pages cannot make the app
+   * unkeyboard-navigable. */
+  :focus-visible {
+    outline: 2px solid rgb(var(--primary-600));
+    outline-offset: 2px;
+    border-radius: inherit;
+  }
+
+  ::placeholder {
+    color: rgb(var(--text-disabled));
+    opacity: 1;
+  }
+
+  [hidden] {
+    display: none !important;
   }
 }
 
-/* Custom Cursor styling */
-.custom-cursor-dot {
-  position: fixed;
-  top: 0;
-  left: 0;
-  width: 8px;
-  height: 8px;
-  border-radius: 50%;
-  background-color: #6366F1;
-  pointer-events: none;
-  z-index: 9999;
-  opacity: 0;
-  transform: translate(-50%, -50%);
-  transition: opacity 0.2s ease-in-out, transform 0.1s cubic-bezier(0.175, 0.885, 0.32, 1.275);
-  will-change: transform;
+/* ===========================================================================
+ * UTILITIES
+ * The six classes below are referenced 40+ times across the legacy pages and
+ * were previously defined nowhere. They are real now.
+ * ========================================================================= */
+@layer components {
+  /* Loading skeleton — the only infinite animation permitted in the app. */
+  .skeleton,
+  .skeleton-shimmer,
+  .animate-shimmer {
+    background: linear-gradient(
+        90deg,
+        var(--skeleton-base) 40%,
+        var(--skeleton-highlight) 50%,
+        var(--skeleton-base) 60%
+      )
+      0 0 / 200% 100%;
+    animation: skeleton-sweep 1.4s linear infinite;
+    border-radius: 4px;
+  }
+
+  /* Subtle neutral card hover. Deliberately NOT a glow — the name is kept only
+   * because ~8 legacy call sites reference it. */
+  .hover-glow-card {
+    transition: background-color 100ms linear, border-color 100ms linear;
+  }
+  .hover-glow-card:hover {
+    background-color: rgb(var(--bg-subtle));
+    border-color: rgb(var(--border-strong));
+  }
+
+  .custom-scrollbar {
+    scrollbar-width: thin;
+    scrollbar-color: rgb(var(--border-strong)) transparent;
+  }
+  .custom-scrollbar::-webkit-scrollbar {
+    width: 8px;
+    height: 8px;
+  }
+  .custom-scrollbar::-webkit-scrollbar-track {
+    background: transparent;
+  }
+  .custom-scrollbar::-webkit-scrollbar-thumb {
+    background: rgb(var(--border-strong));
+    border-radius: 9999px;
+  }
+  .custom-scrollbar::-webkit-scrollbar-thumb:hover {
+    background: rgb(var(--text-disabled));
+  }
+
+  /* Standard focus ring for interactive elements built by hand. */
+  .focus-ring {
+    @apply outline-none;
+  }
+  .focus-ring:focus-visible {
+    outline: 2px solid rgb(var(--primary-600));
+    outline-offset: 2px;
+  }
 }
 
-.custom-cursor-ring {
-  position: fixed;
-  top: 0;
-  left: 0;
-  width: 36px;
-  height: 36px;
-  border-radius: 50%;
-  border: 2px solid #6366F1;
-  background-color: transparent;
-  opacity: 0;
-  pointer-events: none;
-  z-index: 9998;
-  transform: translate(-50%, -50%);
-  transition: opacity 0.2s ease-in-out, border-color 0.2s ease, width 0.2s ease, height 0.2s ease;
-  will-change: transform;
-}
-
-/* Trailing dots */
-.cursor-trail {
-  position: fixed;
-  top: 0;
-  left: 0;
-  width: 6px;
-  height: 6px;
-  border-radius: 50%;
-  background-color: #8B5CF6;
-  pointer-events: none;
-  z-index: 9997;
-  opacity: 0;
-  transform: translate(-50%, -50%);
-  will-change: transform;
-}
-
-/* Cursor hover states */
-body.cursor-hover .custom-cursor-dot {
-  transform: translate(-50%, -50%) scale(3);
-  background-color: #8B5CF6;
-}
-
-body.cursor-hover .custom-cursor-ring {
-  transform: translate(-50%, -50%) scale(0.4);
-  border-color: #8B5CF6;
-}
-
-/* Button ripple styling */
-.btn-ripple-span {
-  position: absolute;
-  border-radius: 50%;
-  background-color: rgba(255, 255, 255, 0.45);
-  transform: scale(0);
-  animation: ripple-effect 0.6s linear;
-  pointer-events: none;
-}
-
-button.bg-white .btn-ripple-span,
-button.border-indigo-600 .btn-ripple-span {
-  background-color: rgba(99, 102, 241, 0.15);
-}
-
-@keyframes ripple-effect {
+@keyframes skeleton-sweep {
   to {
-    transform: scale(4);
-    opacity: 0;
+    background-position: -100% 0;
   }
 }
 
-/* Dot grid background */
-.dot-grid {
-  background-image: radial-gradient(rgba(99, 102, 241, 0.1) 1px, transparent 1px);
-  background-size: 24px 24px;
-}
+/* `animate-fade-in`, `animate-slide-in` and `animate-shake` are produced by the
+ * Tailwind `animation` theme extension — see tailwind.config.js. */
 
-/* Glassmorphism modal content */
-.glassmorphism {
-  background: rgba(255, 255, 255, 0.9);
-  backdrop-filter: blur(20px);
-  -webkit-backdrop-filter: blur(20px);
-  border: 1px solid rgba(99, 102, 241, 0.15);
-  box-shadow: 0 25px 80px rgba(99, 102, 241, 0.2);
-}
-
-/* 3D Mockup Container */
-.perspective-1200 {
-  perspective: 1200px;
-}
-
-/* Custom CSS Animations */
-@keyframes float {
-  0%, 100% { transform: translateY(0px); }
-  50% { transform: translateY(-12px); }
-}
-
-@keyframes blob {
-  0%, 100% {
-    border-radius: 60% 40% 30% 70% / 60% 30% 70% 40%;
-    transform: translate(0, 0) scale(1);
-  }
-  33% {
-    border-radius: 30% 60% 70% 40% / 50% 60% 30% 60%;
-    transform: translate(30px, -20px) scale(1.05);
-  }
-  66% {
-    border-radius: 50% 60% 30% 60% / 40% 70% 60% 50%;
-    transform: translate(-20px, 10px) scale(0.98);
-  }
-}
-
-@keyframes ripple {
-  0% { transform: scale(0); opacity: 0.5; }
-  100% { transform: scale(4); opacity: 0; }
-}
-
-@keyframes fadeInUp {
-  from { opacity: 0; transform: translateY(20px); }
-  to { opacity: 1; transform: translateY(0); }
-}
-
-@keyframes fadeInDown {
-  from { opacity: 0; transform: translateY(-20px); }
-  to { opacity: 1; transform: translateY(0); }
-}
-
-@keyframes countUp {
-  from { opacity: 0; transform: translateY(8px); }
-  to { opacity: 1; transform: translateY(0); }
-}
-
-@keyframes shimmer {
-  0% { background-position: -200% 0; }
-  100% { background-position: 200% 0; }
-}
-
-@keyframes gradientShift {
-  0%, 100% { background-position: 0% 50%; }
-  50% { background-position: 100% 50%; }
-}
-
-@keyframes pulse-ring {
-  0% { transform: scale(1); opacity: 1; }
-  100% { transform: scale(1.4); opacity: 0; }
-}
-
-/* Custom Utility Classes for Animations */
-.animate-float {
-  animation: float 4s ease-in-out infinite;
-}
-
-.animate-blob {
-  animation: blob 25s ease-in-out infinite;
-}
-
-.animate-shimmer {
-  background: linear-gradient(90deg, #f1f5f9 25%, #e2e8f0 37%, #f1f5f9 63%);
-  background-size: 200% 100%;
-  animation: shimmer 1.4s infinite linear;
-}
-
-.animate-pulse-ring {
-  position: relative;
-}
-.animate-pulse-ring::after {
-  content: '';
-  position: absolute;
-  inset: -4px;
-  border-radius: 9999px;
-  border: 2px solid #10B981;
-  animation: pulse-ring 1.5s cubic-bezier(0.25, 0, 0, 1) infinite;
-}
-
-.reveal-element {
-  opacity: 0;
-  transform: translateY(20px);
-  transition: opacity 0.8s cubic-bezier(0.23, 1, 0.32, 1), transform 0.8s cubic-bezier(0.23, 1, 0.32, 1);
-}
-.reveal-element.active {
-  opacity: 1;
-  transform: translateY(0);
-}
-
-.reveal-element-left {
-  opacity: 0;
-  transform: translateX(-40px);
-  transition: opacity 0.8s cubic-bezier(0.23, 1, 0.32, 1), transform 0.8s cubic-bezier(0.23, 1, 0.32, 1);
-}
-.reveal-element-left.active {
-  opacity: 1;
-  transform: translateX(0);
-}
-
-.reveal-element-right {
-  opacity: 0;
-  transform: translateX(40px);
-  transition: opacity 0.8s cubic-bezier(0.23, 1, 0.32, 1), transform 0.8s cubic-bezier(0.23, 1, 0.32, 1);
-}
-.reveal-element-right.active {
-  opacity: 1;
-  transform: translateX(0);
-}
-
-.stagger-reveal > * {
-  opacity: 0;
-  transform: translateY(20px);
-  transition: opacity 0.6s cubic-bezier(0.23, 1, 0.32, 1), transform 0.6s cubic-bezier(0.23, 1, 0.32, 1);
-}
-.stagger-reveal.active > * {
-  opacity: 1;
-  transform: translateY(0);
-}
-.stagger-reveal.active > *:nth-child(1) { transition-delay: 0.1s; }
-.stagger-reveal.active > *:nth-child(2) { transition-delay: 0.2s; }
-.stagger-reveal.active > *:nth-child(3) { transition-delay: 0.3s; }
-.stagger-reveal.active > *:nth-child(4) { transition-delay: 0.4s; }
-.stagger-reveal.active > *:nth-child(5) { transition-delay: 0.5s; }
-.stagger-reveal.active > *:nth-child(6) { transition-delay: 0.6s; }
-
-/* Custom Scrollbars */
+/* App-wide scrollbars — thin and neutral. */
 ::-webkit-scrollbar {
-  width: 8px;
-  height: 8px;
+  width: 10px;
+  height: 10px;
 }
 ::-webkit-scrollbar-track {
-  background: #f8fafc;
+  background: transparent;
 }
 ::-webkit-scrollbar-thumb {
-  background: #cbd5e1;
+  background: rgb(var(--border-strong));
   border-radius: 9999px;
+  border: 2px solid transparent;
+  background-clip: content-box;
 }
 ::-webkit-scrollbar-thumb:hover {
-  background: #94a3b8;
+  background: rgb(var(--text-disabled));
+  background-clip: content-box;
 }
 
-/* Link Underline Slide-in */
-.link-underline {
-  position: relative;
-}
-.link-underline::after {
-  content: '';
-  position: absolute;
-  width: 100%;
-  transform: scaleX(0);
-  height: 2px;
-  bottom: -4px;
-  left: 0;
-  background-color: #6366F1;
-  transform-origin: bottom left;
-  transition: transform 0.3s cubic-bezier(0.25, 1, 0.5, 1);
-}
-.link-underline:hover::after,
-.link-underline.active::after {
-  transform: scaleX(1);
+/* ===========================================================================
+ * MOTION POLICY — 150ms, opacity/transform only.
+ * ========================================================================= */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
 }
 
-/* Rendered HTML Email Body Styles */
+/* ===========================================================================
+ * Rendered HTML email body (used inside the EmailBody sandboxed iframe).
+ * ========================================================================= */
 .email-body-rendered {
-  font-size: 0.8125rem;
+  font-size: 13px;
   line-height: 1.7;
   color: #334155;
   word-break: break-word;
   overflow-wrap: break-word;
 }
-
 .email-body-rendered img {
   max-width: 100%;
   height: auto;
-  border-radius: 0.5rem;
-  margin: 0.5rem 0;
+  margin: 8px 0;
 }
-
 .email-body-rendered a {
-  color: #4f46e5;
+  color: #2563eb;
   text-decoration: underline;
   text-underline-offset: 2px;
   word-break: break-all;
 }
-
-.email-body-rendered a:hover {
-  color: #6366f1;
-}
-
 .email-body-rendered table {
   border-collapse: collapse;
   width: 100%;
-  margin: 0.5rem 0;
-  font-size: 0.75rem;
+  margin: 8px 0;
+  font-size: 12px;
 }
-
 .email-body-rendered th,
 .email-body-rendered td {
   border: 1px solid #e2e8f0;
-  padding: 0.4rem 0.6rem;
+  padding: 6px 10px;
   text-align: left;
 }
-
 .email-body-rendered h1,
 .email-body-rendered h2,
 .email-body-rendered h3,
 .email-body-rendered h4 {
-  font-weight: 700;
-  color: #1e293b;
-  margin: 0.75rem 0 0.25rem;
+  font-weight: 600;
+  color: #0f172a;
+  margin: 12px 0 4px;
 }
-
-.email-body-rendered h1 { font-size: 1.125rem; }
-.email-body-rendered h2 { font-size: 1rem; }
-.email-body-rendered h3 { font-size: 0.9375rem; }
-
-.email-body-rendered p {
-  margin: 0.35rem 0;
-}
-
+.email-body-rendered h1 { font-size: 18px; }
+.email-body-rendered h2 { font-size: 16px; }
+.email-body-rendered h3 { font-size: 15px; }
+.email-body-rendered p { margin: 6px 0; }
 .email-body-rendered ul,
-.email-body-rendered ol {
-  padding-left: 1.25rem;
-  margin: 0.35rem 0;
-}
-
-.email-body-rendered li {
-  margin-bottom: 0.15rem;
-}
-
+.email-body-rendered ol { padding-left: 20px; margin: 6px 0; }
+.email-body-rendered li { margin-bottom: 2px; }
 .email-body-rendered blockquote {
-  border-left: 3px solid #c7d2fe;
-  padding-left: 0.75rem;
-  margin: 0.5rem 0;
+  border-left: 3px solid #e2e8f0;
+  padding-left: 12px;
+  margin: 8px 0;
   color: #64748b;
-  font-style: italic;
 }
-
 .email-body-rendered pre,
 .email-body-rendered code {
   background: #f1f5f9;
-  border-radius: 0.375rem;
-  padding: 0.15rem 0.35rem;
-  font-size: 0.75rem;
-  font-family: 'Courier New', Courier, monospace;
+  border-radius: 4px;
+  padding: 2px 6px;
+  font-size: 12px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
 }
-
 .email-body-rendered hr {
   border: none;
   border-top: 1px solid #e2e8f0;
-  margin: 0.75rem 0;
+  margin: 12px 0;
 }

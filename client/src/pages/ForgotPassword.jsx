@@ -1,129 +1,336 @@
-import React, { useState } from 'react';
-import { useNavigate, Link } from 'react-router-dom';
-import api from '../api/axios';
+import { useState } from 'react'
+import { Link, Navigate, useSearchParams } from 'react-router-dom'
+import { CheckCircle2, Eye, EyeOff, Mail } from 'lucide-react'
 
-const ForgotPassword = () => {
-  const [email, setEmail] = useState('');
-  const [message, setMessage] = useState('');
-  const [error, setError] = useState('');
-  const [loading, setLoading] = useState(false);
+import api, { getErrorMessage } from '../api/axios'
+import { useAuth } from '../components/AuthProvider'
+import { Alert, Button, FormField, Input } from '../components/ui'
 
-  const handleSubmit = async (e) => {
-    e.preventDefault();
-    setError('');
-    setMessage('');
-    setLoading(true);
+/** Map the server's 400 `{ errors: [{ path, message }] }` onto field messages. */
+function fieldErrorsFrom(error) {
+  const issues = error?.response?.data?.errors
+  if (!Array.isArray(issues)) return {}
+  const out = {}
+  for (const issue of issues) {
+    const key = Array.isArray(issue?.path) ? issue.path.join('.') : issue?.path
+    if (key && !out[key]) out[key] = issue.message
+  }
+  return out
+}
 
-    try {
-      const response = await api.post('/auth/forgot-password', { email });
-      setMessage(response.data.message || 'If that email is registered, we have sent a temporary password.');
-      setEmail('');
-    } catch (err) {
-      console.error('Forgot password error:', err);
-      const msg = err.response?.data?.message || 'Failed to submit password reset request. Please try again.';
-      setError(msg);
-    } finally {
-      setLoading(false);
+/** Shared chrome for the three unauthenticated screens. */
+function AuthShell({ heading, description, children, footer }) {
+  return (
+    <div className="flex min-h-screen flex-col bg-canvas">
+      <main className="flex flex-1 items-center justify-center px-6 py-12">
+        <div className="w-full max-w-[420px]">
+          <div className="flex items-center gap-2.5">
+            <span
+              aria-hidden="true"
+              className="flex h-9 w-9 items-center justify-center rounded-lg border border-primary-border bg-primary-subtle text-primary-text"
+            >
+              <Mail className="h-4 w-4" />
+            </span>
+            <span className="text-md font-semibold tracking-tight text-fg">K M KOTHARI</span>
+          </div>
+
+          <div className="mt-6 rounded-lg border border-line bg-surface p-6">
+            <h1 className="text-xl font-semibold text-fg">{heading}</h1>
+            {description ? <p className="mt-1.5 text-sm text-fg-2">{description}</p> : null}
+            {children}
+          </div>
+
+          {footer ? <div className="mt-4 text-sm text-fg-3">{footer}</div> : null}
+        </div>
+      </main>
+    </div>
+  )
+}
+
+function backToSignIn(label = 'Back to sign in') {
+  return (
+    <Link
+      to="/login"
+      className="rounded font-medium text-primary-text underline underline-offset-2 hover:text-primary-700 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary-600"
+    >
+      {label}
+    </Link>
+  )
+}
+
+/* -------------------------------------------------------------------------- */
+/* Step 1 — request a reset link                                              */
+/* -------------------------------------------------------------------------- */
+
+function RequestLink() {
+  const [email, setEmail] = useState('')
+  const [errors, setErrors] = useState({})
+  const [formError, setFormError] = useState('')
+  const [submitting, setSubmitting] = useState(false)
+  const [sentTo, setSentTo] = useState(null)
+  const [sentMessage, setSentMessage] = useState('')
+
+  const handleSubmit = async (event) => {
+    event.preventDefault()
+    setFormError('')
+
+    const trimmed = email.trim()
+    if (!trimmed) {
+      setErrors({ email: 'Enter your work email address.' })
+      return
     }
-  };
+    if (!/^\S+@\S+\.\S+$/.test(trimmed)) {
+      setErrors({ email: 'Enter a valid email address.' })
+      return
+    }
+    setErrors({})
+
+    setSubmitting(true)
+    try {
+      const res = await api.post('/auth/forgot-password', { email: trimmed })
+      // The response is deliberately identical whether or not the account
+      // exists, so it cannot be used to enumerate staff addresses.
+      setSentMessage(
+        res.data?.message ||
+          'If an account with this email exists, a password reset link has been sent to it.'
+      )
+      setSentTo(trimmed)
+    } catch (err) {
+      const fieldErrors = fieldErrorsFrom(err)
+      setErrors(fieldErrors)
+      if (Object.keys(fieldErrors).length === 0) {
+        setFormError(getErrorMessage(err, 'Could not send the reset link. Please try again.'))
+      }
+    } finally {
+      setSubmitting(false)
+    }
+  }
+
+  if (sentTo) {
+    return (
+      <AuthShell heading="Check your email">
+        <div className="mt-5 flex flex-col gap-4">
+          <div className="flex items-start gap-2.5 rounded-lg border border-success-border bg-success-subtle px-3 py-2.5 text-sm text-success-text">
+            <CheckCircle2 aria-hidden="true" className="mt-px h-4 w-4 shrink-0 text-success" />
+            <p>{sentMessage}</p>
+          </div>
+
+          <dl className="rounded-lg border border-line bg-subtle px-3 py-2.5 text-sm">
+            <dt className="text-xs text-fg-3">Sent to</dt>
+            <dd className="mt-0.5 break-all font-mono text-fg">{sentTo}</dd>
+          </dl>
+
+          <p className="text-sm text-fg-2">
+            The link can be used once and expires 30 minutes after it was requested. Your current
+            password still works until you set a new one.
+          </p>
+
+          <Button as={Link} to="/login" variant="primary" size="lg" fullWidth>
+            Back to sign in
+          </Button>
+        </div>
+      </AuthShell>
+    )
+  }
 
   return (
-    <div className="min-h-screen flex bg-white font-sans overflow-hidden select-none relative">
-      {/* Left half: Decorative Indigo Gradient (hidden on mobile) */}
-      <div className="hidden lg:flex lg:w-1/2 bg-gradient-to-tr from-indigo-600 via-indigo-500 to-purple-600 relative items-center justify-center p-12 overflow-hidden">
-        <div className="absolute top-10 left-10 h-72 w-72 bg-white/10 rounded-full blur-2xl animate-pulse" />
-        <div className="absolute bottom-10 right-10 h-96 w-96 bg-white/5 rounded-full blur-3xl animate-pulse delay-1000" />
-        <div className="absolute top-1/2 left-1/3 h-56 w-56 bg-indigo-400/20 rounded-full blur-3xl pointer-events-none" />
+    <AuthShell
+      heading="Reset your password"
+      description="Enter your work email and we will send you a single-use link to choose a new password."
+      footer={<>Remembered it? {backToSignIn('Sign in')}.</>}
+    >
+      {formError ? (
+        <Alert variant="danger" title="Could not send the reset link" className="mt-5">
+          {formError}
+        </Alert>
+      ) : null}
 
-        <div className="relative z-10 max-w-md text-white text-center space-y-6">
-          <div className="mx-auto h-16 w-16 rounded-2xl bg-white/10 backdrop-blur-md flex items-center justify-center shadow-2xl border border-white/20">
-            <svg className="h-8 w-8 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2.5" d="M15 7a2 2 0 012 2m-2-2a2 2 0 00-2 2m2-2a2 2 0 002-2m0 0a2 2 0 00-2-2m2 12a2 2 0 012-2m-2 2a2 2 0 00-2-2m2 2a2 2 0 002 2m0 0a2 2 0 00-2 2M5 18v-1a5 5 0 0110 0v1H5z" />
-            </svg>
+      <form className="mt-5 flex flex-col gap-4" onSubmit={handleSubmit} noValidate>
+        <FormField label="Email address" required error={errors.email}>
+          {(field) => (
+            <Input
+              {...field}
+              type="email"
+              name="email"
+              size="lg"
+              autoComplete="username"
+              placeholder="you@company.com"
+              value={email}
+              onChange={(e) => setEmail(e.target.value)}
+            />
+          )}
+        </FormField>
+
+        <Button type="submit" variant="primary" size="lg" fullWidth loading={submitting}>
+          Send reset link
+        </Button>
+      </form>
+    </AuthShell>
+  )
+}
+
+/* -------------------------------------------------------------------------- */
+/* Step 2 — redeem the token                                                  */
+/* -------------------------------------------------------------------------- */
+
+function ResetPassword({ token }) {
+  const [password, setPassword] = useState('')
+  const [confirmPassword, setConfirmPassword] = useState('')
+  const [showPassword, setShowPassword] = useState(false)
+  const [errors, setErrors] = useState({})
+  const [formError, setFormError] = useState('')
+  const [submitting, setSubmitting] = useState(false)
+  const [done, setDone] = useState('')
+
+  const handleSubmit = async (event) => {
+    event.preventDefault()
+    setFormError('')
+
+    const found = {}
+    if (!password) found.password = 'Choose a new password.'
+    else if (password.length < 6) found.password = 'Use at least 6 characters.'
+    if (confirmPassword !== password) found.confirmPassword = 'Passwords do not match.'
+    setErrors(found)
+    if (Object.keys(found).length > 0) return
+
+    setSubmitting(true)
+    try {
+      const res = await api.post('/auth/reset-password', { token, password })
+      setDone(
+        res.data?.message || 'Password reset successfully. You can now sign in with your new password.'
+      )
+    } catch (err) {
+      const fieldErrors = fieldErrorsFrom(err)
+      // There is no visible input for `token`, so a token issue is a
+      // form-level failure: the link is expired, already used or malformed.
+      const { token: tokenError, ...visible } = fieldErrors
+      setErrors(visible)
+      if (Object.keys(visible).length === 0) {
+        setFormError(
+          tokenError ||
+            getErrorMessage(err, 'This password reset link is invalid or has expired.')
+        )
+      }
+    } finally {
+      setSubmitting(false)
+    }
+  }
+
+  if (done) {
+    return (
+      <AuthShell heading="Password updated">
+        <div className="mt-5 flex flex-col gap-4">
+          <div className="flex items-start gap-2.5 rounded-lg border border-success-border bg-success-subtle px-3 py-2.5 text-sm text-success-text">
+            <CheckCircle2 aria-hidden="true" className="mt-px h-4 w-4 shrink-0 text-success" />
+            <p>{done}</p>
           </div>
-          <h1 className="text-4xl font-black tracking-tight leading-none">K M KOTHARI</h1>
-          <p className="text-white/80 leading-relaxed text-base font-semibold">
-            Retrieve credentials securely.
+          <p className="text-sm text-fg-2">
+            Every other session for this account has been signed out. Sign in again with the new
+            password.
           </p>
+          <Button as={Link} to="/login" variant="primary" size="lg" fullWidth>
+            Go to sign in
+          </Button>
         </div>
-      </div>
+      </AuthShell>
+    )
+  }
 
-      {/* Right half: Form card */}
-      <div className="w-full lg:w-1/2 flex items-center justify-center px-6 sm:px-12 lg:px-20 bg-slate-50/30">
-        <div className="max-w-md w-full space-y-8 bg-white p-8 sm:p-10 rounded-3xl shadow-xl border border-slate-100/80 relative">
-          <div>
-            <div className="mx-auto lg:mx-0 h-11 w-11 rounded-2xl bg-gradient-to-tr from-indigo-600 to-purple-600 flex items-center justify-center text-white shadow-md shadow-indigo-600/10 mb-6">
-              <svg className="h-5 w-5 text-white" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
-                <polyline points="22 12 16 12 14 15 10 15 8 12 2 12" />
-                <path d="M5.45 5.11L2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.45-6.89A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11z" />
-              </svg>
-            </div>
-            <h2 className="text-3xl font-black text-slate-900 tracking-tight leading-none">
-              Reset Password
-            </h2>
-            <p className="mt-2 text-xs text-slate-500 font-medium leading-relaxed">
-              Enter your email below to receive a secure, unique temporary password.
-            </p>
-          </div>
+  const passwordToggle = (
+    <button
+      type="button"
+      aria-label={showPassword ? 'Hide password' : 'Show password'}
+      aria-pressed={showPassword}
+      onClick={() => setShowPassword((v) => !v)}
+      className="flex h-6 w-6 items-center justify-center rounded text-fg-3 hover:text-fg-2 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-primary-600"
+    >
+      {showPassword ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
+    </button>
+  )
 
-          {error && (
-            <div className="bg-red-50 border border-red-100 text-red-500 p-4 rounded-xl text-xs flex items-start space-x-2 animate-shake">
-              <svg className="h-4 w-4 shrink-0 mt-0.5 text-red-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" />
-              </svg>
-              <span>{error}</span>
-            </div>
+  return (
+    <AuthShell
+      heading="Choose a new password"
+      description="This link can be used once. Setting a new password signs out every other session."
+      footer={<>{backToSignIn('Back to sign in')}.</>}
+    >
+      {formError ? (
+        <Alert
+          variant="danger"
+          title="Could not reset the password"
+          className="mt-5"
+          action={
+            <Button as={Link} to="/forgot-password" size="sm" variant="secondary">
+              New link
+            </Button>
+          }
+        >
+          {formError}
+        </Alert>
+      ) : null}
+
+      <form className="mt-5 flex flex-col gap-4" onSubmit={handleSubmit} noValidate>
+        <FormField label="New password" required error={errors.password} hint="At least 6 characters.">
+          {(field) => (
+            <Input
+              {...field}
+              type={showPassword ? 'text' : 'password'}
+              name="password"
+              size="lg"
+              autoComplete="new-password"
+              value={password}
+              onChange={(e) => setPassword(e.target.value)}
+              trailingIcon={passwordToggle}
+            />
           )}
+        </FormField>
 
-          {message && (
-            <div className="bg-emerald-50 border border-emerald-100 text-emerald-600 p-4 rounded-xl text-xs flex items-start space-x-2">
-              <svg className="h-4 w-4 shrink-0 mt-0.5 text-emerald-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z" />
-              </svg>
-              <span>{message}</span>
-            </div>
+        <FormField label="Confirm new password" required error={errors.confirmPassword}>
+          {(field) => (
+            <Input
+              {...field}
+              type={showPassword ? 'text' : 'password'}
+              name="confirmPassword"
+              size="lg"
+              autoComplete="new-password"
+              value={confirmPassword}
+              onChange={(e) => setConfirmPassword(e.target.value)}
+            />
           )}
+        </FormField>
 
-          <form className="mt-6 space-y-4" onSubmit={handleSubmit}>
-            <div>
-              <label htmlFor="email" className="block text-[10px] font-bold text-slate-400 uppercase tracking-wider mb-1">
-                Email Address
-              </label>
-              <input
-                id="email"
-                name="email"
-                type="email"
-                required
-                className="mt-1 block w-full px-4 py-3 bg-slate-50/50 hover:bg-slate-50/80 border border-slate-200/80 rounded-xl text-slate-900 placeholder-slate-400 focus:outline-none focus:ring-2 focus:ring-indigo-100 focus:border-indigo-500 transition-all duration-150 text-xs font-semibold focus:bg-white"
-                placeholder="you@example.com"
-                value={email}
-                onChange={(e) => setEmail(e.target.value)}
-              />
-            </div>
+        <Button type="submit" variant="primary" size="lg" fullWidth loading={submitting}>
+          Set new password
+        </Button>
+      </form>
+    </AuthShell>
+  )
+}
 
-            <div className="pt-2">
-              <button
-                type="submit"
-                disabled={loading}
-                className="w-full flex justify-center py-3.5 px-4 text-xs font-bold rounded-xl text-white bg-gradient-to-r from-indigo-600 to-purple-600 hover:from-indigo-700 hover:to-purple-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-indigo-500 transition-all duration-150 disabled:opacity-50 disabled:cursor-not-allowed shadow-[0_4px_15px_rgba(99,102,241,0.3)] hover:shadow-[0_6px_20px_rgba(99,102,241,0.4)] active:scale-[0.98]"
-              >
-                {loading ? 'Submitting...' : 'Send Temporary Password'}
-              </button>
-            </div>
-          </form>
+/* -------------------------------------------------------------------------- */
 
-          <div className="text-center mt-6">
-            <p className="text-xs text-slate-500 font-semibold">
-              Remembered your credentials?{' '}
-              <Link to="/login" className="font-bold text-indigo-600 hover:text-indigo-700 transition-colors">
-                Log In
-              </Link>
-            </p>
-          </div>
-        </div>
-      </div>
-    </div>
-  );
-};
+/**
+ * Password recovery.
+ *
+ * Forgot-password is no longer an instant password overwrite (which let anyone
+ * who knew a colleague's address lock them out). It now issues a hashed,
+ * single-use, 30-minute token emailed as
+ * `${FRONTEND_URL}/reset-password?token=…`, redeemed by the new
+ * `POST /api/auth/reset-password`.
+ *
+ * This screen therefore has two steps and renders whichever one the URL asks
+ * for: with `?token=` it is the reset form, without it the request form. It
+ * answers on `/forgot-password` and is intended to be mounted on
+ * `/reset-password` as well — see the routing note in the handoff.
+ */
+export default function ForgotPassword() {
+  const [searchParams] = useSearchParams()
+  const { isAuthenticated } = useAuth()
+  const token = searchParams.get('token')
 
-export default ForgotPassword;
+  // An authenticated visitor has no business on the recovery screens, but a
+  // reset link must still work while a stale session is open.
+  if (isAuthenticated && !token) return <Navigate to="/dashboard" replace />
+
+  return token ? <ResetPassword token={token} /> : <RequestLink />
+}
