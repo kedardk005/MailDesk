@@ -11,7 +11,7 @@
     "backfill-emails": "node scripts/backfillEmailSnippets.js",
     "backfill-threads": "node scripts/backfillEmailThreads.js",
     "backfill-completed-at": "node scripts/backfillTaskCompletedAt.js",
-    "check:syntax": "find . -name '*.js' -not -path './node_modules/*' -print0 | xargs -0 -n1 node --check",
+    "check:syntax": "node scripts/checkSyntax.js",
     "test:smoke": "node scripts/smokeTest.js"
   },
   "keywords": [],
