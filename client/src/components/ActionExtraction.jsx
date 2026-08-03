@@ -18,7 +18,7 @@
  * only path to a task is the ordinary, separately authorized `POST /api/tasks`
  * behind an explicit "Create selected".
  */
-import { useCallback, useEffect, useId, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useId, useRef, useState } from 'react'
 import { ListChecks, Sparkles } from 'lucide-react'
 
 import api, { getErrorMessage, isCanceled } from '../api/axios'
@@ -27,13 +27,14 @@ import {
   Badge,
   Button,
   Checkbox,
+  Combobox,
   FormField,
   Input,
   Select,
-  SelectMenu,
   Textarea,
   toast,
 } from './ui'
+import { searchAssignees, searchClients } from '../lib/pickers'
 
 /** Poll cadence for the 202 path. The job usually finishes on the first tick. */
 const POLL_INTERVAL_MS = 2500
@@ -394,16 +395,17 @@ function SuggestionRow({ draft, index, onChange }) {
  *
  * @param {string}   [emailId]      extract from a single message
  * @param {string}   [threadId]     …or across a conversation (exactly one)
- * @param {Array}    [users]        assignable users for the created tasks
  * @param {string}   [linkedEmail]  email id to link every created task back to
  * @param {Function} [onCreated]    called after at least one task was created
  */
-export function ExtractActionsPanel({ emailId, threadId, users = [], linkedEmail, onCreated }) {
+export function ExtractActionsPanel({ emailId, threadId, linkedEmail, onCreated }) {
   const { phase, data, error, run, reset } = useActionExtraction(emailId, threadId)
 
   const [drafts, setDrafts] = useState([])
   const [clientName, setClientName] = useState('')
-  const [assignee, setAssignee] = useState('')
+  /* The picker submits `assigneeOption.value`; the option carries the label. */
+  const [assigneeOption, setAssigneeOption] = useState(null)
+  const assignee = assigneeOption?.value || ''
   const [creating, setCreating] = useState(false)
   const aliveRef = useRef(true)
   /* Two panels can be mounted at once (a drawer plus a dialog), so the
@@ -438,16 +440,6 @@ export function ExtractActionsPanel({ emailId, threadId, users = [], linkedEmail
     )
     setClientName(data?.suggestedClient || '')
   }
-
-  const userOptions = useMemo(
-    () =>
-      users.map((u) => ({
-        value: u._id,
-        label: u.name || u.email || 'Unnamed user',
-        group: u.role ? `${u.role}s` : 'Team',
-      })),
-    [users]
-  )
 
   const updateDraft = useCallback((key, patch) => {
     setDrafts((prev) => prev.map((d) => (d.key === key ? { ...d, ...patch } : d)))
@@ -598,25 +590,34 @@ export function ExtractActionsPanel({ emailId, threadId, users = [], linkedEmail
                   }
                 >
                   {(field) => (
-                    <Input
+                    <Combobox
                       {...field}
                       size="sm"
-                      value={clientName}
-                      onChange={(e) => setClientName(e.target.value)}
+                      value={clientName ? { value: clientName, label: clientName } : null}
+                      onChange={(opt) => setClientName(opt ? opt.value : '')}
+                      loadOptions={searchClients}
+                      allowCreate
                       placeholder="Client these tasks belong to"
+                      searchPlaceholder="Search clients…"
+                      emptyMessage="No matching clients."
+                      errorMessage="Could not search clients."
                     />
                   )}
                 </FormField>
 
                 <FormField label="Assignee" required>
                   {(field) => (
-                    <SelectMenu
-                      id={field.id}
-                      ariaLabel="Assignee for the created tasks"
-                      value={assignee}
-                      onValueChange={setAssignee}
-                      options={userOptions}
+                    <Combobox
+                      {...field}
+                      size="sm"
+                      aria-label="Assignee for the created tasks"
+                      value={assigneeOption}
+                      onChange={setAssigneeOption}
+                      loadOptions={searchAssignees}
                       placeholder="Choose a team member"
+                      searchPlaceholder="Search people…"
+                      emptyMessage="No matching people."
+                      errorMessage="Could not search people."
                     />
                   )}
                 </FormField>

@@ -13,6 +13,7 @@ export { Badge, CountBadge, badgeVariants } from './Badge'
 export { Button, buttonVariants } from './Button'
 export { Card, CardBody, CardFooter, CardHeader, StatTile } from './Card'
 export { Checkbox } from './Checkbox'
+export { Combobox } from './Combobox'
 export { ConfirmDialog, ConfirmProvider, useConfirm } from './ConfirmDialog'
 export { DataTable } from './DataTable'
 export {

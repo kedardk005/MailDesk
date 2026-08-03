@@ -44,6 +44,7 @@ import {
   Avatar,
   Badge,
   Button,
+  Combobox,
   DataTable,
   Dialog,
   DialogClose,
@@ -75,6 +76,7 @@ import {
   toast,
   useConfirm,
 } from '../components/ui'
+import { searchAssignees, searchClients, searchLinkableEmails } from '../lib/pickers'
 import { cn, formatNumber, timeAgo } from '../lib/utils'
 import { ExtractActionsPanel } from '../components/ActionExtraction'
 
@@ -381,9 +383,14 @@ function useTaskQuery(params) {
   return { ...result, reload, patchRow }
 }
 
-/** Clients / assignable users / linkable emails, fetched once and in parallel. */
+/**
+ * Clients / assignable users for the FILTER dropdowns and the bulk-reassign
+ * menu, fetched once and in parallel. The form's pickers do not read these:
+ * they search the server as you type (see lib/pickers.js), so the linkable
+ * email preload this hook used to make is gone entirely.
+ */
 function useTaskOptions(canAssign) {
-  const [options, setOptions] = useState({ clients: [], users: [], emails: [] })
+  const [options, setOptions] = useState({ clients: [], users: [] })
   const [nonce, setNonce] = useState(0)
 
   useEffect(() => {
@@ -396,20 +403,14 @@ function useTaskOptions(canAssign) {
           .then((r) => unwrapList(r.data).data)
           .catch(() => [])
 
-      const [clients, users, emails] = await Promise.all([
+      const [clients, users] = await Promise.all([
         get('/tasks/clients'),
         canAssign ? get('/users', { page: 1, limit: 100, sort: 'name' }) : Promise.resolve([]),
-        // Only the linkable slice, and never with bodies — the list contract
-        // returns a snippet. This used to download every email in the account.
-        canAssign
-          ? get('/gmail/emails', { page: 1, limit: WIDE_VIEW_LIMIT, status: 'unassigned' })
-          : Promise.resolve([]),
       ])
       if (!alive) return
       setOptions({
         clients,
         users: users.filter((u) => !u.status || u.status === 'Approved'),
-        emails: emails.filter((e) => e.status === 'unassigned' && !e.labelIds?.includes('SPAM')),
       })
     })()
     return () => {
@@ -1171,7 +1172,6 @@ function TaskDrawerBody({
   taskId,
   perms,
   user,
-  users,
   now,
   onEdit,
   onComplete,
@@ -1390,7 +1390,6 @@ function TaskDrawerBody({
               <div className="mt-4">
                 <ExtractActionsPanel
                   emailId={email._id}
-                  users={users}
                   linkedEmail={email._id}
                   onCreated={onTasksCreated}
                 />
@@ -1476,10 +1475,34 @@ function validateForm(form, mode) {
 }
 
 /**
+ * Two-line email row for the link-an-email picker: subject over
+ * sender + age, with the read state as the one coloured exception.
+ */
+function EmailOptionRow({ option }) {
+  return (
+    <span className="flex min-w-0 flex-1 items-center gap-2">
+      <span className="min-w-0 flex-1">
+        <span className={cn('block truncate text-fg', option.unread && 'font-semibold')}>
+          {option.label}
+        </span>
+        {option.description ? (
+          <span className="block truncate text-xs text-fg-3">{option.description}</span>
+        ) : null}
+      </span>
+      {option.unread ? (
+        <Badge size="sm" variant="info">
+          Unread
+        </Badge>
+      ) : null}
+    </span>
+  )
+}
+
+/**
  * Remounted by the page (`key`) whenever it opens, so the form always starts
  * from `initial` without a state-syncing effect.
  */
-function TaskFormDialog({ open, mode, initial, options, saving, onSubmit, onOpenChange }) {
+function TaskFormDialog({ open, mode, initial, saving, onSubmit, onOpenChange }) {
   const [form, setForm] = useState(() => ({ ...EMPTY_FORM, ...initial }))
   const [errors, setErrors] = useState({})
   const formId = `task-form-${mode}`
@@ -1494,24 +1517,26 @@ function TaskFormDialog({ open, mode, initial, options, saving, onSubmit, onOpen
     onSubmit(form)
   }
 
-  const clientOptions = useMemo(
-    () => options.clients.map((c) => ({ value: c.name, label: c.name })),
-    [options.clients]
+  /* The pickers submit plain ids/names through `form`; these two hold the
+     DISPLAY of the current selection (a label the id alone cannot provide).
+     Remounted-with-`key` like the rest of the form, so initialisers suffice. */
+  const [assigneeOption, setAssigneeOption] = useState(() =>
+    initial?.assignedTo
+      ? {
+          value: initial.assignedTo,
+          label: initial.assignedToName || 'Current assignee',
+          description: initial.assignedToRole || undefined,
+        }
+      : null
   )
-
   /* A deep link from the inbox may reference an email that is not in the
-     first page of unassigned mail — keep it selectable rather than silently
+     first page of unassigned mail — keep it selected rather than silently
      dropping the link. */
-  const emailOptions = useMemo(() => {
-    const list = options.emails.map((e) => ({
-      value: e._id,
-      label: `${e.subject || '(No subject)'} — ${e.from}`,
-    }))
-    if (initial?.linkedEmail && !list.some((o) => o.value === initial.linkedEmail)) {
-      list.unshift({ value: initial.linkedEmail, label: 'Email selected from the inbox' })
-    }
-    return list
-  }, [options.emails, initial])
+  const [emailOption, setEmailOption] = useState(() =>
+    initial?.linkedEmail
+      ? { value: initial.linkedEmail, label: 'Email selected from the inbox' }
+      : null
+  )
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
@@ -1550,32 +1575,44 @@ function TaskFormDialog({ open, mode, initial, options, saving, onSubmit, onOpen
             </FormField>
 
             <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
-              <FormField label="Client" required error={errors.clientName} hint="Type a new name or pick an existing client.">
+              <FormField
+                label="Client"
+                required
+                error={errors.clientName}
+                hint="Pick an existing client, or create a new one by name."
+              >
                 {(field) => (
-                  <Input
+                  <Combobox
                     {...field}
-                    list={`${formId}-clients`}
-                    value={form.clientName}
-                    maxLength={LIMITS.clientName}
-                    placeholder="Search clients…"
-                    onChange={(e) => set('clientName')(e.target.value)}
+                    value={
+                      form.clientName ? { value: form.clientName, label: form.clientName } : null
+                    }
+                    onChange={(opt) => set('clientName')(opt ? opt.value : '')}
+                    loadOptions={searchClients}
+                    allowCreate
+                    inputMaxLength={LIMITS.clientName}
+                    placeholder="Choose a client"
+                    searchPlaceholder="Search clients…"
+                    emptyMessage="No matching clients."
+                    errorMessage="Could not search clients."
                   />
                 )}
               </FormField>
-              <datalist id={`${formId}-clients`}>
-                {clientOptions.map((c) => (
-                  <option key={c.value} value={c.value} />
-                ))}
-              </datalist>
 
               <FormField label="Assignee" required error={errors.assignedTo}>
                 {(field) => (
-                  <Select
+                  <Combobox
                     {...field}
-                    value={form.assignedTo}
+                    value={assigneeOption}
+                    onChange={(opt) => {
+                      setAssigneeOption(opt)
+                      set('assignedTo')(opt ? opt.value : '')
+                    }}
+                    loadOptions={searchAssignees}
                     placeholder="Choose a team member"
-                    options={options.users.map((u) => ({ value: u._id, label: `${u.name} (${u.role})` }))}
-                    onChange={(e) => set('assignedTo')(e.target.value)}
+                    searchPlaceholder="Search people…"
+                    emptyMessage="No matching people."
+                    errorMessage="Could not search people."
                   />
                 )}
               </FormField>
@@ -1616,12 +1653,21 @@ function TaskFormDialog({ open, mode, initial, options, saving, onSubmit, onOpen
               ) : (
                 <FormField label="Link an email" optionalText="Optional">
                   {(field) => (
-                    <Select
+                    <Combobox
                       {...field}
-                      value={form.linkedEmail}
+                      value={emailOption}
+                      onChange={(opt) => {
+                        setEmailOption(opt)
+                        set('linkedEmail')(opt ? opt.value : '')
+                      }}
+                      loadOptions={searchLinkableEmails}
+                      renderOption={(opt) => <EmailOptionRow option={opt} />}
+                      clearLabel="No linked email"
                       placeholder="No linked email"
-                      options={emailOptions}
-                      onChange={(e) => set('linkedEmail')(e.target.value)}
+                      searchPlaceholder="Search subject or sender…"
+                      emptyMessage="No unassigned emails."
+                      errorMessage="Could not search emails."
+                      contentClassName="w-[380px] max-w-[calc(100vw-32px)]"
                     />
                   )}
                 </FormField>
@@ -1902,6 +1948,9 @@ export default function TaskList() {
         description: editing.description || '',
         clientName: editing.clientName || '',
         assignedTo: idOf(editing.assignedTo),
+        /* Display-only: the assignee picker needs a label for the stored id. */
+        assignedToName: editing.assignedTo?.name || '',
+        assignedToRole: editing.assignedTo?.role || '',
         deadline: toLocalInput(editing.deadline),
         notes: editing.notes || '',
         status: editing.status || 'Pending',
@@ -2268,7 +2317,6 @@ export default function TaskList() {
             taskId={query.task}
             perms={perms}
             user={user}
-            users={options.users}
             now={now}
             onEdit={startEdit}
             onComplete={completeTask}
@@ -2284,7 +2332,6 @@ export default function TaskList() {
         open={composing}
         mode={editing ? 'edit' : 'create'}
         initial={dialogInitial}
-        options={options}
         saving={saving}
         onSubmit={saveTask}
         onOpenChange={(next) => !next && closeDialog()}
