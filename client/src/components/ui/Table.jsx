@@ -13,11 +13,24 @@ import { cn } from '../../lib/utils'
  *   </TableContainer>
  */
 
-/** Rounded, bordered, clipping wrapper. No shadow. Provides the scroll context. */
-export function TableContainer({ className, children, ...props }) {
+/**
+ * Rounded, bordered, clipping wrapper. No shadow. Provides the scroll context.
+ *
+ * @param {boolean} [fill=false] - scroll containment. `overflow-auto` alone
+ *        never scrolls vertically: with no height constraint the box just
+ *        grows and the page scrolls instead. Inside a flex column (e.g.
+ *        `<PageBody fill>`) `fill` gives the container the remaining height
+ *        (`flex-1 min-h-0`) so the rows scroll HERE and the sticky <THead>
+ *        actually sticks.
+ */
+export function TableContainer({ fill = false, className, children, ...props }) {
   return (
     <div
-      className={cn('overflow-auto rounded-lg border border-line bg-surface custom-scrollbar', className)}
+      className={cn(
+        'overflow-auto rounded-lg border border-line bg-surface custom-scrollbar',
+        fill && 'min-h-0 flex-1',
+        className
+      )}
       {...props}
     >
       {children}

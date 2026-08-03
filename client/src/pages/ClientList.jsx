@@ -636,7 +636,7 @@ export default function ClientList() {
         }
       />
 
-      <PageBody>
+      <PageBody fill>
         {error ? (
           <Alert
             variant="danger"
@@ -653,6 +653,7 @@ export default function ClientList() {
         ) : null}
 
         <DataTable
+          fill
           ariaLabel="Clients"
           data={rows}
           columns={columns}
