@@ -22,7 +22,7 @@ export function PopoverContent({ className, align = 'start', sideOffset = 6, ...
         align={align}
         sideOffset={sideOffset}
         className={cn(
-          'z-dropdown rounded-lg border border-line bg-surface p-3 shadow-md focus:outline-none',
+          'z-dropdown rounded-lg border border-line-overlay bg-elevated p-3 shadow-md focus:outline-none',
           'data-[state=open]:animate-slide-in',
           className
         )}

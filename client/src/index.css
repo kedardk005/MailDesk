@@ -34,6 +34,30 @@
     --border-default: 203 213 225; /* #CBD5E1  1.48:1 on surface */
     --border-strong: 148 163 184;  /* #94A3B8  2.56:1 on surface */
 
+    /* elevation — every FLOATING panel (dialog, drawer, dropdown, popover,
+     * select menu, command palette, toast) uses these instead of bg-surface /
+     * border-default. In light mode the elevated fill matches the surface;
+     * in dark mode elevation is expressed as LIGHTNESS (shadows are invisible
+     * on a #0B1220 canvas), so the dark values are lighter than --bg-surface.
+     *   elevated        panel fill
+     *   elevated-subtle header/footer strips + hover rows ON an elevated panel
+     *   border-overlay  the 1px edge of every floating panel + its internal
+     *                   dividers (dark --border-default is 1.04:1 on the dark
+     *                   elevated fill — invisible)                          */
+    --bg-elevated: 255 255 255;        /* #FFFFFF */
+    --bg-elevated-subtle: 238 242 247; /* #EEF2F7  1.12:1 on elevated */
+    --border-overlay: 203 213 225;     /* #CBD5E1  1.48:1 on elevated */
+
+    /* scrim — theme-aware. Light dims the page (#0F172A @ 0.55 moves the
+     * canvas 3.83:1 from its undimmed self); dark mode has no darkening
+     * headroom (#0B1220 is near-black already — even black @ 0.8 only moves
+     * the page 1.10:1), so the dark scrim mostly exists to kill contrast of
+     * the page content while the blur + lighter panel do the separating.
+     * Consumed only via the `.overlay-scrim` component class below.        */
+    --overlay-scrim: 15 23 42;          /* scrim tint (RGB triplet) */
+    --overlay-scrim-alpha: 0.55;
+    --overlay-scrim-alpha-strong: 0.65; /* no-backdrop-filter fallback */
+
     /* text — ratios are computed on surface #FFFFFF / canvas #EAEFF5 */
     --text-primary: 15 23 42;      /* #0F172A  17.85:1 / 15.44:1 — AAA */
     --text-secondary: 71 85 105;   /* #475569   7.58:1 /  6.55:1 — AAA on surface */
@@ -108,6 +132,22 @@
 
     --border-default: 39 50 68;    /* #273244 */
     --border-strong: 58 70 90;     /* #3A465A */
+
+    /* elevation — lighter than --bg-surface (#111827): the panel reads as a
+     * separate layer by luminance, which is the only cue that works on a
+     * near-black canvas.
+     *   #232F42 vs page dimmed by the scrim below = 1.51:1 (was 1.03:1)
+     *   text-primary #F1F5F9 on it = 12.31:1, text-secondary #CBD5E1 = 9.09:1 */
+    --bg-elevated: 35 47 66;           /* #232F42 */
+    --bg-elevated-subtle: 42 56 80;    /* #2A3850  1.14:1 on elevated */
+    --border-overlay: 67 82 107;       /* #43526B  1.71:1 on elevated,
+                                          2.25:1 on undimmed surface */
+
+    /* Near-black at high alpha — darkening cannot separate layers here (no
+     * headroom), it only mutes the page under the blur. */
+    --overlay-scrim: 0 0 0;
+    --overlay-scrim-alpha: 0.70;
+    --overlay-scrim-alpha-strong: 0.80;
 
     --text-primary: 241 245 249;   /* #F1F5F9 */
     --text-secondary: 203 213 225; /* #CBD5E1 */
@@ -215,6 +255,22 @@
  * were previously defined nowhere. They are real now.
  * ========================================================================= */
 @layer components {
+  /* The scrim behind every modal layer (Dialog, Drawer, CommandPalette, the
+   * mobile Sidebar). Theme-aware via the --overlay-scrim* tokens, plus a
+   * modest blur: blur separates by focus rather than brightness, so it keeps
+   * working in dark mode where the luminance headroom is gone. Browsers
+   * without backdrop-filter get a stronger plain scrim instead. */
+  .overlay-scrim {
+    background-color: rgb(var(--overlay-scrim) / var(--overlay-scrim-alpha));
+    -webkit-backdrop-filter: blur(3px) saturate(0.85);
+    backdrop-filter: blur(3px) saturate(0.85);
+  }
+  @supports not (backdrop-filter: blur(1px)) {
+    .overlay-scrim {
+      background-color: rgb(var(--overlay-scrim) / var(--overlay-scrim-alpha-strong));
+    }
+  }
+
   /* Loading skeleton — the only infinite animation permitted in the app. */
   .skeleton,
   .skeleton-shimmer,

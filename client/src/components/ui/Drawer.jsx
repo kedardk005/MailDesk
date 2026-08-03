@@ -49,15 +49,15 @@ export function DrawerContent({
       <DialogOverlay />
       <RadixDialog.Content
         className={cn(
-          'fixed inset-y-0 z-modal flex max-w-[calc(100vw-48px)] flex-col bg-surface shadow-lg focus:outline-none',
-          side === 'right' ? 'right-0 border-l border-line' : 'left-0 border-r border-line',
+          'fixed inset-y-0 z-modal flex max-w-[calc(100vw-48px)] flex-col bg-elevated shadow-lg focus:outline-none',
+          side === 'right' ? 'right-0 border-l border-line-overlay' : 'left-0 border-r border-line-overlay',
           'data-[state=open]:animate-slide-in-right',
           sizes[size] || sizes.md,
           className
         )}
         {...props}
       >
-        <div className="flex min-h-[56px] shrink-0 items-start justify-between gap-3 border-b border-line px-5 py-3">
+        <div className="flex min-h-[56px] shrink-0 items-start justify-between gap-3 border-b border-line-overlay px-5 py-3">
           <div className="min-w-0">
             <RadixDialog.Title className="truncate text-md font-semibold text-fg">
               {title}
@@ -83,7 +83,7 @@ export function DrawerContent({
         <div className={cn('min-h-0 flex-1 overflow-y-auto p-5', bodyClassName)}>{children}</div>
 
         {footer ? (
-          <div className="flex min-h-[56px] shrink-0 items-center justify-end gap-2 border-t border-line bg-canvas px-5 py-3">
+          <div className="flex min-h-[56px] shrink-0 items-center justify-end gap-2 border-t border-line-overlay bg-elevated-subtle px-5 py-3">
             {footer}
           </div>
         ) : null}

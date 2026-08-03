@@ -29,7 +29,7 @@ export function DropdownMenuContent({ className, sideOffset = 4, align = 'end', 
         sideOffset={sideOffset}
         align={align}
         className={cn(
-          'z-dropdown min-w-[180px] overflow-hidden rounded-lg border border-line bg-surface p-1 shadow-md',
+          'z-dropdown min-w-[180px] overflow-hidden rounded-lg border border-line-overlay bg-elevated p-1 shadow-md',
           'data-[state=open]:animate-slide-in',
           className
         )}
@@ -46,7 +46,7 @@ const itemClass = (destructive) =>
     'data-[disabled]:pointer-events-none data-[disabled]:text-fg-off',
     destructive
       ? 'text-danger-text data-[highlighted]:bg-danger-subtle'
-      : 'text-fg-2 data-[highlighted]:bg-subtle data-[highlighted]:text-fg'
+      : 'text-fg-2 data-[highlighted]:bg-elevated-subtle data-[highlighted]:text-fg'
   )
 
 /** @param {boolean} [destructive] - renders in danger colours */
@@ -86,7 +86,7 @@ export function DropdownMenuLabel({ className, ...props }) {
 }
 
 export function DropdownMenuSeparator({ className, ...props }) {
-  return <Radix.Separator className={cn('-mx-1 my-1 h-px bg-line', className)} {...props} />
+  return <Radix.Separator className={cn('-mx-1 my-1 h-px bg-line-overlay', className)} {...props} />
 }
 
 export function DropdownMenuShortcut({ className, ...props }) {
@@ -109,7 +109,7 @@ export function DropdownMenuSubContent({ className, ...props }) {
     <Radix.Portal>
       <Radix.SubContent
         className={cn(
-          'z-dropdown min-w-[180px] overflow-hidden rounded-lg border border-line bg-surface p-1 shadow-md',
+          'z-dropdown min-w-[180px] overflow-hidden rounded-lg border border-line-overlay bg-elevated p-1 shadow-md',
           className
         )}
         {...props}
