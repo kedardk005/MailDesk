@@ -372,6 +372,7 @@ export default function Dashboard() {
           icon: CalendarClock,
           label: 'Due today',
           value: formatNumber(counts.dueToday),
+          tone: counts.dueToday > 0 ? 'warning' : 'default',
           hint: 'Assigned to you',
         },
         {
@@ -394,6 +395,7 @@ export default function Dashboard() {
           icon: Inbox,
           label: 'Unassigned mail',
           value: formatNumber(stats?.totalUnassignedEmails ?? 0),
+          tone: (stats?.totalUnassignedEmails ?? 0) > 0 ? 'primary' : 'default',
           hint: 'Waiting to be turned into tasks',
         },
         {
@@ -401,6 +403,7 @@ export default function Dashboard() {
           icon: MailCheck,
           label: 'Awaiting approval',
           value: formatNumber(approvals.length),
+          tone: approvals.length > 0 ? 'primary' : 'default',
           hint: 'Keyword-matched suggestions',
         },
         {
@@ -427,6 +430,7 @@ export default function Dashboard() {
           icon: CalendarClock,
           label: 'Due today',
           value: formatNumber(counts.dueToday),
+          tone: counts.dueToday > 0 ? 'warning' : 'default',
         },
         {
           to: LINK.myOverdue,
@@ -440,6 +444,7 @@ export default function Dashboard() {
           icon: CheckCircle2,
           label: 'Completed',
           value: formatNumber(counts.completed),
+          tone: counts.completed > 0 ? 'success' : 'default',
           hint: 'Last 30 days',
         },
       ]
