@@ -683,6 +683,149 @@ const main = async () => {
   check('timeline rejects a malformed client id with 400', (await api('/api/clients/nope/timeline', { token: adminToken })).status === 400);
   check('timeline 404s for an unknown client', (await api('/api/clients/507f1f77bcf86cd799439011/timeline', { token: adminToken })).status === 404);
 
+  // =====================================================================
+  // Audit fixes (docs/audits/AUDIT-volume-roles.md):
+  //   D2 — bulk-assign resolves the client instead of storing the raw header
+  //   D5 — client counters are scoped to what the caller may access
+  //   D7 — email-timeline buckets account for EVERY email in the range
+  // =====================================================================
+  console.log('\naudit D2: bulk-assign resolves Task.clientName like the sync path');
+
+  // A sender matching Smoke Client's associated address, in raw-header form,
+  // plus one matching no client at all. `clientId` mirrors what ingest writes.
+  const bulkMatched = await Email.create({
+    messageId: 'smoke-bulkassign-1', subject: 'Bulk assign resolves client',
+    from: '"Smoke Sender" <a@example.test>', date: new Date(),
+    fetchedBy: adminUser._id, toEmail: 'inbox@example.test', clientId: client._id
+  });
+  const bulkUnmatched = await Email.create({
+    messageId: 'smoke-bulkassign-2', subject: 'Bulk assign unmatched sender',
+    from: '"Nobody Known" <nobody@nowhere.test>', date: new Date(),
+    fetchedBy: adminUser._id, toEmail: 'inbox@example.test'
+  });
+  // Head-owned mail for the same client, seeded BEFORE the bulk-assign call so
+  // its cache invalidation covers this row too (D5 assertions below).
+  const headClientMail = await Email.create({
+    messageId: 'smoke-scope-head-1', subject: 'Head mail for Smoke Client',
+    from: '"Smoke Sender" <a@example.test>', date: new Date(),
+    fetchedBy: headUser._id, toEmail: 'head@example.test', clientId: client._id
+  });
+
+  const bulkAssign = await api('/api/gmail/emails/bulk-assign', {
+    token: adminToken, method: 'POST',
+    body: { emailIds: [String(bulkMatched._id), String(bulkUnmatched._id)], assignedTo: String(empUser._id) }
+  });
+  check('bulk-assign: 200', bulkAssign.status === 200, `got ${bulkAssign.status} ${JSON.stringify(bulkAssign.json)}`);
+  const bulkTaskRow = await Task.findOne({ linkedEmail: bulkMatched._id }).lean();
+  check(
+    'bulk-assign resolves clientName to the client (not the raw From header)',
+    bulkTaskRow?.clientName === 'Smoke Client',
+    `clientName=${JSON.stringify(bulkTaskRow?.clientName)}`
+  );
+  const bulkUnmatchedTask = await Task.findOne({ linkedEmail: bulkUnmatched._id }).lean();
+  check(
+    "an unmatched sender gets the sync path's 'Unassigned' sentinel",
+    bulkUnmatchedTask?.clientName === 'Unassigned',
+    `clientName=${JSON.stringify(bulkUnmatchedTask?.clientName)}`
+  );
+  const echoedTask = (bulkAssign.json?.tasks || []).find((t) => String(t.linkedEmail) === String(bulkMatched._id));
+  check('the response echoes the resolved clientName', echoedTask?.clientName === 'Smoke Client', JSON.stringify(echoedTask));
+
+  console.log('\naudit D5: client counters are scoped to the caller');
+  // Re-derive every number straight from the database for each scope, exactly
+  // as the audit did, and require the API to match. The list endpoints' own
+  // rules: tasks Employee=assignedTo, Head=createdBy|assignedTo; mail
+  // Head=fetchedBy, Employee=assignedTo.
+  const smokeNameRe = /^Smoke Client$/i;
+  const mailBase = { clientId: client._id, deletedAt: null, direction: { $ne: 'outbound' } };
+  const dbCounts = {
+    admin: {
+      tasks: await Task.countDocuments({ clientName: smokeNameRe }),
+      mail: await Email.countDocuments(mailBase)
+    },
+    head: {
+      tasks: await Task.countDocuments({ clientName: smokeNameRe, $or: [{ createdBy: headUser._id }, { assignedTo: headUser._id }] }),
+      mail: await Email.countDocuments({ ...mailBase, fetchedBy: headUser._id })
+    },
+    emp: {
+      tasks: await Task.countDocuments({ clientName: smokeNameRe, assignedTo: empUser._id }),
+      mail: await Email.countDocuments({ ...mailBase, assignedTo: empUser._id })
+    }
+  };
+  const clientRowFor = async (token) =>
+    ((await api('/api/clients?page=1&limit=100', { token })).json?.data || []).find((c) => c.name === 'Smoke Client') || {};
+  const rowAdmin = await clientRowFor(adminToken);
+  const rowHead = await clientRowFor(headToken);
+  const rowEmp = await clientRowFor(empToken);
+  check(
+    'Admin counters stay workspace-wide and equal the DB',
+    rowAdmin.taskCount === dbCounts.admin.tasks && rowAdmin.mailCount === dbCounts.admin.mail,
+    `api=${JSON.stringify({ t: rowAdmin.taskCount, m: rowAdmin.mailCount })} db=${JSON.stringify(dbCounts.admin)}`
+  );
+  check(
+    "Head counters equal the Head's own DB slice (fetchedBy / createdBy|assignedTo)",
+    rowHead.taskCount === dbCounts.head.tasks && rowHead.mailCount === dbCounts.head.mail,
+    `api=${JSON.stringify({ t: rowHead.taskCount, m: rowHead.mailCount })} db=${JSON.stringify(dbCounts.head)}`
+  );
+  check(
+    'a Head no longer sees workspace-global volumes for mail they cannot open',
+    rowHead.mailCount < rowAdmin.mailCount,
+    `head=${rowHead.mailCount} admin=${rowAdmin.mailCount}`
+  );
+  check(
+    "Employee counters equal the Employee's own DB slice (assignedTo)",
+    rowEmp.taskCount === dbCounts.emp.tasks && rowEmp.mailCount === dbCounts.emp.mail,
+    `api=${JSON.stringify({ t: rowEmp.taskCount, m: rowEmp.mailCount })} db=${JSON.stringify(dbCounts.emp)}`
+  );
+
+  console.log('\naudit D7: email-timeline accounts for every email in its range');
+  // Fixture emails ON the window boundary: the first instant of the oldest
+  // bucket day (must be counted), one millisecond before it (must not be), and
+  // one now. The old code matched `date >= now - days*24h`, a partial day
+  // before the oldest bucket's local midnight, and silently dropped whatever
+  // fell in the gap.
+  //
+  // Assumes this process and the server share APP_TIMEZONE (both default to
+  // Asia/Kolkata), like every other date assertion in this suite.
+  const { zonedWallClockToUtc } = require('../utils/dateHelper');
+  const SMOKE_TZ = process.env.APP_TIMEZONE || 'Asia/Kolkata';
+  const tlKeyFmt = new Intl.DateTimeFormat('en-CA', { timeZone: SMOKE_TZ, year: 'numeric', month: '2-digit', day: '2-digit' });
+  const startOfDayIn = (ms) => {
+    const [y, mo, d] = tlKeyFmt.format(new Date(ms)).split('-').map(Number);
+    return zonedWallClockToUtc(y, mo, d, 0, 0, 0, 0, SMOKE_TZ);
+  };
+  const TL_DAYS = 14;
+  const tlNow = Date.now();
+  const tlStart = startOfDayIn(tlNow - (TL_DAYS - 1) * 86400000);
+  const tlEnd = startOfDayIn(tlNow + 86400000);
+  await Email.insertMany([
+    { messageId: 'smoke-tl-boundary-in', subject: 'first instant of the window', from: 'tl@example.test', date: new Date(tlStart.getTime()), fetchedBy: adminUser._id, toEmail: 'inbox@example.test' },
+    { messageId: 'smoke-tl-boundary-out', subject: 'one ms before the window', from: 'tl@example.test', date: new Date(tlStart.getTime() - 1), fetchedBy: adminUser._id, toEmail: 'inbox@example.test' },
+    { messageId: 'smoke-tl-today', subject: 'today', from: 'tl@example.test', date: new Date(tlNow), fetchedBy: adminUser._id, toEmail: 'inbox@example.test' }
+  ]);
+  // Direct inserts bypass cache invalidation, but the bulk-assign call above
+  // ran cache.invalidateStats() (dropping every report:* entry, including any
+  // email-timeline payload a previous run cached), and nothing between it and
+  // this read re-populates the timeline key — so this read computes fresh.
+  const tlRes = await api(`/api/reports/email-timeline?days=${TL_DAYS}`, { token: adminToken });
+  const tlBuckets = tlRes.json || [];
+  const tlSum = tlBuckets.reduce((s, b) => s + (b.count || 0), 0);
+  const tlDbCount = await Email.countDocuments({
+    date: { $gte: tlStart, $lt: tlEnd }, deletedAt: null, direction: { $ne: 'outbound' }
+  });
+  check('email-timeline: 200 with one bucket per day', tlRes.status === 200 && tlBuckets.length === TL_DAYS, `got ${tlRes.status} with ${tlBuckets.length} buckets`);
+  check(
+    'bucket sum equals the DB count over the stated range EXACTLY',
+    tlSum === tlDbCount,
+    `sum=${tlSum} db=${tlDbCount}`
+  );
+  const tlFirstBucket = tlBuckets[0] || {};
+  check(
+    'a boundary-day email lands in the first bucket, not the void',
+    tlFirstBucket.date === tlKeyFmt.format(tlStart) && (tlFirstBucket.count || 0) >= 1,
+    JSON.stringify(tlFirstBucket)
+  );
+
   console.log('\nS-11/S-17: permission consistency');
   // A Head can see linked accounts on /status, so it must be able to disconnect
   // one. 404 (no such account) proves the route is reachable; 403 is the bug.
@@ -1416,6 +1559,10 @@ const main = async () => {
 
   // Cleanup of the fixtures created above.
   await SlaPolicy.deleteMany({});
+  // Tasks the audit-D2 bulk-assign created (one carries the 'Unassigned'
+  // sentinel, so the name-based cleanup below would miss it).
+  const smokeEmailIds = (await Email.find({ messageId: /^smoke-/ }).select('_id').lean()).map((e) => e._id);
+  await Task.deleteMany({ linkedEmail: { $in: smokeEmailIds } });
   // Covers the F-3 fixture (`smoke-ai-hostile`) too.
   await Email.deleteMany({ messageId: /^smoke-/ });
   await Task.deleteMany({ clientName: { $in: ['Smoke Client', 'Smoke Pref Client', slaClient] } });
