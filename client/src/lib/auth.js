@@ -8,7 +8,14 @@
  *
  * Token transport stays in localStorage for this wave; when the backend moves
  * to httpOnly cookies only this file changes.
+ *
+ * It is also where the in-memory query cache is bound to the signed-in user:
+ * every write below re-points (and therefore empties) the cache, so the
+ * `cached_*` teardown and the query-cache teardown are one code path rather
+ * than two that can drift apart. See lib/queryCache.js.
  */
+
+import { clearCache, setCacheOwner } from './queryCache'
 
 const TOKEN_KEY = 'token'
 const USER_KEY = 'user'
@@ -102,6 +109,7 @@ export function getUser() {
 export function setUser(user) {
   if (user) safeSet(USER_KEY, JSON.stringify(user))
   else safeRemove(USER_KEY)
+  syncCacheOwner()
   emit()
 }
 
@@ -109,7 +117,19 @@ export function setUser(user) {
 export function setSession({ token, user }) {
   if (token) safeSet(TOKEN_KEY, token)
   if (user) safeSet(USER_KEY, JSON.stringify(user))
+  syncCacheOwner()
   emit()
+}
+
+/**
+ * Re-point the in-memory query cache at whoever is stored right now.
+ * A change of user id empties it; the same id is a no-op.
+ *
+ * Called synchronously from every session write here, and from `AuthProvider`
+ * as a backstop for the cross-tab `storage` event.
+ */
+export function syncCacheOwner() {
+  setCacheOwner(getUser()?._id ?? null)
 }
 
 export function isAuthenticated() {
@@ -130,9 +150,13 @@ export const isAdmin = (user = getUser()) => hasRole('Admin', user)
 export const isHead = (user = getUser()) => hasRole('Head', user)
 export const isEmployee = (user = getUser()) => hasRole('Employee', user)
 
-/** Remove every per-user cache without touching the session. */
+/**
+ * Remove every per-user cache without touching the session — the legacy
+ * `cached_*` localStorage keys AND the in-memory query cache.
+ */
 export function clearCaches() {
   CACHE_KEYS.forEach(safeRemove)
+  clearCache()
 }
 
 /**
@@ -144,6 +168,10 @@ export function clearSession() {
   safeRemove(TOKEN_KEY)
   safeRemove(USER_KEY)
   clearCaches()
+  // Order matters: the user is already gone from storage, so this settles the
+  // cache owner to null and empties it a second time. Cheap, and it means a
+  // future signed-in write cannot inherit the previous owner.
+  syncCacheOwner()
   emit()
 }
 
@@ -159,5 +187,9 @@ export function subscribe(listener) {
     window.removeEventListener('storage', listener)
   }
 }
+
+/* Bind the query cache on first import, so a reload with an existing session
+ * has an owner before the first response comes back. */
+syncCacheOwner()
 
 export { AUTH_EVENT, TOKEN_KEY, USER_KEY }

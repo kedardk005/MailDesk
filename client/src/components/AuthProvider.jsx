@@ -28,6 +28,16 @@ export function AuthProvider({ children }) {
     })
   }, [])
 
+  /* Backstop for the in-memory query cache. The session writers in lib/auth.js
+   * already re-point it synchronously; this covers the paths that change the
+   * user without going through them — chiefly another tab signing in as
+   * somebody else, which reaches us as a `storage` event. Re-pointing the cache
+   * at a different id empties it, so cached rows can never outlive the switch. */
+  const userId = user?._id ?? null
+  useEffect(() => {
+    authStore.syncCacheOwner()
+  }, [userId])
+
   const setUser = useCallback((next) => {
     // Accept an updater function like useState.
     setUserState((prev) => {

@@ -36,6 +36,7 @@ import {
   X,
 } from 'lucide-react'
 import api, { getErrorMessage, isCanceled } from '../api/axios'
+import { useCachedQuery } from '../lib/useCachedQuery'
 import { useAuth } from '../components/AuthProvider'
 import { useRegisterCommands } from '../components/CommandRegistry'
 import EmailBody from '../components/EmailBody'
@@ -339,48 +340,38 @@ function useQueryState() {
 /**
  * @param {object} params memoised request params — every fetch is aborted on
  *   change, so the five refetch paths can never race each other.
+ *
+ * Backed by the shared query cache (lib/queryCache.js), so returning to /tasks
+ * with the same filters inside the TTL paints from memory and issues no
+ * request at all. Any task mutation, and any task-shaped notification arriving
+ * over the socket, drops the entry and this refetches.
  */
 function useTaskQuery(params) {
-  const [result, setResult] = useState({ rows: [], total: 0, loading: true, error: null })
-  const [nonce, setNonce] = useState(0)
+  const { data, error, loading, refetch, patch } = useCachedQuery('/tasks', params, {
+    failureMessage: 'Could not load tasks.',
+  })
 
-  useEffect(() => {
-    const ctrl = new AbortController()
-    let alive = true
-    ;(async () => {
-      setResult((prev) => ({ ...prev, loading: true, error: null }))
-      try {
-        const res = await api.get('/tasks', { params, signal: ctrl.signal })
-        if (!alive) return
-        const { data, pagination } = unwrapList(res.data)
-        if (pagination) {
-          setResult({ rows: data, total: pagination.total ?? data.length, loading: false, error: null })
-        } else {
-          const { rows, total } = applyLegacyQuery(data, params)
-          setResult({ rows, total, loading: false, error: null })
-        }
-      } catch (err) {
-        if (!alive || isCanceled(err)) return
-        setResult({ rows: [], total: 0, loading: false, error: getErrorMessage(err) })
-      }
-    })()
-    return () => {
-      alive = false
-      ctrl.abort()
-    }
-  }, [params, nonce])
-
-  const reload = useCallback(() => setNonce((n) => n + 1), [])
+  const { rows, total } = useMemo(() => {
+    if (!data) return { rows: [], total: 0 }
+    const { data: list, pagination } = unwrapList(data)
+    if (pagination) return { rows: list, total: pagination.total ?? list.length }
+    return applyLegacyQuery(list, params)
+  }, [data, params])
 
   /** Merge a partial into exactly one row — never restores a whole snapshot. */
-  const patchRow = useCallback((taskId, partial) => {
-    setResult((prev) => ({
-      ...prev,
-      rows: prev.rows.map((t) => (t._id === taskId ? { ...t, ...partial } : t)),
-    }))
-  }, [])
+  const patchRow = useCallback(
+    (taskId, partial) => {
+      patch((payload) => {
+        const apply = (list) => list.map((t) => (t._id === taskId ? { ...t, ...partial } : t))
+        if (Array.isArray(payload)) return apply(payload)
+        if (payload && Array.isArray(payload.data)) return { ...payload, data: apply(payload.data) }
+        return payload
+      })
+    },
+    [patch]
+  )
 
-  return { ...result, reload, patchRow }
+  return { rows, total, loading, error, reload: refetch, patchRow }
 }
 
 /**
@@ -389,38 +380,35 @@ function useTaskQuery(params) {
  * they search the server as you type (see lib/pickers.js), so the linkable
  * email preload this hook used to make is gone entirely.
  */
+const USER_OPTION_PARAMS = { page: 1, limit: 100, sort: 'name' }
+
 function useTaskOptions(canAssign) {
-  const [options, setOptions] = useState({ clients: [], users: [] })
-  const [nonce, setNonce] = useState(0)
+  // Two cached reads rather than one Promise.all: they invalidate on different
+  // events (a client write vs. a user write) and both are long-lived, so the
+  // dropdowns survive every navigation between Tasks and anywhere else.
+  const clientsQuery = useCachedQuery('/tasks/clients')
+  const usersQuery = useCachedQuery('/users', USER_OPTION_PARAMS, { enabled: canAssign })
 
-  useEffect(() => {
-    const ctrl = new AbortController()
-    let alive = true
-    ;(async () => {
-      const get = (url, params) =>
-        api
-          .get(url, { params, signal: ctrl.signal })
-          .then((r) => unwrapList(r.data).data)
-          .catch(() => [])
+  const clientsData = clientsQuery.data
+  const usersData = usersQuery.data
+  const reloadClients = clientsQuery.refetch
+  const reloadUsers = usersQuery.refetch
 
-      const [clients, users] = await Promise.all([
-        get('/tasks/clients'),
-        canAssign ? get('/users', { page: 1, limit: 100, sort: 'name' }) : Promise.resolve([]),
-      ])
-      if (!alive) return
-      setOptions({
-        clients,
-        users: users.filter((u) => !u.status || u.status === 'Approved'),
-      })
-    })()
-    return () => {
-      alive = false
-      ctrl.abort()
-    }
-  }, [canAssign, nonce])
+  const reload = useCallback(() => {
+    reloadClients()
+    reloadUsers()
+  }, [reloadClients, reloadUsers])
 
-  const reload = useCallback(() => setNonce((n) => n + 1), [])
-  return useMemo(() => ({ ...options, reload }), [options, reload])
+  return useMemo(
+    () => ({
+      clients: clientsData ? unwrapList(clientsData).data : [],
+      users: usersData
+        ? unwrapList(usersData).data.filter((u) => !u.status || u.status === 'Approved')
+        : [],
+      reload,
+    }),
+    [clientsData, usersData, reload]
+  )
 }
 
 /* -------------------------------------------------------------------------- */

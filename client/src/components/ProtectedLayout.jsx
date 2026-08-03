@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { Outlet, useLocation, useNavigate } from 'react-router-dom'
 import api from '../api/axios'
+import { invalidateForSocketEvent } from '../lib/queryCache'
 import { getSocket, isAuthHandshakeError } from '../lib/socket'
 import { useAuth } from './AuthProvider'
 import { CommandPalette } from './CommandPalette'
@@ -153,18 +154,38 @@ export function ProtectedLayout() {
 
     /* Optional server-pushed signals. Harmless if the server never emits them —
      * the handshake rejection and the 5-minute poll already cover the cases. */
-    const onSessionInvalidated = () =>
+    const onSessionInvalidated = () => {
+      invalidateForSocketEvent('session:invalidated')
       forceSignOut('Your session was ended. Please sign in again.')
-    const onUserUpdated = () => syncSession()
+    }
+    const onUserUpdated = () => {
+      invalidateForSocketEvent('user:updated')
+      syncSession()
+    }
+
+    /* Query-cache freshness. The server writes a notification only when
+     * something the recipient can see changed, so its `type` is the app's
+     * cheapest "your lists are stale now" signal — a task assigned to you from
+     * another browser drops the cached task pages here, and any mounted page
+     * refetches. Mounted once in the shell, so it is independent of whether the
+     * bell is open. The mapping lives in lib/queryCache.js.
+     *
+     * Subscribed here IN ADDITION to NotificationBell's own `newNotification`
+     * handler: the bell owns its list, this owns the cache. */
+    const onNewNotification = (notification) => {
+      invalidateForSocketEvent('newNotification', notification)
+    }
 
     socket.on('connect_error', onConnectError)
     socket.on('session:invalidated', onSessionInvalidated)
     socket.on('user:updated', onUserUpdated)
+    socket.on('newNotification', onNewNotification)
 
     return () => {
       socket.off('connect_error', onConnectError)
       socket.off('session:invalidated', onSessionInvalidated)
       socket.off('user:updated', onUserUpdated)
+      socket.off('newNotification', onNewNotification)
     }
   }, [syncSession, forceSignOut])
 

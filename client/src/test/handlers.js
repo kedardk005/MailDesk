@@ -181,6 +181,7 @@ export const handlers = [
   http.delete(`${API}/clients/:id`, () => HttpResponse.json({ success: true })),
 
   /* ---- notifications --------------------------------------------------- */
+  http.get(`${API}/notifications/unread-count`, () => HttpResponse.json({ count: 0 })),
   http.get(`${API}/notifications`, () => emptyList()),
   http.put(`${API}/notifications/read-all`, () => HttpResponse.json({ success: true })),
   http.put(`${API}/notifications/:id/read`, () => HttpResponse.json({ success: true })),

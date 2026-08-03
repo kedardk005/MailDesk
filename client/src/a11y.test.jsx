@@ -21,6 +21,7 @@ import { describe, expect, it } from 'vitest'
 
 import ClientList from './pages/ClientList'
 import Login from './pages/Login'
+import NotificationBell from './components/NotificationBell'
 import { Button } from './components/ui/Button'
 import { DataTable } from './components/ui/DataTable'
 import { Dialog, DialogContent } from './components/ui/Dialog'
@@ -184,6 +185,72 @@ describe('a11y — an open Dialog', () => {
 
     // The dialog is portalled outside the render container.
     await check(document.body)
+  })
+})
+
+describe('a11y — the notification centre', () => {
+  const ROWS = [
+    {
+      _id: 'n1',
+      type: 'task_assigned',
+      message: 'New task assigned: Q3 GST filing',
+      taskId: 't1',
+      read: false,
+      createdAt: new Date().toISOString(),
+    },
+    {
+      _id: 'n2',
+      type: 'task_overdue',
+      message: 'Task overdue: Renew trade licence',
+      taskId: 't2',
+      read: true,
+      createdAt: new Date(Date.now() - 3 * 86_400_000).toISOString(),
+    },
+  ]
+
+  it('has no violations with the popover open, and does not take focus on mount', async () => {
+    seedSession()
+    server.use(
+      http.get(`${API}/notifications/unread-count`, () => HttpResponse.json({ count: 1 })),
+      http.get(`${API}/notifications`, () => HttpResponse.json(listResponse(ROWS, { total: 2 })))
+    )
+
+    const { user } = renderWithProviders(
+      <main>
+        <NotificationBell />
+      </main>
+    )
+
+    const trigger = await screen.findByRole('button', { name: 'Notifications, 1 unread' })
+    // A live arrival must never steal focus from whatever the user is doing.
+    expect(document.body).toHaveFocus()
+
+    await user.click(trigger)
+    await screen.findByRole('heading', { name: 'Notifications' })
+
+    // Portalled outside the render container, like the Dialog above.
+    await check(document.body)
+  })
+
+  it('closes on Escape and returns focus to the trigger', async () => {
+    seedSession()
+    server.use(
+      http.get(`${API}/notifications/unread-count`, () => HttpResponse.json({ count: 0 })),
+      http.get(`${API}/notifications`, () => HttpResponse.json(listResponse(ROWS, { total: 2 })))
+    )
+
+    const { user } = renderWithProviders(<NotificationBell />)
+    const trigger = await screen.findByRole('button', { name: 'Notifications, none unread' })
+
+    await user.click(trigger)
+    await screen.findByRole('heading', { name: 'Notifications' })
+
+    await user.keyboard('{Escape}')
+
+    await waitFor(() =>
+      expect(screen.queryByRole('heading', { name: 'Notifications' })).not.toBeInTheDocument()
+    )
+    expect(trigger).toHaveFocus()
   })
 })
 
