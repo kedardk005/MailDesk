@@ -38,7 +38,7 @@ export function DialogOverlay({ className, ...props }) {
   return (
     <RadixDialog.Overlay
       className={cn(
-        'fixed inset-0 z-modal bg-[rgb(15_23_42/0.45)]',
+        'fixed inset-0 z-overlay bg-[rgb(15_23_42/0.45)]',
         'data-[state=open]:animate-overlay-in data-[state=closed]:animate-overlay-out',
         className
       )}
