@@ -98,6 +98,27 @@ app.use(express.json({ limit: process.env.JSON_BODY_LIMIT || '1mb' }));
 // a getter that re-parses req.url on every access.
 app.use(mongoKeyGuard);
 
+/*
+ * Every /api response is scoped to the caller, so none of them may be reused
+ * for a different Authorization header.
+ *
+ * Several read endpoints send `Cache-Control: private, max-age=…,
+ * stale-while-revalidate=…` to stop the browser re-asking on every mount. That
+ * is correct, but `private` only excludes SHARED caches — the browser's own
+ * cache is a private cache, and without `Vary: Authorization` it happily
+ * reuses one user's entry for the next. Observed: signing out of Admin and in
+ * as Head inside the same browser rendered the Admin's workspace-wide SLA
+ * backlog (220) on the Head's dashboard, whose real figure is 62.
+ *
+ * `res.vary()` appends, so the existing `Origin, Accept-Encoding` is kept.
+ * Applied globally rather than at the two call sites that cache today, so an
+ * endpoint that starts caching tomorrow is covered by construction.
+ */
+app.use('/api', (req, res, next) => {
+  res.vary('Authorization');
+  next();
+});
+
 // Apply Limiters to routes
 app.use('/api', generalLimiter);
 app.use('/api/auth/login', authLimiter);

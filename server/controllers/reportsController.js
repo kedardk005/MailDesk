@@ -10,6 +10,7 @@ const { getEffectivePolicies, targetMsExpr } = require('../utils/slaPolicy');
 const { businessWindows, elapsedMsExpr } = require('../utils/slaCalendar');
 const { toObjectId } = require('../utils/threadHelper');
 const { firstString } = require('../utils/paginate');
+const { zonedWallClockToUtc } = require('../utils/dateHelper');
 const { log } = require('../utils/logger');
 
 const logger = log('reports');
@@ -226,9 +227,36 @@ exports.getOverallStats = async (req, res) => {
 const TIMEZONE = process.env.APP_TIMEZONE || 'Asia/Kolkata';
 
 /**
+ * UTC instant of local midnight (start of day) in APP_TIMEZONE for the day
+ * containing `ms`. Used to pin the aggregation `$match` window to the exact
+ * span the bucket keys cover.
+ * @param {Number} ms - epoch milliseconds of any instant in the target day
+ * @returns {Date}
+ */
+const startOfZonedDay = (ms) => {
+  const keyFormatter = new Intl.DateTimeFormat('en-CA', {
+    timeZone: TIMEZONE,
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit'
+  });
+  const [year, month, day] = keyFormatter.format(new Date(ms)).split('-').map(Number);
+  return zonedWallClockToUtc(year, month, day, 0, 0, 0, 0, TIMEZONE);
+};
+
+/**
  * Build a zero-filled day bucket list in APP_TIMEZONE, newest last.
+ *
+ * `startDate`/`endDate` delimit EXACTLY the instants whose APP_TIMEZONE day
+ * key is one of `dates` — `[startDate, endDate)`. The `$match` in every
+ * consumer must use both bounds, or rows just outside the key list are counted
+ * by the aggregation and then silently dropped when the JS mapping finds no
+ * bucket for their key (audit D7: 7 boundary-day emails vanished from the
+ * 90-day timeline because the lower bound was `now - (days+1) * 24h`, a
+ * partial day before the first bucket's local midnight).
+ *
  * @param {Number} days
- * @returns {{dates: String[], labels: Object, startDate: Date}}
+ * @returns {{dates: String[], labels: Object, startDate: Date, endDate: Date}}
  */
 const buildDayBuckets = (days) => {
   // 'en-CA' formats as YYYY-MM-DD, matching $dateToString's '%Y-%m-%d'.
@@ -255,11 +283,15 @@ const buildDayBuckets = (days) => {
     labels[key] = labelFormatter.format(d);
   }
 
-  // One extra day of slack on the lower bound so no bucket can be clipped by
-  // the UTC/zone offset. Rows outside the key list are simply ignored.
-  const startDate = new Date(now - days * 86400000);
+  // The exact instants the keys above cover: local midnight (APP_TIMEZONE) of
+  // the OLDEST bucket day, up to but not including local midnight of the day
+  // AFTER the newest bucket day. The previous lower bound ("one day of slack",
+  // `now - days * 24h`) let the aggregation match a partial day whose key was
+  // not in the list, so those rows were counted and then dropped.
+  const startDate = startOfZonedDay(now - (days - 1) * 86400000);
+  const endDate = startOfZonedDay(now + 86400000);
 
-  return { dates, labels, startDate };
+  return { dates, labels, startDate, endDate };
 };
 
 /**
@@ -314,9 +346,11 @@ exports.getTaskTimeline = async (req, res) => {
       cache.KEYS.report('task-timeline', '30d', scopeKey(req.user)),
       cache.TTL.report,
       async () => {
-        const { dates, startDate } = buildDayBuckets(30);
+        const { dates, startDate, endDate } = buildDayBuckets(30);
 
-        const match = { createdAt: { $gte: startDate } };
+        // Both bounds, so the match window is exactly the bucket key span
+        // (see buildDayBuckets — audit D7).
+        const match = { createdAt: { $gte: startDate, $lt: endDate } };
         if (req.user.role === 'Head') match.createdBy = toObjectId(req.user._id);
 
         // Was: `Task.find(taskQuery)` returning full documents (including
@@ -351,18 +385,21 @@ exports.getTaskTimeline = async (req, res) => {
 exports.getClientStats = async (req, res) => {
   try {
     const payload = await cache.wrap(
-      cache.KEYS.report('client-stats', 'all', 'all'),
+      // Scoped per caller (audit D5): a Head's numbers are their own slice, so
+      // the cache entry must be theirs too — `scopeKey` is 'all' for Admin.
+      cache.KEYS.report('client-stats', 'all', scopeKey(req.user)),
       cache.TTL.report,
       async () => {
         // Was: THREE `countDocuments` PER CLIENT, every one an unindexed regex
         // scan. At 50 clients, 100k emails and 20k tasks that is 150 sequential
         // queries and roughly 7 million document examinations per request.
         //
-        // Now: two cached `$group` aggregations shared with the client list.
+        // Now: two cached `$group` aggregations shared with the client list,
+        // scoped to what the caller may actually access (audit D5).
         const [clients, taskCounts, mailCounts] = await Promise.all([
           Client.find({}).select('name associatedEmails').sort({ name: 1 }).limit(1000).lean(),
-          getTaskCountsByClient(),
-          getMailCountsByClient()
+          getTaskCountsByClient(req.user),
+          getMailCountsByClient(req.user)
         ]);
 
         return clients.map((client) => {
@@ -406,11 +443,13 @@ exports.getEmailTimeline = async (req, res) => {
       cache.KEYS.report('email-timeline', `${days}d`, scopeKey(req.user)),
       cache.TTL.report,
       async () => {
-        const { dates, labels, startDate } = buildDayBuckets(days);
+        const { dates, labels, startDate, endDate } = buildDayBuckets(days);
 
         // "Emails received", so outbound replies (F-1) are excluded and this
         // chart reports exactly what it reported before threading existed.
-        const match = { date: { $gte: startDate }, deletedAt: null, direction: { $ne: 'outbound' } };
+        // Both date bounds, so the match window is exactly the bucket key span
+        // and every matched email lands in exactly one bucket (audit D7).
+        const match = { date: { $gte: startDate, $lt: endDate }, deletedAt: null, direction: { $ne: 'outbound' } };
         if (req.user.role === 'Head') match.fetchedBy = toObjectId(req.user._id);
 
         const rows = await Email.aggregate([

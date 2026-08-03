@@ -537,7 +537,8 @@ exports.getClients = async (req, res) => {
       defaultSort: 'name'
     });
 
-    const { data, pagination } = await listClients(params);
+    // Counters scoped to the caller, same as GET /api/clients (audit D5).
+    const { data, pagination } = await listClients(params, { user: req.user });
 
     res.set('Cache-Control', 'private, max-age=30, stale-while-revalidate=60');
 

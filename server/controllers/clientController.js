@@ -25,7 +25,9 @@ const getClients = async (req, res) => {
       defaultSort: '-createdAt'
     });
 
-    const { data, pagination } = await listClients(params);
+    // Counters are scoped to the caller (audit D5): a Head sees the counts for
+    // the mail/tasks THEY can open, not workspace-wide volumes.
+    const { data, pagination } = await listClients(params, { user: req.user });
 
     // Client lists change rarely; let the browser revalidate instead of
     // re-running the aggregation on every dashboard mount.
