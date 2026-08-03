@@ -8,24 +8,36 @@ import { controlVariants } from './Input'
  * Native <select>. Use this for <= 10 flat options — it is faster, works on
  * mobile, and needs no portal.
  *
+ * `className` sizes the WRAPPER, not the <select>. The chevron is absolutely
+ * positioned against the wrapper, so if a width lands on the <select> while the
+ * wrapper stays full-width, the chevron detaches and floats to the right of the
+ * control — which is exactly what every `className="w-[140px]"` caller used to
+ * render. The <select> now always fills its wrapper, so one width class styles
+ * both and they can no longer disagree.
+ *
+ * Use `selectClassName` for the rare case of styling the <select> itself.
+ *
  * @param {Array<{value:string,label:string,disabled?:boolean}>} [options]
  * @param {string} [placeholder] - rendered as a disabled empty-value option
  * @param {'sm'|'md'|'lg'} [size='md']
  * @param {boolean} [invalid]
+ * @param {string} [className] - wrapper classes (width/layout)
+ * @param {string} [selectClassName] - classes for the <select> element
  */
 export const Select = forwardRef(function Select(
-  { className, size = 'md', invalid = false, options, placeholder, children, ...props },
+  { className, selectClassName, size = 'md', invalid = false, options, placeholder, children, ...props },
   ref
 ) {
   return (
-    <div className="relative w-full">
+    // tailwind-merge lets a caller's `w-[140px]` override this `w-full`.
+    <div className={cn('relative w-full', className)}>
       <select
         ref={ref}
         aria-invalid={invalid || undefined}
         className={cn(
           controlVariants({ size, invalid }),
-          'appearance-none bg-none pr-8',
-          className
+          'w-full appearance-none bg-none pr-8',
+          selectClassName
         )}
         {...props}
       >
