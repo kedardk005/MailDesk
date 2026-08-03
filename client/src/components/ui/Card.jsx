@@ -104,7 +104,12 @@ export function CardFooter({ className, children, ...props }) {
  * @param {React.ReactNode} value - already formatted (use formatNumber)
  * @param {{value:string, direction:'up'|'down'|'flat', tone?:'success'|'danger'|'neutral'}} [delta]
  * @param {string} [hint]
- * @param {'default'|'danger'} [tone] - `danger` renders the value in danger text
+ * @param {'default'|'danger'|'warning'|'success'|'primary'} [tone] - colours the
+ *        VALUE only (label and hint stay neutral). Use `danger` for breaches and
+ *        overdue counts, `warning` for due-today, `success` for healthy/completed
+ *        counts, `primary` for counts awaiting the user's action. Default stays
+ *        neutral — colour marks the exception, so tiles whose count is 0 must
+ *        pass `default`.
  * @param {React.ElementType|React.ReactNode} [icon] - a lucide COMPONENT
  *        (`icon={Inbox}`) or a ready-made element. Rendered inline beside the
  *        label at 14px, never in a coloured tile.
@@ -161,7 +166,15 @@ export function StatTile({
       <p
         className={cn(
           'mt-1 text-2xl font-semibold tabular',
-          tone === 'danger' ? 'text-danger-text' : 'text-fg'
+          tone === 'danger'
+            ? 'text-danger-text'
+            : tone === 'warning'
+              ? 'text-warning-text'
+              : tone === 'success'
+                ? 'text-success-text'
+                : tone === 'primary'
+                  ? 'text-primary-text'
+                  : 'text-fg'
         )}
       >
         {value}

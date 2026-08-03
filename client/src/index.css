@@ -19,21 +19,27 @@
  * ========================================================================= */
 @layer base {
   :root {
-    /* surfaces */
-    --bg-canvas: 248 250 252;      /* #F8FAFC */
+    /* surfaces — the canvas is deliberately darker than the surface so cards,
+     * tables and panels visibly sit ON the page instead of merging into one
+     * white sheet (#FFFFFF on #F8FAFC was 1.05:1 — invisible).
+     *   surface #FFFFFF on canvas #EAEFF5 = 1.16:1 (visible, calm step)
+     *   subtle  #EEF2F7 on surface        = 1.12:1 (hover / header rows)   */
+    --bg-canvas: 234 239 245;      /* #EAEFF5 */
     --bg-surface: 255 255 255;     /* #FFFFFF */
-    --bg-subtle: 241 245 249;      /* #F1F5F9 */
+    --bg-subtle: 238 242 247;      /* #EEF2F7 */
     --bg-muted: 226 232 240;       /* #E2E8F0 */
 
-    /* borders */
-    --border-default: 226 232 240; /* #E2E8F0 */
-    --border-strong: 203 213 225;  /* #CBD5E1 */
+    /* borders — previous default #E2E8F0 was 1.23:1 on white and carried no
+     * separation; each step is promoted one notch. */
+    --border-default: 203 213 225; /* #CBD5E1  1.48:1 on surface */
+    --border-strong: 148 163 184;  /* #94A3B8  2.56:1 on surface */
 
-    /* text */
-    --text-primary: 15 23 42;      /* #0F172A */
-    --text-secondary: 71 85 105;   /* #475569 */
-    --text-tertiary: 100 116 139;  /* #64748B  4.76:1 — passes AA */
-    --text-disabled: 148 163 184;  /* #94A3B8  disabled ONLY */
+    /* text — ratios are computed on surface #FFFFFF / canvas #EAEFF5 */
+    --text-primary: 15 23 42;      /* #0F172A  17.85:1 / 15.44:1 — AAA */
+    --text-secondary: 71 85 105;   /* #475569   7.58:1 /  6.55:1 — AAA on surface */
+    --text-tertiary: 84 98 116;    /* #546274   6.22:1 /  5.38:1 — AA everywhere
+                                      (was #64748B: 4.12:1 on the new canvas)  */
+    --text-disabled: 148 163 184;  /* #94A3B8  disabled/placeholder/decorative ONLY */
     --text-inverse: 255 255 255;
 
     /* primary — blue */
@@ -49,26 +55,27 @@
     --primary-border: 191 219 254;
     --primary-text: 29 78 216;
 
-    /* semantic */
+    /* semantic — the `-text` shades are dark enough to sit on white, canvas
+     * OR their own tinted bg. Ratios: on surface / on canvas / on own bg. */
     --success: 22 163 74;          /* #16A34A */
     --success-bg: 240 253 244;     /* #F0FDF4 */
     --success-border: 187 247 208; /* #BBF7D0 */
-    --success-text: 21 128 61;     /* #15803D */
+    --success-text: 22 101 52;     /* #166534  7.13 / 6.17 / 6.81 */
 
     --warning: 217 119 6;          /* #D97706 */
     --warning-bg: 255 251 235;     /* #FFFBEB */
     --warning-border: 253 230 138; /* #FDE68A */
-    --warning-text: 180 83 9;      /* #B45309 */
+    --warning-text: 146 64 14;     /* #92400E  7.09 / 6.13 / 6.84 */
 
     --danger: 220 38 38;           /* #DC2626 */
     --danger-bg: 254 242 242;      /* #FEF2F2 */
     --danger-border: 254 202 202;  /* #FECACA */
-    --danger-text: 185 28 28;      /* #B91C1C */
+    --danger-text: 153 27 27;      /* #991B1B  8.31 / 7.19 / 7.60 */
 
     --info: 2 132 199;             /* #0284C7 */
     --info-bg: 240 249 255;        /* #F0F9FF */
     --info-border: 186 230 253;    /* #BAE6FD */
-    --info-text: 3 105 161;        /* #0369A1 */
+    --info-text: 7 89 133;         /* #075985  7.56 / 6.54 / 7.09 */
 
     --neutral: 100 116 139;        /* #64748B */
     --neutral-bg: 241 245 249;     /* #F1F5F9 */

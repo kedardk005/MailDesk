@@ -426,13 +426,27 @@ function useTaskOptions(canAssign) {
 /* Small presentational pieces                                                 */
 /* -------------------------------------------------------------------------- */
 
+/* Three at-a-glance states, never by hue alone — the text itself differs too
+ * ("Overdue 3h" / "in 2h" / "in 4d"): overdue → danger, due today → warning,
+ * future → neutral. Completed tasks stay neutral regardless of date. */
 function DueCell({ task, now }) {
   const d = toDate(task.deadline)
   if (!d) return <span className="text-fg-off">—</span>
-  const overdue = d.getTime() < now && task.status !== 'Completed'
+  const completed = task.status === 'Completed'
+  const overdue = d.getTime() < now && !completed
+  const dueToday = !overdue && !completed && d.toDateString() === new Date(now).toDateString()
   return (
     <Tooltip content={formatAbsolute(task.deadline)}>
-      <span className={cn('tabular text-sm', overdue ? 'font-medium text-danger-text' : 'text-fg-2')}>
+      <span
+        className={cn(
+          'tabular text-sm',
+          overdue
+            ? 'font-medium text-danger-text'
+            : dueToday
+              ? 'font-medium text-warning-text'
+              : 'text-fg-2'
+        )}
+      >
         {relativeDue(task.deadline, now, overdue)}
       </span>
     </Tooltip>
@@ -440,7 +454,8 @@ function DueCell({ task, now }) {
 }
 
 function AssigneeCell({ user }) {
-  if (!user) return <span className="text-fg-off">Unassigned</span>
+  /* Real information, not a disabled state — `fg-off` (2.56:1) was illegible. */
+  if (!user) return <span className="text-fg-3">Unassigned</span>
   return (
     <span className="flex min-w-0 items-center gap-2">
       <Avatar size="xs" name={user.name} id={user._id} />
