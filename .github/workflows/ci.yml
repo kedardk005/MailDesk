@@ -4,9 +4,14 @@ name: CI
 # on the app's primary screen was committed and survived. ESLint catches it in
 # under a second, so lint is a required, blocking job here.
 
+# Runs on EVERY pushed branch. An earlier revision listed
+# [main, "feat/**", "fix/**"], which silently skipped branches named after a
+# person (e.g. `darshan`) — the push succeeded and no run appeared, which reads
+# as "CI passed" when in fact CI never ran. A branch filter that quietly does
+# nothing is worse than no filter.
 on:
   push:
-    branches: [main, "feat/**", "fix/**"]
+    branches: ["**"]
   pull_request:
     branches: [main]
 
