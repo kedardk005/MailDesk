@@ -2,6 +2,7 @@ import axios from 'axios'
 import { toast } from 'sonner'
 import { API_URL } from '../lib/config'
 import { getToken, clearSession } from '../lib/auth'
+import { invalidateForMutation } from '../lib/queryCache'
 
 /**
  * Shared API client.
@@ -72,7 +73,19 @@ function retryAfterText(headers) {
 }
 
 api.interceptors.response.use(
-  (response) => response,
+  (response) => {
+    /*
+     * Cache invalidation on mutation, in ONE place.
+     *
+     * Every successful POST/PUT/PATCH/DELETE drops the query-cache entries its
+     * URL affects (the matrix lives in lib/queryCache.js), so creating,
+     * editing or deleting a task makes the task lists refetch immediately
+     * instead of waiting out a TTL — and no mutation call site has to remember
+     * to say so. 40+ call sites; a per-site convention would have been missed.
+     */
+    invalidateForMutation(response.config?.method, response.config?.url)
+    return response
+  },
   (error) => {
     // Request cancelled via AbortController / CancelToken — never user-facing.
     if (axios.isCancel?.(error) || error?.code === 'ERR_CANCELED') {

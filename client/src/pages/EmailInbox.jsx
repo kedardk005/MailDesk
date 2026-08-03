@@ -108,6 +108,7 @@ import {
 } from '../components/ui'
 import { searchAssignees } from '../lib/pickers'
 import { getSocket } from '../lib/socket'
+import { useCachedQuery } from '../lib/useCachedQuery'
 import { cn, formatDurationMinutes, formatNumber, timeAgo } from '../lib/utils'
 import { ExtractActionsPanel } from '../components/ActionExtraction'
 
@@ -353,70 +354,49 @@ function useInboxParams() {
  * conversations; only the URL and the failure copy differ.
  */
 function useEmailList(url, paramsJson, nonce, failureMessage = 'Could not load the inbox.') {
-  const [result, setResult] = useState(null)
-  const stamp = paramsJson ? `${url}|${paramsJson}|${nonce}` : ''
-  const fresh = result?.stamp === stamp
+  // `nonce` is the page's explicit "I changed something, refetch" signal. It
+  // stays in the params-derived identity so a bump still forces a round trip,
+  // while an ordinary revisit of the same view is served from memory.
+  const params = useMemo(() => (paramsJson ? JSON.parse(paramsJson) : null), [paramsJson])
+  const { data, error, loading, refetch, patch } = useCachedQuery(url, params, {
+    enabled: Boolean(paramsJson),
+    failureMessage,
+  })
 
+  const previousNonce = useRef(nonce)
   useEffect(() => {
-    if (!paramsJson) return undefined
-    const controller = new AbortController()
-    let alive = true
+    if (previousNonce.current === nonce) return
+    previousNonce.current = nonce
+    refetch()
+  }, [nonce, refetch])
 
-    api
-      .get(url, { params: JSON.parse(paramsJson), signal: controller.signal })
-      .then((res) => {
-        if (!alive) return
-        const { rows, pagination } = readList(res.data)
-        setResult({
-          stamp,
-          rows,
-          total: pagination?.total ?? rows.length,
-          error: null,
-        })
-      })
-      .catch((err) => {
-        if (!alive || isCanceled(err)) return
-        setResult({
-          stamp,
-          rows: [],
-          total: 0,
-          error: getErrorMessage(err, failureMessage),
-        })
-      })
-
-    // Aborting the superseded request is what makes the debounced search
-    // last-QUERY-wins instead of last-RESPONSE-wins.
-    return () => {
-      alive = false
-      controller.abort()
-    }
-  }, [failureMessage, paramsJson, stamp, url])
+  const { rows, total } = useMemo(() => {
+    if (!data) return { rows: [], total: 0 }
+    const read = readList(data)
+    return { rows: read.rows, total: read.pagination?.total ?? read.rows.length }
+  }, [data])
 
   /**
    * Patch loaded rows in place. Marking mail read is a per-user relation on a
    * document the list has already fetched, so re-running the whole query (and
    * scrolling the user back to the top) to reflect one boolean would be worse
-   * than the stale row it fixes.
+   * than the stale row it fixes. The cached copy is patched too, so navigating
+   * away and back does not resurrect the pre-patch row.
    */
-  const patchRows = useCallback((ids, changes) => {
-    const wanted = new Set(ids)
-    setResult((prev) =>
-      prev
-        ? {
-            ...prev,
-            rows: prev.rows.map((row) => (wanted.has(row._id) ? { ...row, ...changes } : row)),
-          }
-        : prev
-    )
-  }, [])
+  const patchRows = useCallback(
+    (ids, changes) => {
+      const wanted = new Set(ids)
+      const apply = (list) => list.map((row) => (wanted.has(row._id) ? { ...row, ...changes } : row))
+      patch((payload) => {
+        if (Array.isArray(payload)) return apply(payload)
+        if (payload && Array.isArray(payload.data)) return { ...payload, data: apply(payload.data) }
+        return payload
+      })
+    },
+    [patch]
+  )
 
-  return {
-    rows: fresh ? result.rows : (result?.rows ?? []),
-    total: fresh ? result.total : (result?.total ?? 0),
-    error: fresh ? result.error : null,
-    loading: Boolean(paramsJson) && !fresh,
-    patchRows,
-  }
+  return { rows, total, error, loading, patchRows }
 }
 
 /** Detail fetch — the only place a body is ever loaded. */
@@ -502,31 +482,33 @@ function useThreadDetail(threadId, nonce) {
  * people are no longer preloaded here — the assign dialog searches the server
  * as you type (lib/pickers.js). */
 function useInboxAux(enabled, nonce) {
-  const [aux, setAux] = useState({ status: null, pendingApprovals: 0 })
+  /* Two cached reads instead of a Promise.allSettled pair: both are reference
+   * data that barely changes, so revisiting the inbox costs nothing, and each
+   * still fails independently (`data` stays null, exactly as the settled
+   * version left it). */
+  const statusQuery = useCachedQuery('/gmail/status')
+  const approvalsQuery = useCachedQuery('/keyword-rules/pending-approvals', null, { enabled })
 
+  const refetchStatus = statusQuery.refetch
+  const refetchApprovals = approvalsQuery.refetch
+  const previousNonce = useRef(nonce)
   useEffect(() => {
-    const controller = new AbortController()
-    let alive = true
-    const options = { signal: controller.signal }
+    if (previousNonce.current === nonce) return
+    previousNonce.current = nonce
+    refetchStatus()
+    refetchApprovals()
+  }, [nonce, refetchStatus, refetchApprovals])
 
-    Promise.allSettled([
-      api.get('/gmail/status', options),
-      enabled ? api.get('/keyword-rules/pending-approvals', options) : Promise.resolve(null),
-    ]).then(([status, approvals]) => {
-      if (!alive) return
-      setAux({
-        status: status?.value?.data ?? null,
-        pendingApprovals: approvals?.value ? readList(approvals.value.data).rows.length : 0,
-      })
-    })
+  const statusData = statusQuery.data
+  const approvalsData = approvalsQuery.data
 
-    return () => {
-      alive = false
-      controller.abort()
-    }
-  }, [enabled, nonce])
-
-  return aux
+  return useMemo(
+    () => ({
+      status: statusData ?? null,
+      pendingApprovals: approvalsData ? readList(approvalsData).rows.length : 0,
+    }),
+    [statusData, approvalsData]
+  )
 }
 
 /* -------------------------------------------------------------------------- */

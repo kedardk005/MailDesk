@@ -22,6 +22,7 @@ import {
 
 import api, { getErrorMessage, isCanceled } from '../api/axios'
 import { fetchTaskOverview } from '../lib/taskOverview'
+import { useCachedQuery } from '../lib/useCachedQuery'
 import { useAuth } from '../components/AuthProvider'
 import {
   Alert,
@@ -98,6 +99,11 @@ const EMPTY_OVERVIEW = {
   attention: { rows: [], total: 0 },
 }
 
+/* Module-level so their identity is stable and they serialise to one cache key
+ * for the whole session (see lib/queryCache.js). */
+const EVERYONE_SCOPE = { scope: 'everyone' }
+const RECENT_TASK_PARAMS = { page: 1, limit: 5, sort: '-createdAt' }
+
 function formatDue(value) {
   if (!value) return '—'
   const d = new Date(value)
@@ -134,25 +140,7 @@ export default function Dashboard() {
   const canManageMail = isAdmin || isHead
   const myId = user?._id
 
-  /* `mine` drives the tiles and the "Mine" attention list; `everyone` is the
-   * office-wide attention list Admin/Head can switch to. Both come from
-   * fetchTaskOverview, whose counts are server-side totals — never the length
-   * of a capped array (the 200-row legacy cap silently under-reported every
-   * tile for users with more tasks than the cap). */
-  const [mine, setMine] = useState(null)
-  /* { key: reloadKey it was fetched under, data: overview }. The "is it still
-   * loading" question is answered by comparing keys, so no loading flag needs
-   * to be raised synchronously inside the fetch effect. */
-  const [everyone, setEveryone] = useState(null)
-  const [recent, setRecent] = useState([])
-  const [stats, setStats] = useState(null)
-  const [gmail, setGmail] = useState({ connected: false, gmailEmail: '', linkedAccounts: [] })
-  const [approvals, setApprovals] = useState([])
-  const [sla, setSla] = useState(null)
-  const [loading, setLoading] = useState(true)
-  const [error, setError] = useState(null)
   const [syncing, setSyncing] = useState(false)
-  const [reloadKey, setReloadKey] = useState(0)
 
   const scope = searchParams.get('scope') === 'all' ? 'all' : 'mine'
 
@@ -167,87 +155,74 @@ export default function Dashboard() {
   )
 
   /* --- data ---------------------------------------------------------------
-   * One round trip, not four sequential ones. Each request is settled
-   * independently so a failing side panel never blanks the whole screen.
+   * Six independent cached reads rather than one Promise.allSettled: each
+   * panel still fails on its own (a broken side panel never blanks the screen)
+   * and each now paints from the query cache when the dashboard is revisited,
+   * so returning here inside the TTL costs zero requests instead of the eight
+   * to twenty this screen used to issue every single mount — `fetchTaskOverview`
+   * alone is three or more.
+   *
+   * The overview is cached under the synthetic tag `/tasks/overview`, so a task
+   * write (or a task-shaped notification over the socket) invalidates it by the
+   * same `/tasks` prefix rule that drops the raw lists.
    * ---------------------------------------------------------------------- */
-  useEffect(() => {
-    const ctrl = new AbortController()
-    const { signal } = ctrl
+  const mineScope = useMemo(
+    () => ({ scope: 'mine', assignedTo: canManageMail && myId ? myId : null }),
+    [canManageMail, myId]
+  )
 
-    const requests = [
-      // Tile counts + "Mine" attention. Admin/Head must ask for their own
-      // assignments explicitly; an Employee's list is already scoped by the
-      // server (and the assignedTo parameter is ignored for that role).
+  const mineQuery = useCachedQuery('/tasks/overview', mineScope, {
+    // Admin/Head must ask for their own assignments explicitly; an Employee's
+    // list is already scoped by the server (and `assignedTo` is ignored there).
+    fetcher: (signal) =>
       fetchTaskOverview({ assignedTo: canManageMail && myId ? myId : undefined, signal }),
-      // Newest five in role scope, straight from the server's -createdAt sort.
-      api.get('/tasks', { params: { page: 1, limit: 5, sort: '-createdAt' }, signal }),
-    ]
-    if (canManageMail) {
-      requests.push(
-        api.get('/reports/overall', { signal }),
-        api.get('/gmail/status', { signal }),
-        api.get('/keyword-rules/pending-approvals', { signal }),
-        // F-2. Admin and Head only; a Head is always scoped to their own
-        // mailbox and tasks by the server.
-        api.get('/reports/sla', { signal })
-      )
-    }
+    failureMessage: 'Could not load your tasks.',
+  })
 
-    Promise.allSettled(requests).then((results) => {
-      if (signal.aborted || results.some((r) => r.status === 'rejected' && isCanceled(r.reason))) {
-        return
-      }
-
-      const [mineRes, recentRes, statsRes, gmailRes, approvalRes, slaRes] = results
-
-      if (mineRes.status === 'fulfilled') {
-        setMine(mineRes.value)
-        setError(null)
-      } else {
-        setError(getErrorMessage(mineRes.reason, 'Could not load your tasks.'))
-      }
-
-      if (recentRes.status === 'fulfilled') {
-        setRecent(toList(recentRes.value.data))
-      } else if (mineRes.status === 'fulfilled') {
-        setError(getErrorMessage(recentRes.reason, 'Could not load your tasks.'))
-      }
-
-      if (statsRes?.status === 'fulfilled') setStats(statsRes.value.data)
-      if (gmailRes?.status === 'fulfilled') {
-        setGmail({
-          connected: Boolean(gmailRes.value.data?.connected),
-          gmailEmail: gmailRes.value.data?.gmailEmail || '',
-          linkedAccounts: gmailRes.value.data?.linkedAccounts || [],
-        })
-      }
-      if (approvalRes?.status === 'fulfilled') setApprovals(toList(approvalRes.value.data))
-      if (slaRes?.status === 'fulfilled') setSla(slaRes.value.data ?? null)
-
-      setLoading(false)
-    })
-
-    return () => ctrl.abort()
-  }, [canManageMail, myId, reloadKey])
+  const wantEveryone = canManageMail && scope === 'all'
 
   /* The office-wide ("Everyone") attention list is a second, wider scope that
-   * only Admin/Head can select. Fetched on demand so the common path pays for
-   * one scope, and keyed by reloadKey so Retry refreshes it too. */
-  useEffect(() => {
-    if (!canManageMail || scope !== 'all') return undefined
-    if (everyone?.key === reloadKey) return undefined // fresh enough
-    const ctrl = new AbortController()
-    fetchTaskOverview({ signal: ctrl.signal })
-      .then((data) => {
-        if (ctrl.signal.aborted) return
-        setEveryone({ key: reloadKey, data })
-      })
-      .catch((err) => {
-        if (ctrl.signal.aborted || isCanceled(err)) return
-        setError(getErrorMessage(err, 'Could not load office-wide tasks.'))
-      })
-    return () => ctrl.abort()
-  }, [canManageMail, scope, reloadKey, everyone])
+   * only Admin/Head can select. Parked until it is on screen, so the common
+   * path still pays for one scope. */
+  const everyoneQuery = useCachedQuery('/tasks/overview', EVERYONE_SCOPE, {
+    enabled: wantEveryone,
+    fetcher: (signal) => fetchTaskOverview({ signal }),
+    failureMessage: 'Could not load office-wide tasks.',
+  })
+
+  // Newest five in role scope, straight from the server's -createdAt sort.
+  const recentQuery = useCachedQuery('/tasks', RECENT_TASK_PARAMS, {
+    failureMessage: 'Could not load your tasks.',
+  })
+
+  const statsQuery = useCachedQuery('/reports/overall', null, { enabled: canManageMail })
+  const gmailQuery = useCachedQuery('/gmail/status', null, { enabled: canManageMail })
+  const approvalsQuery = useCachedQuery('/keyword-rules/pending-approvals', null, {
+    enabled: canManageMail,
+  })
+  // F-2. Admin and Head only; a Head is always scoped to their own mailbox and
+  // tasks by the server.
+  const slaQuery = useCachedQuery('/reports/sla', null, { enabled: canManageMail })
+
+  const mine = mineQuery.data
+  const recent = useMemo(() => toList(recentQuery.data), [recentQuery.data])
+  const stats = statsQuery.data ?? null
+  const approvals = useMemo(() => toList(approvalsQuery.data), [approvalsQuery.data])
+  const sla = slaQuery.data ?? null
+  const gmail = useMemo(
+    () => ({
+      connected: Boolean(gmailQuery.data?.connected),
+      gmailEmail: gmailQuery.data?.gmailEmail || '',
+      linkedAccounts: gmailQuery.data?.linkedAccounts || [],
+    }),
+    [gmailQuery.data]
+  )
+
+  /* The tiles and the "recent" list are the screen; a failure in either is the
+   * page's error. The side panels report their own absence by rendering empty. */
+  const error =
+    mineQuery.error || recentQuery.error || (wantEveryone ? everyoneQuery.error : null) || null
+  const loading = mineQuery.loading || recentQuery.loading
 
   /* The OAuth callback lands on /dashboard?gmail=connected. Acknowledge it once
    * and drop the parameter so a refresh does not re-announce it. */
@@ -259,20 +234,39 @@ export default function Dashboard() {
     setSearchParams(params, { replace: true })
   }, [searchParams, setSearchParams])
 
-  /* Loading is only ever raised from an event handler — never synchronously
-   * inside the fetch effect, which would cascade an extra render pass. */
+  /* Retry / post-sync refresh: force every panel past its cache entry. Each
+   * `refetch` is a stable useCallback, so this list is stable too. */
+  const refetchMine = mineQuery.refetch
+  const refetchEveryone = everyoneQuery.refetch
+  const refetchRecent = recentQuery.refetch
+  const refetchStats = statsQuery.refetch
+  const refetchGmail = gmailQuery.refetch
+  const refetchApprovals = approvalsQuery.refetch
+  const refetchSla = slaQuery.refetch
+
   const refresh = useCallback(() => {
-    setError(null)
-    setLoading(true)
-    setReloadKey((n) => n + 1)
-  }, [])
+    refetchMine()
+    refetchEveryone()
+    refetchRecent()
+    refetchStats()
+    refetchGmail()
+    refetchApprovals()
+    refetchSla()
+  }, [
+    refetchMine,
+    refetchEveryone,
+    refetchRecent,
+    refetchStats,
+    refetchGmail,
+    refetchApprovals,
+    refetchSla,
+  ])
 
   /* --- derived ----------------------------------------------------------- */
   const { counts } = mine ?? EMPTY_OVERVIEW
-  const wantEveryone = canManageMail && scope === 'all'
-  const attention = (wantEveryone ? everyone?.data : mine)?.attention
-    ?? EMPTY_OVERVIEW.attention
-  const attentionBusy = loading || (wantEveryone && everyone?.key !== reloadKey)
+  const attention =
+    (wantEveryone ? everyoneQuery.data : mine)?.attention ?? EMPTY_OVERVIEW.attention
+  const attentionBusy = wantEveryone ? everyoneQuery.loading : loading
 
   const accountCount = 1 + (gmail.linkedAccounts?.length || 0)
 

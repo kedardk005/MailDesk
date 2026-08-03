@@ -26,6 +26,7 @@ import {
   useConfirm,
 } from '../components/ui'
 import { formatNumber } from '../lib/utils'
+import { useCachedQuery } from '../lib/useCachedQuery'
 
 const PAGE_SIZES = [25, 50, 100]
 const DEFAULT_LIMIT = 25
@@ -187,62 +188,36 @@ export default function ClientList() {
     [updateParams]
   )
 
-  /* -- data -------------------------------------------------------------- */
-  const [raw, setRaw] = useState([])
-  const [meta, setMeta] = useState(null)
-  const [error, setError] = useState('')
-  const [reloadToken, setReloadToken] = useState(0)
+  /* -- data ----------------------------------------------------------------
+   * Served from the shared query cache: coming back to /clients with the same
+   * filters inside the TTL costs no request. A client write (or a socket event
+   * implying one) drops the entry, so the directory is never stale on purpose.
+   * -------------------------------------------------------------------- */
+  const listParams = useMemo(
+    () => ({
+      page,
+      limit,
+      sort,
+      q: q || undefined,
+      status: status === 'All' ? undefined : status,
+    }),
+    [page, limit, sort, q, status]
+  )
 
-  const reload = useCallback(() => setReloadToken((n) => n + 1), [])
+  const {
+    data: payload,
+    error,
+    loading,
+    refetch: reload,
+  } = useCachedQuery('/clients', listParams, {
+    failureMessage: 'Could not load the client directory.',
+  })
 
-  // The skeleton shows whenever the view the user asked for is not the view
-  // that finished loading. Deriving it avoids a setState in the effect body.
-  const requestKey = `${page}|${limit}|${sort}|${q}|${status}|${reloadToken}`
-  const [loadedKey, setLoadedKey] = useState(null)
-  const loading = loadedKey !== requestKey
-
-  useEffect(() => {
-    const controller = new AbortController()
-    let active = true
-
-    api
-      .get('/clients', {
-        signal: controller.signal,
-        params: {
-          page,
-          limit,
-          sort,
-          q: q || undefined,
-          status: status === 'All' ? undefined : status,
-        },
-      })
-      .then((res) => {
-        if (!active) return
-        const payload = res.data
-        const list = Array.isArray(payload)
-          ? payload
-          : Array.isArray(payload?.data)
-            ? payload.data
-            : []
-        setRaw(list)
-        setMeta(payload?.pagination || null)
-        setError('')
-      })
-      .catch((err) => {
-        if (!active || isCanceled(err)) return
-        setRaw([])
-        setMeta(null)
-        setError(getErrorMessage(err, 'Could not load the client directory.'))
-      })
-      .finally(() => {
-        if (active) setLoadedKey(requestKey)
-      })
-
-    return () => {
-      active = false
-      controller.abort()
-    }
-  }, [page, limit, sort, q, status, reloadToken, requestKey])
+  const raw = useMemo(() => {
+    if (Array.isArray(payload)) return payload
+    return Array.isArray(payload?.data) ? payload.data : []
+  }, [payload])
+  const meta = payload?.pagination || null
 
   const serverPaged = Boolean(meta)
 

@@ -12,6 +12,7 @@ import '@testing-library/jest-dom/vitest'
 import { configure } from '@testing-library/react'
 import { toHaveNoViolations } from 'jest-axe'
 import { afterAll, afterEach, beforeAll, expect, vi } from 'vitest'
+import { setCacheOwner } from '../lib/queryCache'
 import { server } from './server'
 
 expect.extend(toHaveNoViolations)
@@ -26,6 +27,14 @@ afterEach(() => {
   server.resetHandlers()
   window.localStorage.clear()
   window.sessionStorage.clear()
+  /*
+   * The query cache (src/lib/queryCache.js) is module-level and deliberately
+   * outlives a component unmount — that is the whole feature. Without this,
+   * test N+1 would render from test N's rows and never call its own MSW
+   * handler, which is exactly the false pass this suite exists to prevent.
+   * Re-pointing the owner at null empties the store.
+   */
+  setCacheOwner(null)
   document.documentElement.className = ''
   vi.clearAllTimers()
 })
