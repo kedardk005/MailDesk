@@ -596,7 +596,7 @@ function RowMenu({ email, canDelete, onOpen, onAssign, onDelete, onToggleRead })
 
 function BulkBar({ count, onAssign, onDelete, onClear, onMarkRead, marking, canDelete, deleting }) {
   return (
-    <div className="flex min-h-[44px] flex-wrap items-center justify-between gap-2 border-b border-primary-border bg-primary-subtle px-6 py-2">
+    <div className="flex min-h-[44px] shrink-0 flex-wrap items-center justify-between gap-2 border-b border-primary-border bg-primary-subtle px-6 py-2">
       <p className="text-sm font-medium text-primary-text tabular">
         {formatNumber(count)} {count === 1 ? 'email' : 'emails'} selected
       </p>
@@ -2912,7 +2912,7 @@ export default function EmailInbox() {
         />
       ) : null}
 
-      <PageBody className="space-y-3">
+      <PageBody fill className="space-y-3">
         {error ? (
           <Alert
             variant="danger"
@@ -2933,9 +2933,12 @@ export default function EmailInbox() {
           </Alert>
         ) : null}
 
-        <div ref={listRef}>
+        {/* Part of the fill chain: this wrapper must pass the height
+          * constraint through to the DataTable or the containment breaks. */}
+        <div ref={listRef} className="flex min-h-0 flex-1 flex-col">
           {threadMode ? (
             <DataTable
+              fill
               ariaLabel="Conversations"
               data={rows}
               columns={threadColumns}
@@ -2975,6 +2978,7 @@ export default function EmailInbox() {
             />
           ) : (
             <DataTable
+              fill
               ariaLabel="Workspace emails"
               data={rows}
               columns={columns}

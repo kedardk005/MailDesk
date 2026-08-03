@@ -46,6 +46,28 @@ export function ProtectedLayout() {
 
   const knownRoleRef = useRef(user?.role || null)
 
+  /* SCROLL CONTAINMENT — the document must never be a scroller inside the app.
+   *
+   * The shell below is `h-screen overflow-hidden` and `<main>` owns scrolling,
+   * yet Chromium still gives the *viewport* a scrollbar on some pages: content
+   * inside `<main>` (measured: /inbox 1378px, /profile 1648px against a 720px
+   * viewport) leaks into the document's scrollable overflow, so a wheel at the
+   * bottom of `<main>` chains to the window and drags the whole app up into a
+   * blank page. Locking overflow on <html>/<body> while the shell is mounted
+   * removes that scrollbar entirely; public pages (Landing/Login) are outside
+   * this layout and keep their normal document scrolling. */
+  useEffect(() => {
+    const html = document.documentElement
+    const prevHtml = html.style.overflow
+    const prevBody = document.body.style.overflow
+    html.style.overflow = 'hidden'
+    document.body.style.overflow = 'hidden'
+    return () => {
+      html.style.overflow = prevHtml
+      document.body.style.overflow = prevBody
+    }
+  }, [])
+
   const toggleCollapsed = useCallback(() => {
     setCollapsed((c) => {
       const next = !c
@@ -166,10 +188,14 @@ export function ProtectedLayout() {
             onToggleCollapsed={toggleCollapsed}
           />
 
-          {/* The ONLY scroll container in the app. */}
+          {/* The ONLY scroll container in the app. It is a flex column so a
+            * page can opt into scroll containment: `<PageBody fill>` takes the
+            * remaining height (`flex-1 min-h-0`) and the table body inside it
+            * becomes the scroller instead of <main>. Pages that do not opt in
+            * stack exactly as before and <main> scrolls. */}
           <main
             id="main-content"
-            className="min-w-0 flex-1 overflow-y-auto bg-canvas custom-scrollbar"
+            className="flex min-w-0 flex-1 flex-col overflow-y-auto bg-canvas custom-scrollbar"
           >
             <ErrorBoundary compact resetKey={location.pathname}>
               <Outlet />

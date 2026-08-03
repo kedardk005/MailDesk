@@ -2155,7 +2155,9 @@ export default function TaskList() {
         onClear={clearFilters}
       />
 
-      <PageBody>
+      {/* Containment applies to the list view only: Board columns and the
+        * Calendar grid keep <main> as their scroller. */}
+      <PageBody fill={query.view === 'list'}>
         {error ? (
           <Alert
             variant="danger"
@@ -2191,6 +2193,7 @@ export default function TaskList() {
               />
             ) : null}
             <DataTable
+              fill
               ariaLabel="Tasks"
               data={rows}
               columns={columns}

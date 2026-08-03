@@ -828,7 +828,7 @@ export default function ActivityLog() {
         }
       />
 
-      <PageBody>
+      <PageBody fill>
         {error ? (
           <Alert
             variant="danger"
@@ -845,6 +845,7 @@ export default function ActivityLog() {
         ) : null}
 
         <DataTable
+          fill
           ariaLabel="Activity log"
           data={rows}
           columns={columns}

@@ -942,7 +942,7 @@ export default function ManageUsers() {
         />
       ) : null}
 
-      <PageBody>
+      <PageBody fill>
         {pendingCount > 0 && statusParam !== 'Pending' ? (
           <Alert
             variant="warning"
@@ -977,6 +977,7 @@ export default function ManageUsers() {
         ) : null}
 
         <DataTable
+          fill
           ariaLabel="Users"
           data={rows}
           columns={columns}

@@ -29,7 +29,9 @@ export function PageHeader({
   return (
     <header
       className={cn(
-        'flex min-h-[56px] flex-wrap items-center justify-between gap-3 border-b border-line bg-canvas px-6 py-3',
+        /* shrink-0: <main> is a flex column; without it the wrapped header
+         * would be flex-shrunk to its min-height and overlap the content. */
+        'flex min-h-[56px] shrink-0 flex-wrap items-center justify-between gap-3 border-b border-line bg-canvas px-6 py-3',
         sticky && 'sticky top-0 z-sticky',
         className
       )}
@@ -54,7 +56,9 @@ export function Toolbar({ left, right, className, children, ...props }) {
   return (
     <div
       className={cn(
-        'flex min-h-[44px] flex-wrap items-center justify-between gap-2 border-b border-line bg-canvas px-6 py-2',
+        /* shrink-0 for the same reason as PageHeader: a toolbar whose filters
+         * wrap to two rows must keep its wrapped height inside <main>'s column. */
+        'flex min-h-[44px] shrink-0 flex-wrap items-center justify-between gap-2 border-b border-line bg-canvas px-6 py-2',
         className
       )}
       {...props}
@@ -69,10 +73,26 @@ export function Toolbar({ left, right, className, children, ...props }) {
   )
 }
 
-/** Standard content wrapper — 24px horizontal, 20px top padding. */
-export function PageBody({ className, children, ...props }) {
+/**
+ * Standard content wrapper — 24px horizontal, 20px top padding.
+ *
+ * @param {boolean} [fill=false] - scroll containment. The layout's <main> is a
+ *        flex column; `fill` makes this body take exactly the remaining height
+ *        (`flex-1 min-h-0`, itself a flex column) so a `<DataTable fill>` /
+ *        `<TableContainer fill>` inside it becomes the page's only scroller.
+ *        The page header, toolbar and pagination then never scroll away.
+ *        `min-h-0` is load-bearing: without it a flex child refuses to shrink
+ *        below its content height and the constraint silently does nothing.
+ *        Containment is md-and-up on purpose: below `md` the stacked header,
+ *        tabs and filters can eat the whole viewport and would squeeze the row
+ *        area to nothing, so phones keep the plain scrolling page instead.
+ */
+export function PageBody({ fill = false, className, children, ...props }) {
   return (
-    <div className={cn('px-6 py-5', className)} {...props}>
+    <div
+      className={cn('px-6 py-5', fill && 'md:flex md:min-h-0 md:flex-1 md:flex-col', className)}
+      {...props}
+    >
       {children}
     </div>
   )

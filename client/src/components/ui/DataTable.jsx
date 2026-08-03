@@ -65,6 +65,9 @@ const INTERACTIVE_IN_CELL =
  *        sorting array (never a TanStack updater function)
  * @param {boolean} [manualSorting] - explicit override; defaults to `true` when
  *        `sorting` is controlled and `false` otherwise
+ * @param {boolean} [fill] - scroll containment: stretch to the remaining height
+ *        of a flex column (`<PageBody fill>`) so the rows scroll inside the
+ *        table while header and pagination stay put
  */
 export function DataTable({
   data = [],
@@ -80,6 +83,7 @@ export function DataTable({
   pagination = false,
   emptyState,
   ariaLabel,
+  fill = false,
   className,
   containerClassName,
   initialSorting = [],
@@ -196,7 +200,10 @@ export function DataTable({
   const colCount = allColumns.length
 
   return (
-    <div className={cn('flex min-h-0 flex-col', className)}>
+    /* `fill` — scroll containment: inside a flex column (`<PageBody fill>`)
+     * the table takes the remaining height, the rows scroll inside
+     * <TableContainer>, and the <Pagination> below stays pinned in view. */
+    <div className={cn('flex min-h-0 flex-col', fill && 'flex-1', className)}>
       <TableContainer className={cn('min-h-0 flex-1', containerClassName)}>
         {loading ? (
           <SkeletonTable rows={6} columns={Math.min(colCount, 6)} />
