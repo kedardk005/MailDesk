@@ -689,6 +689,79 @@ const main = async () => {
   //   D5 — client counters are scoped to what the caller may access
   //   D7 — email-timeline buckets account for EVERY email in the range
   // =====================================================================
+  // =====================================================================
+  // Client mutations must be audited through BOTH URLs.
+  //
+  // /api/clients (clientController) and /api/tasks/clients (taskController)
+  // are documented duplicates that mutate the same collection. Only the latter
+  // logged, so the same action was on the record through one URL and invisible
+  // through the other — the worse half of an audit gap, because the log looked
+  // complete. Action strings must match across both, or the Activity Log
+  // filters and CSV export split one action into two.
+  // =====================================================================
+  console.log('\nclient mutations are audited on /api/clients');
+  // `ActivityLog` is const-declared later in this same function, so it is in
+  // the temporal dead zone here — bind the model under its own name.
+  const AuditLog = require('../models/ActivityLog');
+  const dualAuditName = 'Smoke Dual-URL Client';
+  const dualAuditRenamed = 'Smoke Dual-URL Client Renamed';
+  await Client.deleteMany({ name: { $in: [dualAuditName, dualAuditRenamed] } });
+
+  const dualUA = 'MailDeskSmokeTest-DualUrl/1.0';
+  const createdDual = await api('/api/clients', {
+    token: adminToken,
+    method: 'POST',
+    headers: { 'User-Agent': dualUA },
+    body: { name: dualAuditName, associatedEmails: ['dual-a@example.test'] }
+  });
+  check('POST /api/clients is 201', createdDual.status === 201, `got ${createdDual.status}`);
+  const dualId = createdDual.json?.data?._id;
+
+  const dualCreateLog = await AuditLog.findOne({ action: 'Client Creation', targetId: String(dualId) }).lean();
+  check('POST /api/clients writes a Client Creation row', Boolean(dualCreateLog), `no row for ${dualId}`);
+  check('  ... records the ip', Boolean(dualCreateLog?.ip), `ip=${JSON.stringify(dualCreateLog?.ip)}`);
+  check('  ... records the user agent', dualCreateLog?.userAgent === dualUA, `ua=${JSON.stringify(dualCreateLog?.userAgent)}`);
+  check('  ... targets the Client', dualCreateLog?.targetType === 'Client', `targetType=${dualCreateLog?.targetType}`);
+  check('  ... labels the target', dualCreateLog?.targetLabel === dualAuditName, `label=${JSON.stringify(dualCreateLog?.targetLabel)}`);
+  check('  ... records after, and no before on a create',
+    dualCreateLog?.after?.name === dualAuditName && (dualCreateLog?.before === null || dualCreateLog?.before === undefined),
+    `after=${JSON.stringify(dualCreateLog?.after)} before=${JSON.stringify(dualCreateLog?.before)}`);
+
+  const updatedDual = await api(`/api/clients/${dualId}`, {
+    token: adminToken,
+    method: 'PUT',
+    headers: { 'User-Agent': dualUA },
+    body: { name: dualAuditRenamed, associatedEmails: ['dual-a@example.test', 'dual-b@example.test'] }
+  });
+  check('PUT /api/clients/:id is 200', updatedDual.status === 200, `got ${updatedDual.status}`);
+
+  const dualUpdateLog = await AuditLog.findOne({ action: 'Client Update', targetId: String(dualId) }).lean();
+  check('PUT /api/clients/:id writes a Client Update row', Boolean(dualUpdateLog), `no row for ${dualId}`);
+  // The snapshot must be taken before the in-place mutation, or before === after.
+  check('  ... before holds the PRE-update name',
+    dualUpdateLog?.before?.name === dualAuditName,
+    `before=${JSON.stringify(dualUpdateLog?.before)}`);
+  check('  ... after holds the POST-update name',
+    dualUpdateLog?.after?.name === dualAuditRenamed,
+    `after=${JSON.stringify(dualUpdateLog?.after)}`);
+  check('  ... the diff is not a no-op',
+    JSON.stringify(dualUpdateLog?.before) !== JSON.stringify(dualUpdateLog?.after),
+    'before and after are identical');
+
+  const deletedDual = await api(`/api/clients/${dualId}`, {
+    token: adminToken, method: 'DELETE', headers: { 'User-Agent': dualUA }
+  });
+  check('DELETE /api/clients/:id is 200', deletedDual.status === 200, `got ${deletedDual.status}`);
+
+  const dualDeleteLog = await AuditLog.findOne({ action: 'Client Deletion', targetId: String(dualId) }).lean();
+  check('DELETE /api/clients/:id writes a Client Deletion row', Boolean(dualDeleteLog), `no row for ${dualId}`);
+  check('  ... records before, and no after on a delete',
+    dualDeleteLog?.before?.name === dualAuditRenamed && (dualDeleteLog?.after === null || dualDeleteLog?.after === undefined),
+    `before=${JSON.stringify(dualDeleteLog?.before)} after=${JSON.stringify(dualDeleteLog?.after)}`);
+
+  await AuditLog.deleteMany({ targetId: String(dualId) });
+  await Client.deleteMany({ name: { $in: [dualAuditName, dualAuditRenamed] } });
+
   console.log('\naudit D2: bulk-assign resolves Task.clientName like the sync path');
 
   // A sender matching Smoke Client's associated address, in raw-header form,
