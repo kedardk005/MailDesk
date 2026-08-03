@@ -21,7 +21,7 @@ const TASK_SORT_FIELDS = ['createdAt', 'deadline', 'title', 'status', 'priority'
 // List projection. `description` is excluded because taskHelper fills it from
 // an email preview and it is dead weight in a list.
 const TASK_LIST_FIELDS =
-  'title clientName status priority deadline assignedTo createdBy createdAt linkedEmail isRecurring recurrence overdueNotifiedAt parentTaskId';
+  'title clientName status priority deadline assignedTo createdBy createdAt completedAt linkedEmail isRecurring recurrence overdueNotifiedAt parentTaskId';
 
 // Linked-email projection for LIST responses. `body` is deliberately absent:
 // `.populate('linkedEmail', 'subject from body attachments')` used to drag one

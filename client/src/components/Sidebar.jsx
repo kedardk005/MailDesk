@@ -31,7 +31,10 @@ const NAV_ITEMS = [
   { to: '/inbox', label: 'Inbox', icon: Inbox, roles: ['Admin', 'Head'] },
   { to: '/tasks', label: 'Tasks', icon: CheckSquare, roles: ['Admin', 'Head', 'Employee'] },
   { to: '/clients', label: 'Clients', icon: Building2, roles: ['Admin', 'Head', 'Employee'] },
-  { to: '/reports', label: 'Reports', icon: ScrollText, roles: ['Admin'] },
+  /* Head belongs here: the Reports API serves Heads with their own mailbox and
+   * task scope, and the /reports route already admits them (App.jsx). Hiding
+   * the link made the page a dead end reachable only by typing the URL. */
+  { to: '/reports', label: 'Reports', icon: ScrollText, roles: ['Admin', 'Head'] },
   { to: '/admin/users', label: 'Users & Approvals', icon: Users, roles: ['Admin'] },
   { to: '/admin/activities', label: 'Activity Log', icon: History, roles: ['Admin'] },
   { to: '/profile', label: 'My Profile', icon: User, roles: ['Admin', 'Head', 'Employee'] },

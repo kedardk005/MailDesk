@@ -41,7 +41,9 @@ const NAV_COMMANDS = [
   { id: 'inbox', label: 'Go to Inbox', to: '/inbox', icon: Inbox, roles: ['Admin', 'Head'] },
   { id: 'tasks', label: 'Go to Tasks', to: '/tasks', icon: CheckSquare, roles: ['Admin', 'Head', 'Employee'] },
   { id: 'clients', label: 'Go to Clients', to: '/clients', icon: Building2, roles: ['Admin', 'Head', 'Employee'] },
-  { id: 'reports', label: 'Go to Reports', to: '/reports', icon: ScrollText, roles: ['Admin'] },
+  /* Same roles as the /reports route in App.jsx and the sidebar entry: the
+   * server fully supports Head-scoped reports. */
+  { id: 'reports', label: 'Go to Reports', to: '/reports', icon: ScrollText, roles: ['Admin', 'Head'] },
   { id: 'users', label: 'Go to Users & Approvals', to: '/admin/users', icon: Users, roles: ['Admin'] },
   { id: 'activity', label: 'Go to Activity Log', to: '/admin/activities', icon: ScrollText, roles: ['Admin'] },
   { id: 'profile', label: 'Go to My Profile', to: '/profile', icon: User, roles: ['Admin', 'Head', 'Employee'] },
