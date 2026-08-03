@@ -112,7 +112,7 @@ export function CommandPalette({ open: openProp, onOpenChange, extraCommands = [
           aria-label="Command palette"
           className={cn(
             'fixed left-1/2 top-[15%] z-modal w-[calc(100vw-32px)] max-w-[560px] -translate-x-1/2',
-            'overflow-hidden rounded-xl border border-line bg-surface shadow-lg focus:outline-none',
+            'overflow-hidden rounded-xl border border-line-overlay bg-elevated shadow-lg focus:outline-none',
             'data-[state=open]:animate-slide-in'
           )}
         >
@@ -122,14 +122,14 @@ export function CommandPalette({ open: openProp, onOpenChange, extraCommands = [
           </RadixDialog.Description>
 
           <Command loop className="flex flex-col">
-            <div className="flex items-center gap-2 border-b border-line px-3">
+            <div className="flex items-center gap-2 border-b border-line-overlay px-3">
               <Search aria-hidden="true" className="h-4 w-4 shrink-0 text-fg-3" />
               <Command.Input
                 autoFocus
                 placeholder="Search pages and actions…"
                 className="h-11 flex-1 border-0 bg-transparent text-sm text-fg outline-none placeholder:text-fg-off focus:ring-0"
               />
-              <kbd className="rounded border border-line bg-subtle px-1.5 py-0.5 text-2xs text-fg-3">
+              <kbd className="rounded border border-line-overlay bg-elevated-subtle px-1.5 py-0.5 text-2xs text-fg-3">
                 Esc
               </kbd>
             </div>
@@ -186,7 +186,7 @@ function Item({ children, onSelect, keywords }) {
     <Command.Item
       onSelect={onSelect}
       keywords={keywords}
-      className="flex cursor-default select-none items-center gap-2 rounded px-2 py-2 text-sm text-fg-2 data-[selected=true]:bg-subtle data-[selected=true]:text-fg"
+      className="flex cursor-default select-none items-center gap-2 rounded px-2 py-2 text-sm text-fg-2 data-[selected=true]:bg-elevated-subtle data-[selected=true]:text-fg"
     >
       {children}
     </Command.Item>

@@ -32,9 +32,19 @@ export default {
         surface: v('--bg-surface'),
         subtle: v('--bg-subtle'),
         muted: v('--bg-muted'),
+        /* Floating panels ONLY (dialog/drawer/dropdown/popover/toast).
+         * Light: same as surface. Dark: lighter than surface — elevation is
+         * expressed as lightness there, not shadow. See index.css.       */
+        elevated: {
+          DEFAULT: v('--bg-elevated'),
+          subtle: v('--bg-elevated-subtle'),
+        },
         line: {
           DEFAULT: v('--border-default'),
           strong: v('--border-strong'),
+          /* edge + internal dividers of floating panels — dark
+           * --border-default is invisible (1.04:1) on --bg-elevated */
+          overlay: v('--border-overlay'),
         },
 
         /* ---------- semantic text ---------- */
@@ -214,7 +224,13 @@ export default {
       },
 
       zIndex: {
-        dropdown: '40',
+        // Dropdown/popover/select content portals to <body>, so when its
+        // trigger lives inside a Dialog or Drawer (z-modal 60) it must paint
+        // ABOVE the modal — at 40 it painted behind it (EmailInbox's dialog
+        // SelectMenu, TaskList's drawer overflow menu were invisible). Radix
+        // closes these on any outside interaction, so a page-level menu never
+        // outlives a modal opening beneath it.
+        dropdown: '65',
         sticky: '30',
         sidebar: '20',
         drawer: '50',

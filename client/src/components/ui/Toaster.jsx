@@ -26,12 +26,12 @@ export function Toaster() {
         duration: 4000,
         classNames: {
           toast:
-            'group !w-[360px] !min-h-[44px] !rounded-lg !border !border-line !bg-surface !text-fg !shadow-md !px-3.5 !py-3 !gap-2.5 !font-sans',
+            'group !w-[360px] !min-h-[44px] !rounded-lg !border !border-line-overlay !bg-elevated !text-fg !shadow-md !px-3.5 !py-3 !gap-2.5 !font-sans',
           title: '!text-sm !font-medium !text-fg',
           description: '!text-xs !text-fg-3',
           actionButton: '!bg-primary-600 !text-white !rounded !text-xs !h-7 !px-2',
-          cancelButton: '!bg-subtle !text-fg-2 !rounded !text-xs !h-7 !px-2',
-          closeButton: '!bg-surface !border-line !text-fg-3',
+          cancelButton: '!bg-elevated-subtle !text-fg-2 !rounded !text-xs !h-7 !px-2',
+          closeButton: '!bg-elevated !border-line-overlay !text-fg-3',
           success: '!border-l-2 !border-l-success',
           error: '!border-l-2 !border-l-danger',
           warning: '!border-l-2 !border-l-warning',

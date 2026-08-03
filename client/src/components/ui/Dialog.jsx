@@ -38,7 +38,7 @@ export function DialogOverlay({ className, ...props }) {
   return (
     <RadixDialog.Overlay
       className={cn(
-        'fixed inset-0 z-overlay bg-[rgb(15_23_42/0.45)]',
+        'fixed inset-0 z-overlay overlay-scrim',
         'data-[state=open]:animate-overlay-in data-[state=closed]:animate-overlay-out',
         className
       )}
@@ -78,7 +78,7 @@ export function DialogContent({
         onInteractOutside={dismissable ? undefined : (e) => e.preventDefault()}
         className={cn(
           'fixed left-1/2 top-1/2 z-modal flex w-[calc(100vw-32px)] -translate-x-1/2 -translate-y-1/2 flex-col',
-          'max-h-[calc(100vh-96px)] overflow-hidden rounded-xl border border-line bg-surface shadow-lg',
+          'max-h-[calc(100vh-96px)] overflow-hidden rounded-xl border border-line-overlay bg-elevated shadow-lg',
           'focus:outline-none',
           'data-[state=open]:animate-dialog-in data-[state=closed]:animate-dialog-out',
           sizes[size] || sizes.md,
@@ -86,7 +86,7 @@ export function DialogContent({
         )}
         {...props}
       >
-        <div className="flex min-h-[56px] shrink-0 items-center justify-between gap-3 border-b border-line px-5 py-3">
+        <div className="flex min-h-[56px] shrink-0 items-center justify-between gap-3 border-b border-line-overlay px-5 py-3">
           <div className="min-w-0">
             <RadixDialog.Title className="truncate text-md font-semibold text-fg">
               {title}
@@ -124,7 +124,7 @@ export function DialogFooter({ className, children, ...props }) {
   return (
     <div
       className={cn(
-        'flex min-h-[64px] shrink-0 items-center justify-end gap-2 border-t border-line bg-canvas px-5 py-3',
+        'flex min-h-[64px] shrink-0 items-center justify-end gap-2 border-t border-line-overlay bg-elevated-subtle px-5 py-3',
         className
       )}
       {...props}

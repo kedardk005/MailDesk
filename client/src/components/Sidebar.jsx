@@ -50,16 +50,16 @@ export function Sidebar({ isOpen, onClose, collapsed = false, onToggleCollapsed 
         <div
           onClick={onClose}
           aria-hidden="true"
-          className="fixed inset-0 z-drawer bg-[rgb(15_23_42/0.45)] lg:hidden"
+          className="fixed inset-0 z-45 overlay-scrim lg:hidden"
         />
       ) : null}
 
       <aside
         aria-label="Main navigation"
         className={cn(
-          'fixed inset-y-0 left-0 z-drawer flex shrink-0 flex-col border-r border-line bg-canvas',
+          'fixed inset-y-0 left-0 z-drawer flex shrink-0 flex-col border-r border-line-overlay bg-elevated',
           'transition-[transform,width] duration-150',
-          'lg:static lg:z-sidebar lg:translate-x-0',
+          'lg:static lg:z-sidebar lg:translate-x-0 lg:border-line lg:bg-canvas',
           collapsed ? 'w-sidebar-collapsed' : 'w-sidebar',
           isOpen ? 'translate-x-0' : '-translate-x-full'
         )}

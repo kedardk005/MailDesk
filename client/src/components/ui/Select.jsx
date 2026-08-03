@@ -118,7 +118,7 @@ export function SelectMenu({
           sideOffset={4}
           className={cn(
             'z-dropdown max-h-72 min-w-[--radix-select-trigger-width] overflow-hidden',
-            'rounded-lg border border-line bg-surface shadow-md',
+            'rounded-lg border border-line-overlay bg-elevated shadow-md',
             'data-[state=open]:animate-fade-in',
             contentClassName
           )}
@@ -141,7 +141,7 @@ export function SelectMenu({
                     disabled={o.disabled}
                     className={cn(
                       'relative flex cursor-default select-none items-center gap-2 rounded px-2 py-1.5 pr-7 text-sm text-fg-2 outline-none',
-                      'data-[highlighted]:bg-subtle data-[highlighted]:text-fg',
+                      'data-[highlighted]:bg-elevated-subtle data-[highlighted]:text-fg',
                       'data-[state=checked]:text-fg data-[state=checked]:font-medium',
                       'data-[disabled]:text-fg-off data-[disabled]:pointer-events-none'
                     )}
