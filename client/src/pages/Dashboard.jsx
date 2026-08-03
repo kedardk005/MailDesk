@@ -21,6 +21,7 @@ import {
 } from 'lucide-react'
 
 import api, { getErrorMessage, isCanceled } from '../api/axios'
+import { fetchTaskOverview } from '../lib/taskOverview'
 import { useAuth } from '../components/AuthProvider'
 import {
   Alert,
@@ -88,31 +89,13 @@ const LINK = {
   profile: '/profile',
 }
 
-const DAY_MS = 86_400_000
-
 const STATUS_VARIANT = { Completed: 'success', Late: 'danger', Pending: 'neutral' }
 const PRIORITY_VARIANT = { Low: 'neutral', Medium: 'info', High: 'warning', Urgent: 'danger' }
 
-function startOfToday() {
-  const d = new Date()
-  d.setHours(0, 0, 0, 0)
-  return d.getTime()
-}
-
-function millisAgo(days) {
-  return new Date().getTime() - days * DAY_MS
-}
-
-/** 'overdue' | 'today' | 'upcoming' | 'none' — the only three states this screen acts on. */
-function dueBucket(task, todayStart) {
-  if (task.status === 'Completed') return 'none'
-  if (task.status === 'Late') return 'overdue'
-  if (!task.deadline) return 'none'
-  const due = new Date(task.deadline).getTime()
-  if (!Number.isFinite(due)) return 'none'
-  if (due < todayStart) return 'overdue'
-  if (due < todayStart + DAY_MS) return 'today'
-  return 'upcoming'
+/** Neither loaded nor failed yet — tiles render zeros only from real data. */
+const EMPTY_OVERVIEW = {
+  counts: { open: 0, overdue: 0, dueToday: 0, completed: null },
+  attention: { rows: [], total: 0 },
 }
 
 function formatDue(value) {
@@ -151,7 +134,17 @@ export default function Dashboard() {
   const canManageMail = isAdmin || isHead
   const myId = user?._id
 
-  const [tasks, setTasks] = useState([])
+  /* `mine` drives the tiles and the "Mine" attention list; `everyone` is the
+   * office-wide attention list Admin/Head can switch to. Both come from
+   * fetchTaskOverview, whose counts are server-side totals — never the length
+   * of a capped array (the 200-row legacy cap silently under-reported every
+   * tile for users with more tasks than the cap). */
+  const [mine, setMine] = useState(null)
+  /* { key: reloadKey it was fetched under, data: overview }. The "is it still
+   * loading" question is answered by comparing keys, so no loading flag needs
+   * to be raised synchronously inside the fetch effect. */
+  const [everyone, setEveryone] = useState(null)
+  const [recent, setRecent] = useState([])
   const [stats, setStats] = useState(null)
   const [gmail, setGmail] = useState({ connected: false, gmailEmail: '', linkedAccounts: [] })
   const [approvals, setApprovals] = useState([])
@@ -181,7 +174,14 @@ export default function Dashboard() {
     const ctrl = new AbortController()
     const { signal } = ctrl
 
-    const requests = [api.get('/tasks', { signal })]
+    const requests = [
+      // Tile counts + "Mine" attention. Admin/Head must ask for their own
+      // assignments explicitly; an Employee's list is already scoped by the
+      // server (and the assignedTo parameter is ignored for that role).
+      fetchTaskOverview({ assignedTo: canManageMail && myId ? myId : undefined, signal }),
+      // Newest five in role scope, straight from the server's -createdAt sort.
+      api.get('/tasks', { params: { page: 1, limit: 5, sort: '-createdAt' }, signal }),
+    ]
     if (canManageMail) {
       requests.push(
         api.get('/reports/overall', { signal }),
@@ -198,13 +198,19 @@ export default function Dashboard() {
         return
       }
 
-      const [taskRes, statsRes, gmailRes, approvalRes, slaRes] = results
+      const [mineRes, recentRes, statsRes, gmailRes, approvalRes, slaRes] = results
 
-      if (taskRes.status === 'fulfilled') {
-        setTasks(toList(taskRes.value.data))
+      if (mineRes.status === 'fulfilled') {
+        setMine(mineRes.value)
         setError(null)
       } else {
-        setError(getErrorMessage(taskRes.reason, 'Could not load your tasks.'))
+        setError(getErrorMessage(mineRes.reason, 'Could not load your tasks.'))
+      }
+
+      if (recentRes.status === 'fulfilled') {
+        setRecent(toList(recentRes.value.data))
+      } else if (mineRes.status === 'fulfilled') {
+        setError(getErrorMessage(recentRes.reason, 'Could not load your tasks.'))
       }
 
       if (statsRes?.status === 'fulfilled') setStats(statsRes.value.data)
@@ -222,7 +228,26 @@ export default function Dashboard() {
     })
 
     return () => ctrl.abort()
-  }, [canManageMail, reloadKey])
+  }, [canManageMail, myId, reloadKey])
+
+  /* The office-wide ("Everyone") attention list is a second, wider scope that
+   * only Admin/Head can select. Fetched on demand so the common path pays for
+   * one scope, and keyed by reloadKey so Retry refreshes it too. */
+  useEffect(() => {
+    if (!canManageMail || scope !== 'all') return undefined
+    if (everyone?.key === reloadKey) return undefined // fresh enough
+    const ctrl = new AbortController()
+    fetchTaskOverview({ signal: ctrl.signal })
+      .then((data) => {
+        if (ctrl.signal.aborted) return
+        setEveryone({ key: reloadKey, data })
+      })
+      .catch((err) => {
+        if (ctrl.signal.aborted || isCanceled(err)) return
+        setError(getErrorMessage(err, 'Could not load office-wide tasks.'))
+      })
+    return () => ctrl.abort()
+  }, [canManageMail, scope, reloadKey, everyone])
 
   /* The OAuth callback lands on /dashboard?gmail=connected. Acknowledge it once
    * and drop the parameter so a refresh does not re-announce it. */
@@ -243,51 +268,11 @@ export default function Dashboard() {
   }, [])
 
   /* --- derived ----------------------------------------------------------- */
-  const myTasks = useMemo(
-    () => (myId ? tasks.filter((t) => t.assignedTo?._id === myId) : []),
-    [tasks, myId]
-  )
-
-  const attentionSource = canManageMail && scope === 'all' ? tasks : myTasks
-
-  const counts = useMemo(() => {
-    const todayStart = startOfToday()
-    const monthAgo = millisAgo(30)
-    let open = 0
-    let overdue = 0
-    let dueToday = 0
-    let completed = 0
-    for (const t of myTasks) {
-      const bucket = dueBucket(t, todayStart)
-      if (t.status === 'Completed') {
-        if (new Date(t.createdAt).getTime() >= monthAgo) completed += 1
-        continue
-      }
-      open += 1
-      if (bucket === 'overdue') overdue += 1
-      else if (bucket === 'today') dueToday += 1
-    }
-    return { open, overdue, dueToday, completed }
-  }, [myTasks])
-
-  const attention = useMemo(() => {
-    const todayStart = startOfToday()
-    return attentionSource
-      .map((t) => ({ task: t, bucket: dueBucket(t, todayStart) }))
-      .filter((row) => row.bucket === 'overdue' || row.bucket === 'today')
-      .sort((a, b) => {
-        if (a.bucket !== b.bucket) return a.bucket === 'overdue' ? -1 : 1
-        return new Date(a.task.deadline || 0) - new Date(b.task.deadline || 0)
-      })
-  }, [attentionSource])
-
-  const recent = useMemo(
-    () =>
-      [...tasks]
-        .sort((a, b) => new Date(b.createdAt || 0) - new Date(a.createdAt || 0))
-        .slice(0, 5),
-    [tasks]
-  )
+  const { counts } = mine ?? EMPTY_OVERVIEW
+  const wantEveryone = canManageMail && scope === 'all'
+  const attention = (wantEveryone ? everyone?.data : mine)?.attention
+    ?? EMPTY_OVERVIEW.attention
+  const attentionBusy = loading || (wantEveryone && everyone?.key !== reloadKey)
 
   const accountCount = 1 + (gmail.linkedAccounts?.length || 0)
 
@@ -443,9 +428,13 @@ export default function Dashboard() {
           to: LINK.myCompleted,
           icon: CheckCircle2,
           label: 'Completed',
-          value: formatNumber(counts.completed),
-          tone: counts.completed > 0 ? 'success' : 'default',
-          hint: 'Last 30 days',
+          /* Counted by `completedAt` — when it was finished — not `createdAt`,
+           * which answered "created recently and happens to be complete". A
+           * null count means the rows carried no completion dates at all: that
+           * renders as an em dash, never as a plausible wrong number. */
+          value: counts.completed == null ? '—' : formatNumber(counts.completed),
+          tone: (counts.completed ?? 0) > 0 ? 'success' : 'default',
+          hint: counts.completed == null ? 'Completion dates unavailable' : 'Last 30 days',
         },
       ]
 
@@ -558,11 +547,11 @@ export default function Dashboard() {
                   ) : null
                 }
               />
-              {loading ? (
+              {attentionBusy ? (
                 <CardBody className="p-0">
                   <SkeletonTable rows={5} columns={4} />
                 </CardBody>
-              ) : attention.length === 0 ? (
+              ) : attention.rows.length === 0 ? (
                 <CardBody className="p-0">
                   <EmptyState
                     icon={CheckCircle2}
@@ -588,7 +577,7 @@ export default function Dashboard() {
                         </TR>
                       </THead>
                       <TBody>
-                        {attention.slice(0, 8).map(({ task, bucket }) => (
+                        {attention.rows.slice(0, 8).map(({ task, bucket }) => (
                           <TR key={task._id}>
                             <TD primary>
                               <Link
@@ -629,8 +618,11 @@ export default function Dashboard() {
                   </TableContainer>
                   <CardFooter className="justify-between">
                     <span className="text-xs text-fg-3 tabular">
-                      Showing {formatNumber(Math.min(8, attention.length))} of{' '}
-                      {formatNumber(attention.length)}
+                      {/* The total is count-derived (server-side totals), not
+                          the length of the fetched rows, so it stays right
+                          even when the row set is page-bounded. */}
+                      Showing {formatNumber(Math.min(8, attention.rows.length))} of{' '}
+                      {formatNumber(attention.total)}
                     </span>
                     <Button
                       as={Link}
