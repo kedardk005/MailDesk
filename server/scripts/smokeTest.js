@@ -290,6 +290,35 @@ const main = async () => {
     `${timeline.json?.timeline?.length} buckets`
   );
 
+  /*
+   * Cross-user HTTP cache leak. Several read endpoints send
+   * `Cache-Control: private, max-age=...`, which is fine on its own — but
+   * `private` only excludes SHARED caches. The browser's own cache is private,
+   * so without `Vary: Authorization` it reuses one user's response for the
+   * next. Observed before the fix: signing out of Admin and in as Head in the
+   * same browser rendered the Admin's workspace-wide SLA backlog on the Head's
+   * dashboard.
+   */
+  console.log('\ncache isolation');
+  for (const path of ['/api/reports/sla', '/api/tasks?page=1&limit=5', '/api/gmail/emails?page=1&limit=5']) {
+    const res = await fetch(`${BASE}${path}`, { headers: { Authorization: `Bearer ${adminToken}` } });
+    const vary = (res.headers.get('vary') || '').toLowerCase();
+    check(
+      `${path} varies on Authorization`,
+      vary.includes('authorization'),
+      `Vary: ${res.headers.get('vary') || '(none)'}`
+    );
+  }
+
+  // The same URL must not return one role's numbers to another.
+  const adminSla = await api('/api/reports/sla', { token: adminToken });
+  const headSla = await api('/api/reports/sla', { token: headToken });
+  check(
+    'admin and head receive differently scoped SLA payloads',
+    adminSla.json?.scope !== headSla.json?.scope,
+    `admin=${adminSla.json?.scope} head=${headSla.json?.scope}`
+  );
+
   console.log('\nnosql key guard');
   const injected = await api('/api/auth/login', {
     method: 'POST',
