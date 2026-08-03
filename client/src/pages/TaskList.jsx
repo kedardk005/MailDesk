@@ -153,8 +153,20 @@ function formatAbsolute(value) {
   })
 }
 
-/** Short relative deadline: "Overdue 2d", "in 5h", "in 3d". */
-function relativeDue(value, now) {
+/**
+ * Short relative deadline: "Overdue 2d", "in 5h", "3d ago".
+ *
+ * `overdue` is passed in rather than derived from the date, because a past
+ * deadline is not the same thing as an overdue task: a Completed task whose
+ * deadline has passed was delivered, not missed. Labelling it "Overdue" read as
+ * a live problem on a row the colour logic had already (correctly) treated as
+ * fine. Past deadlines on finished work render as plain elapsed time.
+ *
+ * @param {String|Date} value
+ * @param {Number} now
+ * @param {Boolean} overdue Whether this task actually counts as overdue
+ */
+function relativeDue(value, now, overdue = true) {
   const d = toDate(value)
   if (!d) return '—'
   const diff = d.getTime() - now
@@ -163,7 +175,8 @@ function relativeDue(value, now) {
   const hours = Math.round(abs / 3600000)
   const days = Math.round(abs / 86400000)
   const span = mins < 60 ? `${mins}m` : hours < 48 ? `${hours}h` : `${days}d`
-  return diff < 0 ? `Overdue ${span}` : `in ${span}`
+  if (diff >= 0) return `in ${span}`
+  return overdue ? `Overdue ${span}` : `${span} ago`
 }
 
 /** `<input type="datetime-local">` needs a local, offset-free value. */
@@ -420,7 +433,7 @@ function DueCell({ task, now }) {
   return (
     <Tooltip content={formatAbsolute(task.deadline)}>
       <span className={cn('tabular text-sm', overdue ? 'font-medium text-danger-text' : 'text-fg-2')}>
-        {relativeDue(task.deadline, now)}
+        {relativeDue(task.deadline, now, overdue)}
       </span>
     </Tooltip>
   )
