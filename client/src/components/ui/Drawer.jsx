@@ -49,7 +49,7 @@ export function DrawerContent({
       <DialogOverlay />
       <RadixDialog.Content
         className={cn(
-          'fixed inset-y-0 z-drawer flex max-w-[calc(100vw-48px)] flex-col bg-surface shadow-lg focus:outline-none',
+          'fixed inset-y-0 z-modal flex max-w-[calc(100vw-48px)] flex-col bg-surface shadow-lg focus:outline-none',
           side === 'right' ? 'right-0 border-l border-line' : 'left-0 border-r border-line',
           'data-[state=open]:animate-slide-in-right',
           sizes[size] || sizes.md,

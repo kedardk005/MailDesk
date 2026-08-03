@@ -218,6 +218,15 @@ export default {
         sticky: '30',
         sidebar: '20',
         drawer: '50',
+        // The scrim behind a modal/drawer. MUST sit below `modal`, which every
+        // Dialog and Drawer content uses. Previously the overlay used `modal`
+        // (60) while Drawer content used `drawer` (50), so the scrim painted on
+        // top of its own drawer: the panel was visible but dimmed and every
+        // click was swallowed. Dialog only escaped it because its overlay and
+        // content shared a z-index and DOM order broke the tie — correct by
+        // accident. Making the two layers explicitly different removes the
+        // dependence on paint order.
+        overlay: '55',
         modal: '60',
         toast: '70',
         tooltip: '80',
