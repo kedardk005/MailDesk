@@ -5,6 +5,7 @@ const cache = require('../utils/cache');
 const { escapeRegex } = require('../utils/regexHelper');
 const { parseListParams, listResponse, firstString } = require('../utils/paginate');
 const { listClients, CLIENT_SORT_FIELDS } = require('../utils/clientService');
+const { logActivity } = require('../utils/activityLogger');
 const { log } = require('../utils/logger');
 
 const logger = log('clients');
@@ -182,6 +183,25 @@ const createClient = async (req, res) => {
     await newClient.save();
     await cache.invalidateClients();
 
+    /*
+     * Client mutations are reachable through TWO documented-duplicate URLs:
+     * /api/clients (here) and /api/tasks/clients (taskController). Only the
+     * latter was audited, so the same action was on the record through one URL
+     * and invisible through the other — the worse half of an audit gap,
+     * because the log looked complete.
+     *
+     * Same action strings as taskController on purpose: the Activity Log
+     * filters and the CSV export key off them, and a second spelling would
+     * split one action into two filter entries.
+     */
+    await logActivity(req.user._id, 'Client Creation', `Created client "${newClient.name}"`, {
+      req,
+      targetType: 'Client',
+      targetId: newClient._id,
+      targetLabel: newClient.name,
+      after: { name: newClient.name, associatedEmails: [...(newClient.associatedEmails || [])] }
+    });
+
     res.status(201).json({
       success: true,
       message: 'Client created successfully',
@@ -205,6 +225,13 @@ const updateClient = async (req, res) => {
     if (!client) {
       return res.status(404).json({ success: false, message: 'Client not found' });
     }
+
+    // Snapshot BEFORE the in-place mutations below. Taking it afterwards would
+    // record the new values as the old ones and make the diff read as a no-op.
+    const beforeClient = {
+      name: client.name,
+      associatedEmails: [...(client.associatedEmails || [])]
+    };
 
     if (name && name.trim().toLowerCase() !== client.name.toLowerCase()) {
       const existing = await Client.findOne({ name: { $regex: new RegExp(`^${escapeRegex(name.trim())}$`, 'i') } });
@@ -231,6 +258,15 @@ const updateClient = async (req, res) => {
     await client.save();
     await cache.invalidateClients();
 
+    await logActivity(req.user._id, 'Client Update', `Updated client "${client.name}"`, {
+      req,
+      targetType: 'Client',
+      targetId: client._id,
+      targetLabel: client.name,
+      before: beforeClient,
+      after: { name: client.name, associatedEmails: [...(client.associatedEmails || [])] }
+    });
+
     res.json({
       success: true,
       message: 'Client updated successfully',
@@ -253,6 +289,17 @@ const deleteClient = async (req, res) => {
       return res.status(404).json({ success: false, message: 'Client not found' });
     }
     await cache.invalidateClients();
+
+    // `before` only: after a delete there is no "after" state, and recording an
+    // empty object would read as "the fields were cleared" rather than "the
+    // record is gone". The returned doc is the pre-delete state.
+    await logActivity(req.user._id, 'Client Deletion', `Deleted client "${client.name}"`, {
+      req,
+      targetType: 'Client',
+      targetId: client._id,
+      targetLabel: client.name,
+      before: { name: client.name, associatedEmails: [...(client.associatedEmails || [])] }
+    });
 
     res.json({ success: true, message: 'Client deleted successfully' });
   } catch (err) {
