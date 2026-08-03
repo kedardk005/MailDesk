@@ -82,3 +82,6 @@ Thumbs.db
 temp_password.txt
 server/temp_password.txt
 
+
+# Local dev server logs written by scripts/dev.sh
+.dev-logs/
