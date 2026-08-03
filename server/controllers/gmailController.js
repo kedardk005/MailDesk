@@ -2474,26 +2474,37 @@ exports.bulkAssignEmails = async (req, res) => {
     // because the unique partial index on `Task.linkedEmail` would otherwise
     // reject an email that already has a task.
     const now = new Date();
-    const operations = emails.map((email) => ({
-      updateOne: {
-        filter: { linkedEmail: email._id },
-        update: {
-          $set: { assignedTo: assignee._id, status: 'Pending', deadline: taskDeadline, priority: taskPriority },
-          $setOnInsert: {
-            title: email.subject || 'Assigned Email',
-            // The full email body is NOT copied into the task description. The
-            // task links to the email; the body is served only through an
-            // authorized email read path.
-            description: '',
-            linkedEmail: email._id,
-            clientName: email.from || 'Inbox Client',
-            createdBy: req.user._id,
-            createdAt: now
-          }
-        },
-        upsert: true
-      }
-    }));
+    // Resolve the client the SAME way the sync path does (taskHelper's
+    // `resolveClientForSender`): an exact sender-address match against the
+    // cached client table, falling back to the shared UNASSIGNED sentinel.
+    // This used to store the raw From header ("Name <addr@example>") verbatim,
+    // which escaped every per-client counter (they group by client name) and
+    // rendered a mangled header in the Tasks UI client column.
+    const clientMatcher = await getClientMatcher();
+    const operations = [];
+    for (const email of emails) {
+      const { clientName } = await resolveClientForSender(email.from, clientMatcher);
+      operations.push({
+        updateOne: {
+          filter: { linkedEmail: email._id },
+          update: {
+            $set: { assignedTo: assignee._id, status: 'Pending', deadline: taskDeadline, priority: taskPriority },
+            $setOnInsert: {
+              title: email.subject || 'Assigned Email',
+              // The full email body is NOT copied into the task description. The
+              // task links to the email; the body is served only through an
+              // authorized email read path.
+              description: '',
+              linkedEmail: email._id,
+              clientName,
+              createdBy: req.user._id,
+              createdAt: now
+            }
+          },
+          upsert: true
+        }
+      });
+    }
 
     await Task.bulkWrite(operations, { ordered: false });
     await Email.updateMany(

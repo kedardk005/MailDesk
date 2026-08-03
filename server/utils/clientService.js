@@ -1,3 +1,4 @@
+const mongoose = require('mongoose');
 const Client = require('../models/Client');
 const Task = require('../models/Task');
 const Email = require('../models/Email');
@@ -27,18 +28,56 @@ const CLIENT_SORT_FIELDS = ['name', 'createdAt', 'status', 'contactPerson'];
 const CLIENT_FIELDS = 'name associatedEmails contactPerson email phone notes status createdAt';
 
 /**
- * Per-client task counters, keyed by LOWERCASED client name.
+ * Role scoping for the counters (audit defect D5).
  *
- * Deliberately groups the whole collection rather than `$match`ing the current
- * page's names: the original comparison was case-insensitive, and an exact
- * `$in` match would silently change the numbers for any task whose
+ * The counters used to be workspace-global for every caller while the
+ * drill-down (client timeline, task/email lists) is role-scoped — a Head saw
+ * `mailCount: 43` for a client but could open only their own 7 emails, and an
+ * Employee saw workspace-wide volumes for clients they have no work on.
+ *
+ * The rules below are EXACTLY the ones the list endpoints already apply:
+ *   - tasks:  Employee -> assignedTo; Head -> createdBy OR assignedTo
+ *             (taskController.getAllTasks)
+ *   - emails: Head -> fetchedBy (gmailController list scope); Employee ->
+ *             assignedTo (the only mail an Employee may reach, and the same
+ *             rule clientController.getClientTimeline applies)
+ *   - Admin (or no user, for internal callers) -> unscoped
+ */
+const toId = (user) => new mongoose.Types.ObjectId(String(user._id));
+
+const taskScopeFor = (user) => {
+  if (!user || user.role === 'Admin') return {};
+  if (user.role === 'Employee') return { assignedTo: toId(user) };
+  return { $or: [{ createdBy: toId(user) }, { assignedTo: toId(user) }] };
+};
+
+const mailScopeFor = (user) => {
+  if (!user || user.role === 'Admin') return {};
+  if (user.role === 'Employee') return { assignedTo: toId(user) };
+  return { fetchedBy: toId(user) };
+};
+
+// Cache key segment: Admin and internal callers share the global entry; every
+// other caller gets an entry of their own, invalidated by the same `report:`
+// prefix drops as before.
+const counterScopeKey = (user) => (!user || user.role === 'Admin' ? 'all' : `${user.role}:${String(user._id)}`);
+
+/**
+ * Per-client task counters, keyed by LOWERCASED client name, scoped to what
+ * `user` may actually access (see `taskScopeFor`).
+ *
+ * Deliberately groups the whole (scoped) collection rather than `$match`ing
+ * the current page's names: the original comparison was case-insensitive, and
+ * an exact `$in` match would silently change the numbers for any task whose
  * `clientName` differs in case.
  *
+ * @param {Object} [user] - the requesting user; omitted = unscoped (Admin)
  * @returns {Promise<Object>} { [lowercasedName]: { total, completed } }
  */
-const getTaskCountsByClient = () =>
-  cache.wrap(cache.KEYS.report('client-task-counts', 'all', 'all'), cache.TTL.clients, async () => {
+const getTaskCountsByClient = (user = null) =>
+  cache.wrap(cache.KEYS.report('client-task-counts', 'all', counterScopeKey(user)), cache.TTL.clients, async () => {
     const rows = await Task.aggregate([
+      { $match: taskScopeFor(user) },
       {
         $group: {
           _id: { $toLower: { $ifNull: ['$clientName', ''] } },
@@ -59,14 +98,15 @@ const getTaskCountsByClient = () =>
  * NOTE: rows created before this change have `clientId: null` and are counted
  * as 0 until `scripts/backfillEmailSnippets.js` has been run.
  *
+ * @param {Object} [user] - the requesting user; omitted = unscoped (Admin)
  * @returns {Promise<Object>} { [clientId]: Number }
  */
-const getMailCountsByClient = () =>
-  cache.wrap(cache.KEYS.report('client-mail-counts', 'all', 'all'), cache.TTL.clients, async () => {
+const getMailCountsByClient = (user = null) =>
+  cache.wrap(cache.KEYS.report('client-mail-counts', 'all', counterScopeKey(user)), cache.TTL.clients, async () => {
     const rows = await Email.aggregate([
       // F-1: `mailCount` has always meant mail RECEIVED from the client, so the
       // outbound replies now persisted alongside it are excluded.
-      { $match: { deletedAt: null, clientId: { $ne: null }, direction: { $ne: 'outbound' } } },
+      { $match: { deletedAt: null, clientId: { $ne: null }, direction: { $ne: 'outbound' }, ...mailScopeFor(user) } },
       { $group: { _id: '$clientId', total: { $sum: 1 } } }
     ]);
     return Object.fromEntries(rows.map((r) => [String(r._id), r.total]));
@@ -78,10 +118,12 @@ const getMailCountsByClient = () =>
  * @param {Object} params - result of parseListParams
  * @param {Object} [options]
  * @param {Boolean} [options.withCounts=true]
+ * @param {Object} [options.user] - requesting user; counters are scoped to
+ *   what this user may access (Admin/omitted = workspace-wide)
  * @returns {Promise<{data: Array, pagination: Object|null}>}
  */
 const listClients = async (params, options = {}) => {
-  const { withCounts = true } = options;
+  const { withCounts = true, user = null } = options;
 
   const filter = {};
   if (params.q) {
@@ -98,7 +140,7 @@ const listClients = async (params, options = {}) => {
     };
   }
 
-  const [taskCounts, mailCounts] = await Promise.all([getTaskCountsByClient(), getMailCountsByClient()]);
+  const [taskCounts, mailCounts] = await Promise.all([getTaskCountsByClient(user), getMailCountsByClient(user)]);
 
   const withCounters = data.map((client) => {
     const key = String(client.name || '').toLowerCase();
