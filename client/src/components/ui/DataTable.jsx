@@ -164,6 +164,17 @@ export function DataTable({
     return pick ? (pick.id ?? pick.accessorKey ?? null) : null
   }, [allColumns, keyboardCell])
 
+  /*
+   * React Compiler reports that it skips memoizing this component because
+   * `useReactTable()` returns functions it cannot safely memoize. That is
+   * informational and expected for TanStack Table — not a defect here, and not
+   * something this codebase can fix without dropping the library.
+   *
+   * Suppressed at the single call site rather than by loosening CI's
+   * `--max-warnings=0`, so the gate keeps catching every OTHER warning. If
+   * TanStack ever becomes compiler-compatible, deleting this line is the test.
+   */
+  // eslint-disable-next-line react-hooks/incompatible-library
   const table = useReactTable({
     data,
     columns: allColumns,
