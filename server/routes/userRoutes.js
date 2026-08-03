@@ -8,7 +8,9 @@ const {
   deleteUser,
   getActivityLogs,
   updateUserProfile,
-  changePassword
+  changePassword,
+  getNotificationPreferences,
+  updateNotificationPreferences
 } = require('../controllers/userController');
 const { protect, authorizeRoles } = require('../middleware/authMiddleware');
 const validate = require('../middleware/validate');
@@ -25,8 +27,18 @@ router.use(protect);
 // PUT /api/users/profile - Update own profile (all roles)
 router.put('/profile', validate(updateUserProfileSchema), updateUserProfile);
 
-// PUT /api/users/change-password - Change own password (all roles)
+// PUT /api/users/change-password - Change own password (all roles).
+// Returns a REPLACEMENT token so the caller's own session survives the
+// tokenVersion bump that revokes every other session (WAVE2 gap S-6).
 router.put('/change-password', validate(changePasswordSchema), changePassword);
+
+// GET/PUT /api/users/notification-preferences - own notification preferences.
+// Registered before '/:id' so the literal path cannot be captured as an id.
+// Validation is done in the controller: the payload is a deep partial merge,
+// which a flat Zod object schema cannot express without rejecting valid input.
+router.route('/notification-preferences')
+  .get(getNotificationPreferences)
+  .put(updateNotificationPreferences);
 
 // GET /api/users - Get all users (accessible by Admin and Head for assignment lists)
 // POST /api/users - Create new Head/Employee user (Admin only)

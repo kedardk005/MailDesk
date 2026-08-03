@@ -6,6 +6,55 @@ const { logActivity } = require('../utils/activityLogger');
 const { createNotification } = require('../utils/notificationHelper');
 const { sendEmail } = require('../utils/emailHelper');
 const { escapeRegex } = require('../utils/regexHelper');
+const { parseDeadline } = require('../utils/dateHelper');
+const { sanitizeTaskLinkedEmail } = require('../utils/sanitizeEmailHtml');
+const cache = require('../utils/cache');
+const { parseListParams, paginate, listResponse, firstString } = require('../utils/paginate');
+const { listClients, CLIENT_SORT_FIELDS } = require('../utils/clientService');
+const { log } = require('../utils/logger');
+
+const logger = log('tasks');
+
+// Sortable fields for GET /api/tasks (docs/audits/API-LIST-CONTRACT.md).
+const TASK_SORT_FIELDS = ['createdAt', 'deadline', 'title', 'status', 'priority', 'clientName'];
+
+// List projection. `description` is excluded because taskHelper fills it from
+// an email preview and it is dead weight in a list.
+const TASK_LIST_FIELDS =
+  'title clientName status priority deadline assignedTo createdBy createdAt linkedEmail isRecurring recurrence overdueNotifiedAt parentTaskId';
+
+// Linked-email projection for LIST responses. `body` is deliberately absent:
+// `.populate('linkedEmail', 'subject from body attachments')` used to drag one
+// base64-laden body per row into the response.
+const LINKED_EMAIL_LIST_FIELDS = 'subject from snippet attachments';
+// Detail responses opt in explicitly.
+const LINKED_EMAIL_DETAIL_FIELDS = 'subject from snippet attachments +body';
+
+/**
+ * Spawn the next occurrence of a recurring task AT MOST ONCE.
+ *
+ * `recurrenceSpawnedAt` is claimed with a conditional update, so of two
+ * concurrent completions exactly one writes the flag and therefore exactly one
+ * child task is created. Called only after the completion has been persisted —
+ * previously the spawn ran BEFORE `task.save()`, so a failed save left an
+ * orphaned child behind.
+ *
+ * @param {Object} task - the (saved) task document
+ * @param {Object} io - socket.io server
+ * @returns {Promise<void>}
+ */
+const claimRecurrenceSpawn = async (task, io) => {
+  if (!task || !task.isRecurring || !task.recurrence) return;
+
+  const claim = await Task.updateOne(
+    { _id: task._id, recurrenceSpawnedAt: null },
+    { $set: { recurrenceSpawnedAt: new Date() } }
+  );
+  if ((claim.modifiedCount || 0) !== 1) return;
+
+  const { spawnNextRecurrence } = require('../utils/recurrenceHelper');
+  await spawnNextRecurrence(task, io);
+};
 
 
 // @desc    Create a new task
@@ -20,6 +69,34 @@ exports.createTask = async (req, res) => {
       return res.status(400).json({ message: 'Title, assignedTo, clientName, and deadline are required.' });
     }
 
+    // Verify the assignee actually exists — an unknown id previously produced a
+    // Mongoose CastError -> 500.
+    const assignee = await User.findOne({ _id: assignedTo, deletedAt: null }).select('name');
+    if (!assignee) {
+      return res.status(400).json({ message: 'Assignee not found.' });
+    }
+
+    // Object-level authorization on linkedEmail.
+    //
+    // `linkedEmail` was previously taken from the request with zero checks, so a
+    // Head could link the Admin's email to a task, read its full body back from
+    // the 201 response, and flip its assignment.
+    if (linkedEmail) {
+      const emailScope = { _id: linkedEmail, deletedAt: null };
+      if (req.user.role !== 'Admin') {
+        emailScope.fetchedBy = req.user._id;
+      }
+      const linkedEmailDoc = await Email.findOne(emailScope).select('_id');
+      if (!linkedEmailDoc) {
+        return res.status(403).json({ message: 'Linked email not found or not in your mailbox.' });
+      }
+    }
+
+    // `isRecurring` must be evaluated once and reused — the original code
+    // normalized it and then tested the RAW value on the next line, so
+    // {"isRecurring":"false"} stored isRecurring:false with a non-null recurrence.
+    const recurringFlag = isRecurring === true || isRecurring === 'true';
+
     // Create the task instance
     const task = new Task({
       title: title.trim(),
@@ -27,13 +104,14 @@ exports.createTask = async (req, res) => {
       linkedEmail: linkedEmail || null,
       assignedTo,
       clientName: clientName.trim(),
-      deadline,
+      // Already normalized to a UTC Date by createTaskSchema.
+      deadline: parseDeadline(deadline),
       notes: notes ? notes.trim() : '',
       priority: priority || 'Medium',
       createdBy: req.user._id,
       status: 'Pending',
-      isRecurring: isRecurring === true || isRecurring === 'true',
-      recurrence: isRecurring ? (recurrence || null) : null
+      isRecurring: recurringFlag,
+      recurrence: recurringFlag ? (recurrence || null) : null
     });
 
     // Save task
@@ -47,10 +125,12 @@ exports.createTask = async (req, res) => {
       });
     }
 
-    // Populate task details before returning
+    // Populate task details before returning. `body` and `attachments` are
+    // deliberately NOT populated here — the 201 response must not become an
+    // email-content read primitive.
     const populatedTask = await Task.findById(savedTask._id)
       .populate('assignedTo', 'name email')
-      .populate('linkedEmail', 'subject from body attachments')
+      .populate('linkedEmail', 'subject from')
       .populate('createdBy', 'name');
 
     await logActivity(req.user._id, 'Task Creation', `Created task "${populatedTask.title}" (Assigned to: ${populatedTask.assignedTo?.name || 'N/A'}, Client: ${populatedTask.clientName})`);
@@ -65,9 +145,11 @@ exports.createTask = async (req, res) => {
       'task_assigned'
     );
 
+    await cache.invalidateStats();
+
     return res.status(201).json(populatedTask);
   } catch (error) {
-    console.error('Error in createTask:', error);
+    logger.error({ err: error.message }, 'createTask failed');
     return res.status(500).json({ message: 'Server error. Failed to create task.' });
   }
 };
@@ -77,24 +159,54 @@ exports.createTask = async (req, res) => {
 // @access  Private (All roles)
 exports.getAllTasks = async (req, res) => {
   try {
-    let query = {};
+    const params = parseListParams(req, {
+      sortWhitelist: TASK_SORT_FIELDS,
+      defaultSort: '-createdAt'
+    });
+
+    const filter = {};
 
     // Filter by role: Employees can only see tasks assigned to them, Heads can see tasks created by or assigned to them
     if (req.user.role === 'Employee') {
-      query = { assignedTo: req.user._id };
+      filter.assignedTo = req.user._id;
     } else if (req.user.role === 'Head') {
-      query = { $or: [{ createdBy: req.user._id }, { assignedTo: req.user._id }] };
+      filter.$or = [{ createdBy: req.user._id }, { assignedTo: req.user._id }];
     }
 
-    const tasks = await Task.find(query)
-      .populate('assignedTo', 'name email')
-      .populate('linkedEmail', 'subject from body attachments')
-      .populate('createdBy', 'name')
-      .sort({ createdAt: -1 });
+    // Additive, endpoint-specific filters.
+    const status = firstString(req.query.status, 20);
+    if (['Pending', 'Completed', 'Late'].includes(status)) filter.status = status;
 
-    return res.status(200).json(tasks);
+    const priority = firstString(req.query.priority, 20);
+    if (['Low', 'Medium', 'High', 'Urgent'].includes(priority)) filter.priority = priority;
+
+    const assignedTo = firstString(req.query.assignedTo, 40);
+    if (/^[0-9a-fA-F]{24}$/.test(assignedTo) && req.user.role !== 'Employee') filter.assignedTo = assignedTo;
+
+    const clientName = firstString(req.query.clientName, 200);
+    if (clientName) filter.clientName = clientName;
+
+    if (params.q) {
+      const regex = new RegExp(escapeRegex(params.q), 'i');
+      const search = { $or: [{ title: regex }, { clientName: regex }] };
+      // Never overwrite the role scope's own `$or`.
+      filter.$and = [search];
+    }
+
+    const { data, pagination } = await paginate(Task, filter, params, {
+      select: TASK_LIST_FIELDS,
+      populate: [
+        { path: 'assignedTo', select: 'name email' },
+        { path: 'linkedEmail', select: LINKED_EMAIL_LIST_FIELDS },
+        { path: 'createdBy', select: 'name' }
+      ]
+    });
+
+    // Bodies are no longer in this payload at all, so the read-time sanitizer
+    // has nothing to do here; it is retained only on the detail paths.
+    return listResponse(res, { params, data, pagination });
   } catch (error) {
-    console.error('Error in getAllTasks:', error);
+    logger.error({ err: error.message, stack: error.stack }, 'getAllTasks failed');
     return res.status(500).json({ message: 'Server error. Failed to retrieve tasks.' });
   }
 };
@@ -106,15 +218,20 @@ exports.getTaskById = async (req, res) => {
   try {
     const task = await Task.findById(req.params.id)
       .populate('assignedTo', 'name email')
-      .populate('linkedEmail', 'subject from body attachments')
+      // The detail view is the ONLY task read path that opts into the body.
+      .populate('linkedEmail', LINKED_EMAIL_DETAIL_FIELDS)
       .populate('createdBy', 'name');
 
     if (!task) {
       return res.status(404).json({ message: 'Task not found.' });
     }
 
-    // Employees can only access their own tasks
-    if (req.user.role === 'Employee' && task.assignedTo && task.assignedTo._id.toString() !== req.user._id.toString()) {
+    // Employees can only access their own tasks.
+    //
+    // The `task.assignedTo &&` short-circuit let UNASSIGNED tasks through, so an
+    // Employee could read any unassigned task — including its populated email
+    // body and attachments. Deny by default: no assignee means no access.
+    if (req.user.role === 'Employee' && task.assignedTo?._id.toString() !== req.user._id.toString()) {
       return res.status(403).json({ message: 'Access denied. You can only access tasks assigned to you.' });
     }
 
@@ -127,9 +244,9 @@ exports.getTaskById = async (req, res) => {
       }
     }
 
-    return res.status(200).json(task);
+    return res.status(200).json(sanitizeTaskLinkedEmail(task));
   } catch (error) {
-    console.error('Error in getTaskById:', error);
+    logger.error({ err: error.message }, 'getTaskById failed');
     return res.status(500).json({ message: 'Server error. Failed to retrieve task details.' });
   }
 };
@@ -145,10 +262,14 @@ exports.updateTask = async (req, res) => {
       return res.status(404).json({ message: 'Task not found.' });
     }
 
+    let shouldSpawnRecurrence = false;
+
     // Role checks
     if (req.user.role === 'Employee') {
-      // Employees can only update their own tasks
-      if (task.assignedTo && task.assignedTo.toString() !== req.user._id.toString()) {
+      // Employees can only update their own tasks. Deny by default: the old
+      // `task.assignedTo &&` short-circuit let an Employee complete any
+      // UNASSIGNED task, firing notifications and spawning recurrences.
+      if (task.assignedTo?.toString() !== req.user._id.toString()) {
         return res.status(403).json({ message: 'Access denied. You can only update your own tasks.' });
       }
 
@@ -161,33 +282,73 @@ exports.updateTask = async (req, res) => {
         return res.status(400).json({ message: 'Employees are only allowed to mark a task as Completed.' });
       }
 
-      const wasAlreadyCompleted = task.status === 'Completed';
+      // Claim the Pending/Late -> Completed transition ATOMICALLY.
+      //
+      // The old code read `task.status`, decided, fired the notifications and
+      // spawned the recurrence, and only then called `task.save()`. Two
+      // concurrent completions therefore both saw "not completed", both mailed
+      // the creator and both spawned a child task — and if the save failed, the
+      // side effects had already happened.
+      // F-2: `completedAt` is stamped by the SAME atomic claim that sets the
+      // status, so the completion instant cannot disagree with the status and
+      // a losing concurrent completion cannot move it.
+      const claimed = await Task.findOneAndUpdate(
+        { _id: task._id, status: { $ne: 'Completed' } },
+        { $set: { status: 'Completed', completedAt: new Date() } },
+        { new: true }
+      );
+      const wasAlreadyCompleted = !claimed;
       task.status = 'Completed';
 
       if (!wasAlreadyCompleted) {
         // Send completion notification & email alert to task creator (Admin/Head)
         try {
-          const creator = await User.findById(task.createdBy);
+          const creator = await User.findById(task.createdBy).select('email').lean();
           if (creator) {
             // 1. App Notification
             await createNotification(
               task.createdBy,
               `Task completed: ${task.title} by ${req.user.name}`,
-              io
+              io,
+              task._id,
+              'task_completed'
             );
-            // 2. Email alert
-            const emailSubject = `Task Completed: ${task.title}`;
-            const emailBody = `Employee ${req.user.name} has marked the task "${task.title}" as completed on ${new Date().toLocaleString()}.`;
-            await sendEmail(creator.email, emailSubject, emailBody);
+            // 2. Email alert — QUEUED, so completing a task no longer waits on
+            //    an SMTP round-trip to Gmail. Tagged with an `event`, so the
+            //    creator's notification preferences actually govern it.
+            await sendEmail(
+              creator.email,
+              `Task Completed: ${task.title}`,
+              `Employee ${req.user.name} has marked the task "${task.title}" as completed on ${new Date().toLocaleString()}.`,
+              null,
+              { event: 'task_completed', userId: task.createdBy }
+            );
           }
         } catch (err) {
-          console.error('Failed to send task completion alerts:', err);
+          logger.error({ err: err.message, taskId: String(task._id) }, 'failed to queue task completion alerts');
         }
 
-        // If this is a recurring task, spawn the next occurrence
-        const { spawnNextRecurrence } = require('../utils/recurrenceHelper');
-        await spawnNextRecurrence(task, io);
+        // Recurrence is spawned AFTER the completion is durable — see
+        // claimRecurrenceSpawn below.
+        await claimRecurrenceSpawn(task, io);
       }
+
+      await cache.invalidateStats();
+
+      const completedTask = await Task.findById(task._id)
+        .populate('assignedTo', 'name email')
+        .populate('linkedEmail', LINKED_EMAIL_DETAIL_FIELDS)
+        .populate('createdBy', 'name');
+
+      await logActivity(
+        req.user._id,
+        'Task Update',
+        `Updated task "${completedTask.title}" (Status: ${completedTask.status})`
+      );
+
+      // Return early: the status write already happened atomically above, so
+      // falling through to the shared `task.save()` would rewrite a stale doc.
+      return res.status(200).json(sanitizeTaskLinkedEmail(completedTask));
     } else {
       // For Head, check if they created the task or are assigned to it
       if (req.user.role === 'Head') {
@@ -203,12 +364,28 @@ exports.updateTask = async (req, res) => {
 
       const wasAlreadyCompleted = task.status === 'Completed';
 
+      // All values are already type-checked and bounded by updateTaskSchema, so
+      // these are safe (previously `{"title":123}` threw and became a 500).
       if (title !== undefined) task.title = title.trim();
       if (description !== undefined) task.description = description.trim();
       if (clientName !== undefined) task.clientName = clientName.trim();
-      if (deadline !== undefined) task.deadline = deadline;
+      if (deadline !== undefined) {
+        task.deadline = deadline === null ? null : parseDeadline(deadline);
+        // A new deadline re-arms overdue notification for this task.
+        task.overdueNotifiedAt = null;
+      }
       if (notes !== undefined) task.notes = notes.trim();
-      if (status !== undefined) task.status = status;
+      if (status !== undefined) {
+        task.status = status;
+        // Leaving the Late state re-arms the overdue notifier.
+        if (status !== 'Late') task.overdueNotifiedAt = null;
+
+        // F-2. Set only on the transition INTO Completed, so re-saving an
+        // already-completed task does not move its resolution time; cleared on
+        // the transition out, so a reopened task is not counted as resolved.
+        if (status === 'Completed' && !wasAlreadyCompleted) task.completedAt = new Date();
+        else if (status !== 'Completed') task.completedAt = null;
+      }
       if (priority !== undefined) task.priority = priority;
       if (isRecurring !== undefined) task.isRecurring = isRecurring;
       if (recurrence !== undefined) task.recurrence = recurrence || null;
@@ -225,26 +402,29 @@ exports.updateTask = async (req, res) => {
         }
       }
 
-      // If status changed to Completed and was not already Completed, spawn next recurrence
-      if (status === 'Completed' && !wasAlreadyCompleted) {
-        const { spawnNextRecurrence } = require('../utils/recurrenceHelper');
-        await spawnNextRecurrence(task, io);
-      }
+      // The recurrence spawn is deferred until AFTER the save; see below.
+      shouldSpawnRecurrence = status === 'Completed' && !wasAlreadyCompleted;
     }
 
     const updatedTask = await task.save();
 
+    if (shouldSpawnRecurrence) {
+      await claimRecurrenceSpawn(updatedTask, io);
+    }
+
+    await cache.invalidateStats();
+
     // Populate and return updated task details
     const populatedTask = await Task.findById(updatedTask._id)
       .populate('assignedTo', 'name email')
-      .populate('linkedEmail', 'subject from body attachments')
+      .populate('linkedEmail', LINKED_EMAIL_DETAIL_FIELDS)
       .populate('createdBy', 'name');
 
     await logActivity(req.user._id, 'Task Update', `Updated task "${populatedTask.title}" (Status: ${populatedTask.status}, Assigned to: ${populatedTask.assignedTo?.name || 'N/A'})`);
 
-    return res.status(200).json(populatedTask);
+    return res.status(200).json(sanitizeTaskLinkedEmail(populatedTask));
   } catch (error) {
-    console.error('Error in updateTask:', error);
+    logger.error({ err: error.message }, 'updateTask failed');
     return res.status(500).json({ message: 'Server error. Failed to update task.' });
   }
 };
@@ -275,10 +455,11 @@ exports.deleteTask = async (req, res) => {
     await Task.findByIdAndDelete(req.params.id);
 
     await logActivity(req.user._id, 'Task Deletion', `Deleted task "${task.title}" (Client: ${task.clientName})`);
+    await cache.invalidateStats();
 
     return res.status(200).json({ message: 'Task deleted successfully.' });
   } catch (error) {
-    console.error('Error in deleteTask:', error);
+    logger.error({ err: error.message }, 'deleteTask failed');
     return res.status(500).json({ message: 'Server error. Failed to delete task.' });
   }
 };
@@ -288,10 +469,22 @@ exports.deleteTask = async (req, res) => {
 // @access  Private (All roles)
 exports.getClients = async (req, res) => {
   try {
-    const clients = await Client.find({}).sort({ name: 1 });
-    return res.status(200).json(clients);
+    // Same implementation as GET /api/clients (utils/clientService); only the
+    // default sort and the legacy response shape differ. The audit flagged
+    // these two endpoints as duplicates with divergent behaviour.
+    const params = parseListParams(req, {
+      sortWhitelist: CLIENT_SORT_FIELDS,
+      defaultSort: 'name'
+    });
+
+    const { data, pagination } = await listClients(params);
+
+    res.set('Cache-Control', 'private, max-age=30, stale-while-revalidate=60');
+
+    // Legacy shape preserved: a bare array (now bounded at 200).
+    return listResponse(res, { params, data, pagination });
   } catch (error) {
-    console.error('Error in getClients:', error);
+    logger.error({ err: error.message }, 'getClients (tasks) failed');
     return res.status(500).json({ message: 'Server error. Failed to retrieve clients.' });
   }
 };
@@ -312,9 +505,15 @@ exports.bulkTaskAction = async (req, res) => {
       return res.status(400).json({ message: `Invalid action. Must be one of: ${validActions.join(', ')}` });
     }
 
+    // ONE query, reused by every branch below. The original ran up to three
+    // separate `Task.find({_id:{$in:taskIds}})` calls in a single handler, each
+    // hydrating up to 500 full documents.
+    const tasks = await Task.find({ _id: { $in: taskIds } })
+      .select('_id createdBy linkedEmail')
+      .lean();
+
     // For Head role, make sure they created all tasks they are trying to perform bulk action on
     if (req.user.role === 'Head') {
-      const tasks = await Task.find({ _id: { $in: taskIds } });
       const ownedTasksCount = tasks.filter(t => t.createdBy && t.createdBy.toString() === req.user._id.toString()).length;
       if (ownedTasksCount !== tasks.length) {
         return res.status(403).json({ message: 'Access denied. You can only perform bulk actions on tasks created by you.' });
@@ -325,7 +524,6 @@ exports.bulkTaskAction = async (req, res) => {
 
     if (action === 'delete') {
       // Reset linked emails before deleting tasks
-      const tasks = await Task.find({ _id: { $in: taskIds } });
       const linkedEmailIds = tasks.filter(t => t.linkedEmail).map(t => t.linkedEmail);
       if (linkedEmailIds.length > 0) {
         await Email.updateMany(
@@ -343,19 +541,30 @@ exports.bulkTaskAction = async (req, res) => {
       if (!value || !allowedStatuses.includes(value)) {
         return res.status(400).json({ message: `Invalid status. Must be one of: ${allowedStatuses.join(', ')}` });
       }
-      await Task.updateMany({ _id: { $in: taskIds } }, { $set: { status: value } });
+      // F-2: same transition semantics as the single-task path. Stamping
+      // `completedAt` FIRST, restricted to tasks that are not already
+      // completed, is what stops a bulk re-apply from resetting the resolution
+      // time of tasks that were finished last week.
+      if (value === 'Completed') {
+        await Task.updateMany(
+          { _id: { $in: taskIds }, status: { $ne: 'Completed' } },
+          { $set: { completedAt: new Date() } }
+        );
+        await Task.updateMany({ _id: { $in: taskIds } }, { $set: { status: 'Completed' } });
+      } else {
+        await Task.updateMany({ _id: { $in: taskIds } }, { $set: { status: value, completedAt: null } });
+      }
       result = { updated: taskIds.length, status: value };
       await logActivity(req.user._id, 'Bulk Task Status', `Bulk set ${taskIds.length} tasks to "${value}"`);
     }
 
     else if (action === 'reassign') {
       if (!value) return res.status(400).json({ message: 'value (userId) is required for reassign action.' });
-      const targetUser = await User.findById(value);
+      const targetUser = await User.findById(value).select('name').lean();
       if (!targetUser) return res.status(404).json({ message: 'Target user not found.' });
       await Task.updateMany({ _id: { $in: taskIds } }, { $set: { assignedTo: value } });
-      // Sync linked email assignments too
-      const tasks = await Task.find({ _id: { $in: taskIds }, linkedEmail: { $ne: null } });
-      const linkedEmailIds = tasks.map(t => t.linkedEmail);
+      // Sync linked email assignments too, reusing the tasks already loaded.
+      const linkedEmailIds = tasks.filter(t => t.linkedEmail).map(t => t.linkedEmail);
       if (linkedEmailIds.length > 0) {
         await Email.updateMany({ _id: { $in: linkedEmailIds } }, { $set: { assignedTo: value, status: 'assigned' } });
       }
@@ -363,9 +572,11 @@ exports.bulkTaskAction = async (req, res) => {
       await logActivity(req.user._id, 'Bulk Task Reassign', `Bulk reassigned ${taskIds.length} tasks to ${targetUser.name}`);
     }
 
+    await cache.invalidateStats();
+
     return res.status(200).json({ message: 'Bulk action completed.', result });
   } catch (error) {
-    console.error('Error in bulkTaskAction:', error);
+    logger.error({ err: error.message }, 'bulkTaskAction failed');
     return res.status(500).json({ message: 'Server error. Failed to perform bulk action.' });
   }
 };
@@ -398,11 +609,12 @@ exports.createClient = async (req, res) => {
     });
 
     await client.save();
+    await cache.invalidateClients();
     await logActivity(req.user._id, 'Client Creation', `Created client "${client.name}"`);
 
     return res.status(201).json(client);
   } catch (error) {
-    console.error('Error in createClient:', error);
+    logger.error({ err: error.message }, 'createClient (tasks) failed');
     return res.status(500).json({ message: 'Server error. Failed to create client.' });
   }
 };
@@ -440,11 +652,12 @@ exports.updateClient = async (req, res) => {
     }
 
     await client.save();
+    await cache.invalidateClients();
     await logActivity(req.user._id, 'Client Update', `Updated client "${client.name}"`);
 
     return res.status(200).json(client);
   } catch (error) {
-    console.error('Error in updateClient:', error);
+    logger.error({ err: error.message }, 'updateClient (tasks) failed');
     return res.status(500).json({ message: 'Server error. Failed to update client.' });
   }
 };
@@ -460,11 +673,12 @@ exports.deleteClient = async (req, res) => {
     }
 
     await Client.findByIdAndDelete(req.params.id);
+    await cache.invalidateClients();
     await logActivity(req.user._id, 'Client Deletion', `Deleted client "${client.name}"`);
 
     return res.status(200).json({ message: 'Client deleted successfully.' });
   } catch (error) {
-    console.error('Error in deleteClient:', error);
+    logger.error({ err: error.message }, 'deleteClient (tasks) failed');
     return res.status(500).json({ message: 'Server error. Failed to delete client.' });
   }
 };

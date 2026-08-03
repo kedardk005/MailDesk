@@ -2,13 +2,19 @@ const TaskComment = require('../models/TaskComment');
 const Task = require('../models/Task');
 const { createNotification } = require('../utils/notificationHelper');
 const { logActivity } = require('../utils/activityLogger');
+const { parseListParams, paginate, listResponse } = require('../utils/paginate');
+const { log } = require('../utils/logger');
+
+const logger = log('comments');
+
+const COMMENT_SORT_FIELDS = ['createdAt'];
 
 // @desc    Get all comments for a task
 // @route   GET /api/tasks/:id/comments
 // @access  Private (All roles)
 exports.getComments = async (req, res) => {
   try {
-    const task = await Task.findById(req.params.id);
+    const task = await Task.findById(req.params.id).select('_id assignedTo createdBy').lean();
     if (!task) return res.status(404).json({ message: 'Task not found.' });
 
     // Employees can only see comments on their own tasks
@@ -25,13 +31,27 @@ exports.getComments = async (req, res) => {
       }
     }
 
-    const comments = await TaskComment.find({ taskId: req.params.id })
-      .populate('author', 'name role')
-      .sort({ createdAt: 1 });
+    // Comments read oldest-first, so the default sort is ASCENDING here. The
+    // { taskId: 1, createdAt: 1 } compound index covers filter + sort.
+    const params = parseListParams(req, {
+      sortWhitelist: COMMENT_SORT_FIELDS,
+      defaultSort: 'createdAt',
+      defaultLimit: 50
+    });
 
-    return res.status(200).json(comments);
+    const { data, pagination } = await paginate(
+      TaskComment,
+      { taskId: req.params.id },
+      params,
+      {
+        select: 'taskId author message createdAt',
+        populate: [{ path: 'author', select: 'name role' }]
+      }
+    );
+
+    return listResponse(res, { params, data, pagination });
   } catch (error) {
-    console.error('Error in getComments:', error);
+    logger.error({ err: error.message }, 'getComments failed');
     return res.status(500).json({ message: 'Server error. Failed to load comments.' });
   }
 };
@@ -47,6 +67,7 @@ exports.addComment = async (req, res) => {
     }
 
     const task = await Task.findById(req.params.id)
+      .select('_id title assignedTo createdBy')
       .populate('assignedTo', 'name')
       .populate('createdBy', 'name');
 
@@ -75,27 +96,18 @@ exports.addComment = async (req, res) => {
     const saved = await comment.save();
     const populated = await TaskComment.findById(saved._id).populate('author', 'name role');
 
-    // Notify task assignee (if commenter is not the assignee)
+    // Both notifications are independent writes, so they go out in parallel
+    // instead of one sequential round-trip after the other.
     const io = req.app.get('io');
+    const notificationText = `New comment on task "${task.title}" by ${req.user.name}`;
+    const notifications = [];
     if (task.assignedTo && task.assignedTo._id.toString() !== req.user._id.toString()) {
-      await createNotification(
-        task.assignedTo._id,
-        `New comment on task "${task.title}" by ${req.user.name}`,
-        io,
-        task._id,
-        'task_comment'
-      );
+      notifications.push(createNotification(task.assignedTo._id, notificationText, io, task._id, 'task_comment'));
     }
-    // Notify task creator (if commenter is not the creator)
     if (task.createdBy && task.createdBy._id.toString() !== req.user._id.toString()) {
-      await createNotification(
-        task.createdBy._id,
-        `New comment on task "${task.title}" by ${req.user.name}`,
-        io,
-        task._id,
-        'task_comment'
-      );
+      notifications.push(createNotification(task.createdBy._id, notificationText, io, task._id, 'task_comment'));
     }
+    await Promise.all(notifications);
 
     await logActivity(req.user._id, 'Task Comment', `Commented on task "${task.title}"`);
 
@@ -112,7 +124,7 @@ exports.addComment = async (req, res) => {
 
     return res.status(201).json(populated);
   } catch (error) {
-    console.error('Error in addComment:', error);
+    logger.error({ err: error.message }, 'addComment failed');
     return res.status(500).json({ message: 'Server error. Failed to post comment.' });
   }
 };
@@ -125,19 +137,36 @@ exports.deleteComment = async (req, res) => {
     const comment = await TaskComment.findById(req.params.commentId);
     if (!comment) return res.status(404).json({ message: 'Comment not found.' });
 
-    const isOwner = comment.author.toString() === req.user._id.toString();
-    
+    // Bind the child to the parent BEFORE any authorization logic.
+    //
+    // Previously the comment was loaded by :commentId but authorization was
+    // evaluated against Task.findById(:id) — two unrelated documents. A Head
+    // could create one throwaway task they own and then delete ANY comment in
+    // the system through it (classic confused deputy).
+    if (!comment.taskId || comment.taskId.toString() !== req.params.id) {
+      return res.status(404).json({ message: 'Comment not found.' });
+    }
+
+    // Authorize against the comment's OWN task.
+    const task = await Task.findById(comment.taskId).select('_id title assignedTo createdBy').lean();
+    if (!task) return res.status(404).json({ message: 'Task not found.' });
+
+    const userId = req.user._id.toString();
+    const isOwner = comment.author.toString() === userId;
+    const isCreator = task.createdBy && task.createdBy.toString() === userId;
+    const isAssignee = task.assignedTo && task.assignedTo.toString() === userId;
+
     let isAuthorized = false;
-    if (isOwner) {
-      isAuthorized = true;
-    } else if (req.user.role === 'Admin') {
+    if (req.user.role === 'Admin') {
       isAuthorized = true;
     } else if (req.user.role === 'Head') {
-      // Heads can only delete comments on tasks created by them
-      const task = await Task.findById(req.params.id);
-      if (task && task.createdBy && task.createdBy.toString() === req.user._id.toString()) {
-        isAuthorized = true;
-      }
+      // Heads can delete their own comments on a task they can see, and any
+      // comment on a task they created.
+      isAuthorized = isCreator || (isOwner && isAssignee);
+    } else {
+      // Employees may delete only their own comment, and only while the task is
+      // still assigned to them.
+      isAuthorized = isOwner && isAssignee;
     }
 
     if (!isAuthorized) {
@@ -146,10 +175,11 @@ exports.deleteComment = async (req, res) => {
 
     await TaskComment.findByIdAndDelete(req.params.commentId);
 
+    await logActivity(req.user._id, 'Task Comment Delete', `Deleted a comment on task "${task.title}"`);
+
     const io = req.app.get('io');
     if (io) {
       // Scope event to relevant user rooms
-      const task = await Task.findById(req.params.id);
       const eventName = `task:${req.params.id}:commentDeleted`;
       const eventData = { commentId: req.params.commentId };
       if (task?.assignedTo) {
@@ -162,7 +192,7 @@ exports.deleteComment = async (req, res) => {
 
     return res.status(200).json({ message: 'Comment deleted.' });
   } catch (error) {
-    console.error('Error in deleteComment:', error);
+    logger.error({ err: error.message }, 'deleteComment failed');
     return res.status(500).json({ message: 'Server error. Failed to delete comment.' });
   }
 };

@@ -3,6 +3,7 @@ const router = express.Router();
 const { protect } = require('../middleware/authMiddleware');
 const {
   getNotifications,
+  getUnreadCount,
   markAsRead,
   markAllAsRead
 } = require('../controllers/notificationController');
@@ -12,6 +13,10 @@ router.use(protect);
 
 // GET /api/notifications - Get all notifications for logged-in user
 router.get('/', getNotifications);
+
+// GET /api/notifications/unread-count - Bell badge count, without downloading
+// the list to count it client-side.
+router.get('/unread-count', getUnreadCount);
 
 // PUT /api/notifications/read-all - Mark all notifications as read (MUST be registered before dynamic /:id/read)
 router.put('/read-all', markAllAsRead);

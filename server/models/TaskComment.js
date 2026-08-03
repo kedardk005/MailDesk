@@ -24,4 +24,9 @@ const TaskCommentSchema = new mongoose.Schema({
   }
 });
 
+// Comments are listed oldest-first for one task; without the compound the sort
+// is not covered by the single `taskId` index.
+TaskCommentSchema.index({ taskId: 1, createdAt: 1 });
+TaskCommentSchema.index({ author: 1 });
+
 module.exports = mongoose.model('TaskComment', TaskCommentSchema);

@@ -14,7 +14,7 @@ const {
   deleteClient
 } = require('../controllers/taskController');
 const validate = require('../middleware/validate');
-const { createTaskSchema, bulkTaskSchema } = require('../middleware/schemas');
+const { createTaskSchema, updateTaskSchema, bulkTaskSchema } = require('../middleware/schemas');
 
 // Route for listing all clients - must be registered before the /:id route parameters to prevent collisions
 router.get('/clients', protect, getClients);
@@ -31,7 +31,7 @@ router.route('/')
 
 router.route('/:id')
   .get(protect, getTaskById)
-  .put(protect, updateTask)
+  .put(protect, validate(updateTaskSchema), updateTask)
   .delete(protect, authorizeRoles('Admin', 'Head'), deleteTask);
 
 module.exports = router;

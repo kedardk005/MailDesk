@@ -5,7 +5,14 @@
   "main": "index.js",
   "scripts": {
     "dev": "nodemon index.js",
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test": "npm run check:syntax",
+    "start": "node index.js",
+    "sync-indexes": "node scripts/syncIndexes.js",
+    "backfill-emails": "node scripts/backfillEmailSnippets.js",
+    "backfill-threads": "node scripts/backfillEmailThreads.js",
+    "backfill-completed-at": "node scripts/backfillTaskCompletedAt.js",
+    "check:syntax": "find . -name '*.js' -not -path './node_modules/*' -print0 | xargs -0 -n1 node --check",
+    "test:smoke": "node scripts/smokeTest.js"
   },
   "keywords": [],
   "author": "",
@@ -13,7 +20,10 @@
   "type": "commonjs",
   "dependencies": {
     "@google/generative-ai": "^0.24.1",
+    "@socket.io/redis-adapter": "^8.3.0",
     "bcryptjs": "^3.0.3",
+    "bullmq": "^6.0.5",
+    "compression": "^1.8.1",
     "cors": "^2.8.6",
     "dotenv": "^17.4.2",
     "express": "^5.2.1",
@@ -21,14 +31,22 @@
     "express-rate-limit": "^8.5.2",
     "googleapis": "^173.0.0",
     "helmet": "^8.2.0",
+    "ioredis": "^6.0.0",
     "jsonwebtoken": "^9.0.3",
+    "lru-cache": "^11.5.2",
     "mongoose": "^9.6.3",
     "node-cron": "^4.2.1",
     "nodemailer": "^8.0.10",
+    "p-limit": "^3.1.0",
+    "pino": "^10.3.1",
+    "pino-http": "^11.0.0",
+    "rate-limit-redis": "^6.0.0",
+    "sanitize-html": "^2.17.6",
     "socket.io": "^4.8.3",
     "zod": "^4.4.3"
   },
   "devDependencies": {
-    "nodemon": "^3.1.14"
+    "nodemon": "^3.1.14",
+    "socket.io-client": "^4.8.3"
   }
 }
