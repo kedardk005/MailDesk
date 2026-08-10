@@ -120,6 +120,27 @@ function Write-Log {
     Write-Host $line -ForegroundColor $colour
 }
 
+function Get-NpmExe {
+    <#
+        Returns the npm entry point to invoke.
+
+        On Windows, `npm` on PATH resolves to npm.ps1 first, and PowerShell
+        refuses to run it under the default Restricted/AllSigned execution
+        policy:
+
+            npm.ps1 cannot be loaded because running scripts is disabled
+
+        That would fail every `npm ci` here — so a deploy could never install
+        dependencies, and, worse, a ROLLBACK could not either. npm.cmd is a
+        batch shim, not a script, so the policy does not apply to it. Preferring
+        it means this works on a locked-down machine without asking anyone to
+        weaken their execution policy, which is not ours to change.
+    #>
+    $cmd = Get-Command 'npm.cmd' -ErrorAction SilentlyContinue
+    if ($cmd) { return $cmd.Source }
+    return 'npm'
+}
+
 function Invoke-Native {
     <#
         Runs an external command and throws on a non-zero exit code.
@@ -333,7 +354,7 @@ function Install-And-Restart {
     param([string]$Label)
 
     Write-Log "[$Label] npm ci --omit=dev"
-    Invoke-Native npm @('ci', '--omit=dev') -WorkingDirectory $serverDir | Out-Null
+    Invoke-Native (Get-NpmExe) @('ci', '--omit=dev') -WorkingDirectory $serverDir | Out-Null
 
     # Idempotent, and index definitions change between releases. The backfill
     # scripts in server/scripts are deliberately NOT run here: they are one-time
