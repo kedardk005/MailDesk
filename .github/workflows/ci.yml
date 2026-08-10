@@ -128,7 +128,15 @@ jobs:
           AI_RATE_LIMIT_PER_MINUTE: 500
           JWT_SECRET: ci-test-secret-not-a-real-key
           # 32 bytes hex — required by tokenCrypto's AES-256-GCM key derivation.
-          TOKEN_ENCRYPTION_KEY: 0000000000000000000000000000000000000000000000000000000000000000
+          #
+          # QUOTED, and deliberately not a run of zeros. Unquoted, a 64-digit
+          # all-zero scalar is parsed by YAML as a NUMBER, which reaches the
+          # process as the string "0" — and Buffer.from("0", "hex") is zero
+          # bytes, so getEncryptionKey() throws "Decoded key length is 0 bytes".
+          # This was wrong from the day the file was written and nobody noticed,
+          # because nothing in the smoke path called encrypt() until the L-4
+          # tests did. Keep the quotes.
+          TOKEN_ENCRYPTION_KEY: "1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f809"
           OAUTH_STATE_SECRET: ci-test-oauth-state-secret
           APP_TIMEZONE: Asia/Kolkata
 
