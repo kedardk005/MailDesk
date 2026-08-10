@@ -106,6 +106,8 @@ import {
   Tooltip,
   useConfirm,
 } from '../components/ui'
+import { describeSyncResult, syncAddedMail } from '../lib/gmailSync'
+import { TAB_VALUES, visibleTabs } from '../lib/inboxTabs'
 import { searchAssignees } from '../lib/pickers'
 import { getSocket } from '../lib/socket'
 import { useCachedQuery } from '../lib/useCachedQuery'
@@ -115,16 +117,6 @@ import { ExtractActionsPanel } from '../components/ActionExtraction'
 /* -------------------------------------------------------------------------- */
 /* Constants                                                                   */
 /* -------------------------------------------------------------------------- */
-
-const TABS = [
-  { value: 'inbox', label: 'Inbox' },
-  { value: 'sent', label: 'Sent' },
-  { value: 'promotions', label: 'Promotions' },
-  { value: 'social', label: 'Social' },
-  { value: 'updates', label: 'Updates' },
-  { value: 'spam', label: 'Spam' },
-]
-const TAB_VALUES = TABS.map((t) => t.value)
 
 const STATUS_OPTIONS = [
   { value: '', label: 'Any status' },
@@ -1730,7 +1722,7 @@ function HeaderActions({
  * `gmailController.js`); only those columns get a sortable header. The opener
  * button that j/k focuses comes from `rowActivation="cell"` on the table.
  */
-function buildColumns({ canDelete, onOpen, onAssign, onDelete, onToggleRead }) {
+function buildColumns({ canDelete, outbound, onOpen, onAssign, onDelete, onToggleRead }) {
   return [
     {
       accessorKey: 'from',
@@ -1807,7 +1799,13 @@ function buildColumns({ canDelete, onOpen, onAssign, onDelete, onToggleRead }) {
     {
       accessorKey: 'date',
       meta: { width: '120px', numeric: true },
-      header: 'Received',
+      /* Outbound rows are ours: "Received" was a straight falsehood on the
+       * Sent tab. The address column stays "From" because that is exactly what
+       * it holds — the mailbox the reply went out of, which is the useful
+       * column in a shared multi-mailbox inbox. `toEmail` is NOT rendered as a
+       * recipient: it mirrors the sending mailbox in this data, so a "To"
+       * column would name us. */
+      header: outbound ? 'Sent' : 'Received',
       cell: ({ row }) => (
         <Tooltip content={formatAbsolute(row.original.date)}>
           <span className="tabular">{timeAgo(row.original.date) || '—'}</span>
@@ -2211,6 +2209,17 @@ export default function EmailInbox() {
   )
   const { rows, total, loading, error } = threadMode ? threadList : messageList
   const { patchRows } = messageList
+
+  /* Real per-category totals. Parked in conversation mode, where the strip is
+   * not rendered at all. Any failure leaves `data` null and `visibleTabs`
+   * falls back to the full strip with no counts — never to a hidden tab. */
+  const categoriesQuery = useCachedQuery('/gmail/categories', null, {
+    enabled: canManage && !threadMode,
+  })
+  const tabs = useMemo(
+    () => visibleTabs(categoriesQuery.data?.categories, view.tab),
+    [categoriesQuery.data, view.tab]
+  )
   const aux = useInboxAux(canManage, auxNonce)
   const detail = useEmailDetail(canManage && !threadMode ? view.openId : '', listNonce)
   const threadDetail = useThreadDetail(
@@ -2497,9 +2506,12 @@ export default function EmailInbox() {
     setSyncing(true)
     try {
       const res = await api.post('/gmail/fetch')
-      const count = res.data?.count ?? 0
-      toast.success(count ? `Synced ${count} new emails` : 'Inbox is already up to date')
-      if (count > 0) {
+      /* A green tick here used to be unconditional, so four mailboxes failing
+       * `invalid_grant` read as "Inbox is already up to date" (audit H-1).
+       * The tone now comes from the server's own outcome. */
+      const outcome = describeSyncResult(res.data)
+      toast[outcome.tone](outcome.title, outcome.description ? { description: outcome.description } : undefined)
+      if (syncAddedMail(res.data)) {
         setHasExported(false)
         try {
           window.localStorage.removeItem(flagKey)
@@ -2755,12 +2767,13 @@ export default function EmailInbox() {
     () =>
       buildColumns({
         canDelete: hasExported,
+        outbound: view.tab === 'sent',
         onOpen: openEmail,
         onAssign: setAssignIds,
         onDelete: deleteEmail,
         onToggleRead: markRead,
       }),
-    [deleteEmail, hasExported, openEmail, markRead]
+    [deleteEmail, hasExported, openEmail, markRead, view.tab]
   )
 
   const threadColumns = useMemo(() => buildThreadColumns(), [])
@@ -2830,13 +2843,24 @@ export default function EmailInbox() {
           ) : (
             <Tabs value={view.tab} onValueChange={(tab) => applyFilter({ tab })}>
               <TabsList className="border-b-0">
-                {TABS.map((tab) => (
+                {tabs.map((tab) => (
                   <TabsTrigger
                     key={tab.value}
                     value={tab.value}
-                    /* Only the active tab carries a count, and it is the same
-                     * `pagination.total` that produced the rows below it. */
-                    count={tab.value === view.tab && !loading ? formatNumber(total) : undefined}
+                    /* The active tab's count is the `pagination.total` that
+                     * produced the rows below it; the others come from
+                     * /gmail/categories, so every number on the strip is a
+                     * real count of that category rather than a copy of the
+                     * Inbox's. */
+                    count={
+                      tab.value === view.tab
+                        ? loading
+                          ? undefined
+                          : formatNumber(total)
+                        : tab.total === null
+                          ? undefined
+                          : formatNumber(tab.total)
+                    }
                   >
                     {tab.label}
                   </TabsTrigger>

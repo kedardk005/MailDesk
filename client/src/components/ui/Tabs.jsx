@@ -15,10 +15,19 @@ import { cn } from '../../lib/utils'
  */
 export const Tabs = Radix.Root
 
+/**
+ * `flex-wrap` is load-bearing on narrow viewports. Without it a six-tab strip
+ * measures ~460px inside a 375px screen, which widens <main> and makes the
+ * whole PAGE scroll sideways — dragging the toolbar and its filters off the
+ * left edge, and putting the last tabs out of reach entirely. Wrapping keeps
+ * every tab reachable and costs nothing on desktop, where the strip already
+ * fits on one line. A horizontal scroller was the alternative, but it would
+ * clip the active trigger's `-mb-px` underline.
+ */
 export function TabsList({ className, ...props }) {
   return (
     <Radix.List
-      className={cn('flex items-center gap-1 border-b border-line', className)}
+      className={cn('flex flex-wrap items-center gap-1 border-b border-line', className)}
       {...props}
     />
   )

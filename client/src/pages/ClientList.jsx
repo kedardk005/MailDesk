@@ -219,6 +219,12 @@ export default function ClientList() {
   }, [payload])
   const meta = payload?.pagination || null
 
+  /* `GET /api/clients` now reports the residual alongside the page: the tasks
+   * and email that belong to no client on file. Without it the Total tasks and
+   * Emails columns sum to less than the workspace holds — 353 of 427 tasks and
+   * 1,185 of 1,397 emails — and nothing on screen says where the rest went. */
+  const unattributed = payload?.unattributed || null
+
   const serverPaged = Boolean(meta)
 
   const { rows, total } = useMemo(() => {
@@ -437,7 +443,13 @@ export default function ClientList() {
       {
         accessorKey: 'name',
         header: 'Client',
-        meta: { primary: true },
+        /* The identifying column MUST carry a width. Every body cell is
+         * `max-w-0 truncate` (Table.jsx), so a column with no specified width
+         * contributes nothing to the auto-layout preferred width and collapses
+         * to its <th> label — 76px, seven characters, "Northl…". All the slack
+         * went to the columns that did specify one, which is how the email
+         * address ended up nearly three times wider than the client name. */
+        meta: { primary: true, width: '320px' },
         cell: ({ row }) => {
           const client = row.original
           const contact = client?.contactPerson
@@ -455,7 +467,7 @@ export default function ClientList() {
         accessorKey: 'email',
         header: 'Primary email',
         enableSorting: false,
-        meta: { width: '220px' },
+        meta: { width: '200px' },
         cell: ({ row }) =>
           row.original?.email ? (
             <span className="font-mono text-xs">{row.original.email}</span>
@@ -467,7 +479,7 @@ export default function ClientList() {
         id: 'associatedEmails',
         header: 'Addresses',
         enableSorting: false,
-        meta: { numeric: true, width: '104px' },
+        meta: { numeric: true, width: '96px' },
         cell: ({ row }) =>
           formatNumber(
             Array.isArray(row.original?.associatedEmails) ? row.original.associatedEmails.length : 0
@@ -493,13 +505,13 @@ export default function ClientList() {
         id: 'mailCount',
         header: 'Emails',
         enableSorting: false,
-        meta: { numeric: true, width: '96px' },
+        meta: { numeric: true, width: '88px' },
         cell: ({ row }) => formatNumber(row.original?.mailCount || 0),
       },
       {
         accessorKey: 'status',
         header: 'Status',
-        meta: { width: '110px' },
+        meta: { width: '104px' },
         cell: ({ row }) => (
           <Badge variant={(row.original?.status || 'Active') === 'Active' ? 'success' : 'neutral'}>
             {row.original?.status || 'Active'}
@@ -509,7 +521,7 @@ export default function ClientList() {
       {
         accessorKey: 'createdAt',
         header: 'Created',
-        meta: { width: '130px' },
+        meta: { width: '120px' },
         cell: ({ row }) => <span className="tabular">{formatDate(row.original?.createdAt)}</span>,
       },
     ]
@@ -669,6 +681,17 @@ export default function ClientList() {
                 }
           }
         />
+
+        {unattributed && (unattributed.taskCount > 0 || unattributed.emailCount > 0) ? (
+          <p className="mt-3 shrink-0 text-xs text-fg-3">
+            {formatNumber(unattributed.taskCount)}{' '}
+            {unattributed.taskCount === 1 ? 'task' : 'tasks'} and{' '}
+            {formatNumber(unattributed.emailCount)}{' '}
+            {unattributed.emailCount === 1 ? 'email' : 'emails'} are not attributed to any client
+            on file, so they are in no row above. Reports → Clients lists them as
+            “Unattributed”.
+          </p>
+        ) : null}
       </PageBody>
 
       {/* ------------------------------------------------------------------ */}

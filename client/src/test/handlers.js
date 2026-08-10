@@ -83,6 +83,21 @@ export const handlers = [
     HttpResponse.json({ data: { _id: params.id, subject: 'Hello', body: '<p>Hi</p>' } })
   ),
   http.get(`${API}/gmail/emails`, () => emptyList()),
+  /* Real per-category totals (audit H-3). `promotions`/`social`/`updates`/
+     `spam` are genuinely empty in the seeded workspace, so the default here
+     mirrors that: the strip renders Inbox and Sent only. */
+  http.get(`${API}/gmail/categories`, () =>
+    HttpResponse.json({
+      categories: [
+        { name: 'inbox', label: 'Inbox', total: 0 },
+        { name: 'sent', label: 'Sent', total: 0 },
+        { name: 'promotions', label: 'Promotions', total: 0 },
+        { name: 'social', label: 'Social', total: 0 },
+        { name: 'updates', label: 'Updates', total: 0 },
+        { name: 'spam', label: 'Spam', total: 0 },
+      ],
+    })
+  ),
   http.post(`${API}/gmail/fetch`, () => HttpResponse.json({ count: 0 })),
   http.post(`${API}/gmail/emails/bulk-assign`, () => HttpResponse.json({ taskIds: [] })),
   http.post(`${API}/gmail/emails/:id/reply`, () => HttpResponse.json({ success: true })),
