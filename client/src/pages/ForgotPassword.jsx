@@ -5,6 +5,7 @@ import { CheckCircle2, Eye, EyeOff, Mail } from 'lucide-react'
 import api, { getErrorMessage } from '../api/axios'
 import { useAuth } from '../components/AuthProvider'
 import { Alert, Button, FormField, Input } from '../components/ui'
+import { PASSWORD_HINT, PASSWORD_TOO_SHORT, isLongEnough } from '../lib/passwordPolicy'
 
 /** Map the server's 400 `{ errors: [{ path, message }] }` onto field messages. */
 function fieldErrorsFrom(error) {
@@ -188,7 +189,7 @@ function ResetPassword({ token }) {
 
     const found = {}
     if (!password) found.password = 'Choose a new password.'
-    else if (password.length < 6) found.password = 'Use at least 6 characters.'
+    else if (!isLongEnough(password)) found.password = PASSWORD_TOO_SHORT
     if (confirmPassword !== password) found.confirmPassword = 'Passwords do not match.'
     setErrors(found)
     if (Object.keys(found).length > 0) return
@@ -270,7 +271,7 @@ function ResetPassword({ token }) {
       ) : null}
 
       <form className="mt-5 flex flex-col gap-4" onSubmit={handleSubmit} noValidate>
-        <FormField label="New password" required error={errors.password} hint="At least 6 characters.">
+        <FormField label="New password" required error={errors.password} hint={PASSWORD_HINT}>
           {(field) => (
             <Input
               {...field}

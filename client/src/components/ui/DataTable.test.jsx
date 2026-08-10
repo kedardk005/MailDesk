@@ -522,4 +522,81 @@ describe('DataTable — empty and loading states', () => {
     expect(screen.getByRole('status', { name: 'Loading rows' })).toBeInTheDocument()
     expect(screen.queryByRole('table')).toBeNull()
   })
+
+  /* AUDIT L-2 — the empty state's CTA was clipped out of sight.
+   *
+   * With `fill`, DataTable makes <TableContainer> the page's scroller
+   * (`min-h-0 flex-1` + `overflow-auto`). That is right for rows and wrong for
+   * an empty state: measured on /inbox at 1280x720 with a filter matching
+   * nothing, "Clear filters" sat at y 596-628 inside a scroller whose visible
+   * area ended at exactly 596. Zero pixels on screen, in a box that looked
+   * like it held nothing worth scrolling.
+   *
+   * Two things have to hold, and both are structural rather than cosmetic, so
+   * they are asserted on the DOM rather than on a screenshot:
+   *   1. the state is a SIBLING of <table>, not a `<td colSpan>` inside it —
+   *      as a cell it also inherited the message row's `py-12` on top of its
+   *      own, which is where 96 of the overflowing pixels came from; and
+   *   2. the containment classes come off when there are no rows. */
+  describe('empty state — scroll containment', () => {
+    const renderEmpty = (props) =>
+      render(
+        <DataTable
+          data={[]}
+          columns={COLUMNS}
+          ariaLabel="Clients"
+          emptyState={{
+            title: 'No emails match these filters',
+            secondaryAction: { label: 'Clear filters', onClick: () => {} },
+          }}
+          {...props}
+        />
+      )
+
+    it('renders the empty state outside the <table>, not in a message cell', () => {
+      renderEmpty()
+
+      const cta = screen.getByRole('button', { name: 'Clear filters' })
+      expect(cta).toBeInTheDocument()
+      expect(cta.closest('table')).toBeNull()
+      expect(cta.closest('td')).toBeNull()
+
+      /* The column headers stay for context — this is still a table, it just
+       * has nothing in it. */
+      expect(screen.getByRole('columnheader', { name: /client/i })).toBeInTheDocument()
+      expect(screen.queryAllByRole('row')).toHaveLength(1)
+    })
+
+    it('drops scroll containment when there are no rows, even with `fill`', () => {
+      const { container } = renderEmpty({ fill: true })
+
+      const wrapper = container.querySelector('[data-empty="true"]')
+      expect(wrapper).not.toBeNull()
+      /* `flex-1` would pin the box to the leftover height and `min-h-0` would
+       * let it shrink below the empty state — together they are the clip. */
+      expect(wrapper.className).not.toMatch(/\bflex-1\b/)
+      expect(wrapper.className).not.toMatch(/\bmin-h-0\b/)
+
+      const scroller = container.querySelector('.overflow-auto')
+      expect(scroller.className).not.toMatch(/\bflex-1\b/)
+      expect(scroller.className).not.toMatch(/\bmin-h-0\b/)
+    })
+
+    it('keeps scroll containment the moment rows exist', () => {
+      const { container } = render(
+        <DataTable data={ROWS} columns={COLUMNS} ariaLabel="Clients" fill />
+      )
+
+      expect(container.querySelector('[data-empty="true"]')).toBeNull()
+      expect(container.firstChild.className).toMatch(/\bflex-1\b/)
+      expect(container.querySelector('.overflow-auto').className).toMatch(/\bflex-1\b/)
+    })
+
+    it('does not treat a loading table as empty', () => {
+      const { container } = renderEmpty({ fill: true, loading: true })
+
+      expect(container.querySelector('[data-empty="true"]')).toBeNull()
+      expect(screen.queryByRole('button', { name: 'Clear filters' })).toBeNull()
+    })
+  })
 })

@@ -12,7 +12,7 @@ import { Checkbox } from './Checkbox'
 import { EmptyState } from './EmptyState'
 import { Pagination } from './Pagination'
 import { SkeletonTable } from './Skeleton'
-import { Table, TBody, TableContainer, TD, TH, THead, TR, TableMessageRow } from './Table'
+import { Table, TBody, TableContainer, TD, TH, THead, TR } from './Table'
 
 /**
  * Anything inside a cell that handles its own activation. A click originating
@@ -199,12 +199,36 @@ export function DataTable({
   const rows = table.getRowModel().rows
   const colCount = allColumns.length
 
+  /* An empty table has nothing to scroll, and containing it actively hurts:
+   * the empty state is taller than a row, so `flex-1` + `overflow-auto` clipped
+   * it against the remaining height. Measured on /inbox at 1280x720 with a
+   * filter that matches nothing: the "Clear filters" CTA sat at y 596-628
+   * inside a scroller whose visible area ended at exactly 596 — zero pixels of
+   * the button on screen, reachable only by scrolling the inner box that
+   * appeared to hold no content. So when there are no rows the table opts out
+   * of containment entirely and the empty state sits in normal page flow, where
+   * <main> scrolls it if the window is short. Scroll containment exists to keep
+   * a sticky header and pinned pagination over a long row list; with zero rows
+   * there is no row list, no sticky header to preserve and no pagination. */
+  const isEmpty = !loading && rows.length === 0
+
   return (
     /* `fill` — scroll containment: inside a flex column (`<PageBody fill>`)
      * the table takes the remaining height, the rows scroll inside
      * <TableContainer>, and the <Pagination> below stays pinned in view. */
-    <div className={cn('flex min-h-0 flex-col', fill && 'flex-1', className)}>
-      <TableContainer className={cn('min-h-0 flex-1', containerClassName)}>
+    <div
+      className={cn(
+        'flex flex-col',
+        /* `min-h-0` lets a flex item shrink below its content. That is what
+         * makes the rows scroll — and exactly what must NOT happen to an empty
+         * state, which has no scroller of its own to fall back on. */
+        !isEmpty && 'min-h-0',
+        fill && !isEmpty && 'flex-1',
+        className
+      )}
+      data-empty={isEmpty ? 'true' : undefined}
+    >
+      <TableContainer className={cn(!isEmpty && 'min-h-0 flex-1', containerClassName)}>
         {loading ? (
           <SkeletonTable rows={6} columns={Math.min(colCount, 6)} />
         ) : (
@@ -234,15 +258,7 @@ export function DataTable({
             </THead>
 
             <TBody>
-              {rows.length === 0 ? (
-                <TableMessageRow colSpan={colCount}>
-                  <EmptyState
-                    title="Nothing to show"
-                    description="No records match the current view."
-                    {...emptyState}
-                  />
-                </TableMessageRow>
-              ) : (
+              {isEmpty ? null : (
                 rows.map((row) => (
                   <TR
                     key={row.id}
@@ -322,6 +338,19 @@ export function DataTable({
             </TBody>
           </Table>
         )}
+
+        {/* Sibling of <table>, not a `<td colSpan>` inside it. As a message row
+          * the state carried the cell's own `py-12` on top of EmptyState's, so
+          * a 230px block occupied 326px of a 240px scroller. Here it is laid
+          * out by the container, keeps the column headers above it for context,
+          * and its CTA is always on screen. */}
+        {isEmpty ? (
+          <EmptyState
+            title="Nothing to show"
+            description="No records match the current view."
+            {...emptyState}
+          />
+        ) : null}
       </TableContainer>
 
       {serverPagination ? (

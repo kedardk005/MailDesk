@@ -5,6 +5,7 @@ import { CheckCircle2, Eye, EyeOff, Mail } from 'lucide-react'
 import api, { getErrorMessage } from '../api/axios'
 import { useAuth } from '../components/AuthProvider'
 import { Alert, Button, FormField, Input } from '../components/ui'
+import { PASSWORD_HINT, PASSWORD_TOO_SHORT, isLongEnough } from '../lib/passwordPolicy'
 
 /** Map the server's 400 `{ errors: [{ path, message }] }` onto field messages. */
 function fieldErrorsFrom(error) {
@@ -72,7 +73,7 @@ export default function Register() {
     if (!form.email.trim()) found.email = 'Enter your work email address.'
     else if (!/^\S+@\S+\.\S+$/.test(form.email.trim())) found.email = 'Enter a valid email address.'
     if (!form.password) found.password = 'Choose a password.'
-    else if (form.password.length < 6) found.password = 'Use at least 6 characters.'
+    else if (!isLongEnough(form.password)) found.password = PASSWORD_TOO_SHORT
     if (form.confirmPassword !== form.password) found.confirmPassword = 'Passwords do not match.'
     return found
   }
@@ -218,7 +219,7 @@ export default function Register() {
           label="Password"
           required
           error={errors.password}
-          hint="At least 6 characters."
+          hint={PASSWORD_HINT}
         >
           {(field) => (
             <Input

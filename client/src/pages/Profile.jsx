@@ -13,6 +13,12 @@ import {
 import api, { getErrorMessage, isCanceled } from '../api/axios'
 import { useAuth } from '../components/AuthProvider'
 import {
+  PASSWORD_HINT,
+  PASSWORD_MIN_LENGTH,
+  PASSWORD_TOO_SHORT,
+  isLongEnough,
+} from '../lib/passwordPolicy'
+import {
   Alert,
   Avatar,
   Badge,
@@ -161,17 +167,36 @@ function passwordStrength(value) {
   if (/[a-z]/.test(value) && /[A-Z]/.test(value)) score += 1
   if (/\d/.test(value)) score += 1
   if (/[^\w\s]/.test(value)) score += 1
-  if (value.length < 6) return { label: 'Too short — at least 6 characters', tone: 'text-danger-text' }
+  if (!isLongEnough(value)) {
+    return {
+      label: `Too short — at least ${PASSWORD_MIN_LENGTH} characters`,
+      tone: 'text-danger-text',
+    }
+  }
   if (score <= 1) return { label: 'Weak — add length, a capital or a digit', tone: 'text-danger-text' }
   if (score <= 3) return { label: 'Fair — longer is better than complex', tone: 'text-warning-text' }
   return { label: 'Strong', tone: 'text-success-text' }
 }
 
-function PasswordToggle({ shown, onToggle }) {
+/**
+ * Show/hide control for one password input.
+ *
+ * One toggle per field, not one for the form. The audit found the eye on
+ * *Current password* only, so the two fields where a typo actually costs
+ * something — the new password and its confirmation, neither of which can be
+ * checked against anything the user already knows — were the ones you could not
+ * read back. `field` names the input in the accessible label so three toggles
+ * in one form are still distinguishable in a screen reader's control list.
+ *
+ * @param {string} field - e.g. "new password"
+ * @param {boolean} shown
+ * @param {Function} onToggle
+ */
+function PasswordToggle({ field, shown, onToggle }) {
   return (
     <button
       type="button"
-      aria-label={shown ? 'Hide password' : 'Show password'}
+      aria-label={`${shown ? 'Hide' : 'Show'} ${field}`}
       aria-pressed={shown}
       onClick={onToggle}
       className="flex h-6 w-6 items-center justify-center rounded text-fg-3 hover:text-fg-2 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-primary-600"
@@ -233,7 +258,13 @@ export default function Profile() {
   /* -- password form ----------------------------------------------------- */
   const [passwords, setPasswords] = useState({ current: '', next: '', confirm: '' })
   const [passwordErrors, setPasswordErrors] = useState({})
-  const [showPasswords, setShowPasswords] = useState(false)
+  /* One flag per field — see <PasswordToggle>. */
+  const [showPasswords, setShowPasswords] = useState({
+    current: false,
+    next: false,
+    confirm: false,
+  })
+  const togglePassword = (key) => setShowPasswords((s) => ({ ...s, [key]: !s[key] }))
   const [savingPassword, setSavingPassword] = useState(false)
 
   /* -- gmail ------------------------------------------------------------- */
@@ -386,7 +417,7 @@ export default function Profile() {
     const found = {}
     if (!passwords.current) found.currentPassword = 'Enter your current password.'
     if (!passwords.next) found.newPassword = 'Choose a new password.'
-    else if (passwords.next.length < 6) found.newPassword = 'Use at least 6 characters.'
+    else if (!isLongEnough(passwords.next)) found.newPassword = PASSWORD_TOO_SHORT
     else if (passwords.next === passwords.current)
       found.newPassword = 'The new password must be different.'
     if (passwords.confirm !== passwords.next) found.confirm = 'Passwords do not match.'
@@ -401,6 +432,8 @@ export default function Profile() {
       })
       setPasswords({ current: '', next: '', confirm: '' })
       setPasswordErrors({})
+      /* Cleared fields must not stay revealed for the next visitor to this tab. */
+      setShowPasswords({ current: false, next: false, confirm: false })
       // S-6: the server still bumps `tokenVersion` — which is the point, every
       // session holding the old credential is revoked — but it now hands back a
       // replacement token signed with the new version. Storing it keeps THIS
@@ -695,14 +728,15 @@ export default function Profile() {
                       {(field) => (
                         <Input
                           {...field}
-                          type={showPasswords ? 'text' : 'password'}
+                          type={showPasswords.current ? 'text' : 'password'}
                           autoComplete="current-password"
                           value={passwords.current}
                           onChange={(e) => setPasswords((p) => ({ ...p, current: e.target.value }))}
                           trailingIcon={
                             <PasswordToggle
-                              shown={showPasswords}
-                              onToggle={() => setShowPasswords((v) => !v)}
+                              field="current password"
+                              shown={showPasswords.current}
+                              onToggle={() => togglePassword('current')}
                             />
                           }
                         />
@@ -713,15 +747,22 @@ export default function Profile() {
                       label="New password"
                       required
                       error={passwordErrors.newPassword}
-                      hint={strength ? undefined : 'At least 6 characters.'}
+                      hint={strength ? undefined : PASSWORD_HINT}
                     >
                       {(field) => (
                         <Input
                           {...field}
-                          type={showPasswords ? 'text' : 'password'}
+                          type={showPasswords.next ? 'text' : 'password'}
                           autoComplete="new-password"
                           value={passwords.next}
                           onChange={(e) => setPasswords((p) => ({ ...p, next: e.target.value }))}
+                          trailingIcon={
+                            <PasswordToggle
+                              field="new password"
+                              shown={showPasswords.next}
+                              onToggle={() => togglePassword('next')}
+                            />
+                          }
                         />
                       )}
                     </FormField>
@@ -734,10 +775,17 @@ export default function Profile() {
                       {(field) => (
                         <Input
                           {...field}
-                          type={showPasswords ? 'text' : 'password'}
+                          type={showPasswords.confirm ? 'text' : 'password'}
                           autoComplete="new-password"
                           value={passwords.confirm}
                           onChange={(e) => setPasswords((p) => ({ ...p, confirm: e.target.value }))}
+                          trailingIcon={
+                            <PasswordToggle
+                              field="confirm new password"
+                              shown={showPasswords.confirm}
+                              onToggle={() => togglePassword('confirm')}
+                            />
+                          }
                         />
                       )}
                     </FormField>
