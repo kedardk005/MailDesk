@@ -345,9 +345,10 @@ Range longer than `SLA_MAX_RANGE_DAYS` (366) is clamped, not rejected.
     "businessHours": { "enabled": false, "startHour": 9, "endHour": 18, "workingDays": [1,2,3,4,5], "timezone": "Asia/Kolkata" },
     "clientOverrides": 0
   },
-  "firstResponse": { "median": 20, "p90": 300, "max": 300, "count": 3, "breachCount": 1, "breachRate": 0.333, "pendingCount": 1 },
-  "resolution":    { "median": 310, "p90": 310, "max": 310, "count": 1, "breachCount": 0, "breachRate": 0 },
-  "backlog":       { "median": 400, "p90": 400, "max": 400, "count": 2, "breachCount": 2, "breachRate": 1 },
+  "firstResponse": { "median": 20, "medianMethod": "exact", "p90": 300, "max": 300, "count": 3, "breachCount": 1, "breachRate": 0.333, "pendingCount": 1 },
+  "resolution":    { "median": 310, "medianMethod": "exact", "p90": 310, "max": 310, "count": 1, "breachCount": 0, "breachRate": 0,
+                     "coverage": { "completedInRange": 4, "emailLinkedInRange": 1 }, "emptyReason": null },
+  "backlog":       { "median": 400, "medianMethod": "exact", "p90": 400, "max": 400, "count": 2, "breachCount": 2, "breachRate": 1 },
   "generatedAt": "2026-08-02T…Z"
 }
 ```
@@ -368,6 +369,30 @@ Definitions — these are the contract, not an implementation detail:
 - `median`/`p90`/`max` are minutes (one decimal) or `null` when `count` is 0.
 - `breachRate` is `breachCount / count`, 3 decimals, `0` when `count` is 0.
 
+**`medianMethod`** (audit M-6) — `"exact"`, `"approximate"`, or `null` when
+`count` is 0. The median is the textbook one: the middle value for an odd
+sample, the mean of the two middle values for an even one. It reads
+`"approximate"` only when a single sample exceeds
+`SLA_EXACT_MEDIAN_MAX_SAMPLES` (default 200000), where MongoDB's t-digest is
+used instead — and that estimator returns the LOWER of the two middle values
+rather than interpolating, which is what made every even-sized sample read low
+before this field existed. `p90` and `max` are unchanged and remain the
+approximate estimator by design.
+
+**`resolution.emptyReason` / `resolution.coverage`** (audit M-8) — a resolution
+metric can be structurally empty, and a blank panel is indistinguishable from a
+broken query. When `count` is 0, `emptyReason` is one of:
+
+| value | meaning |
+|---|---|
+| `no_completed_tasks_in_range` | nothing was completed in this window |
+| `no_email_linked_completions` | work was completed, but none of it is linked to an email, so there is no conversation to measure from |
+| `linked_emails_unavailable` | linked, but the emails are deleted or carry no usable date |
+
+and `null` whenever `count > 0`. `coverage` carries the two counts the reason
+was derived from — `completedInRange` and `emailLinkedInRange` — in the
+caller's own task scope. Render the reason; do not render an empty chart.
+
 `source` is `"default"` (environment only) or `"global"` (a `SlaPolicy` row).
 
 ### `GET /api/reports/sla/timeseries`
@@ -377,7 +402,7 @@ zero-filled, oldest first, anchored to the **requested range** (not to "today").
 
 ```json
 {
-  "range": { … }, "scope": "mine", "unit": "minutes",
+  "range": { … }, "scope": "mine", "unit": "minutes", "medianMethod": "exact",
   "buckets": [
     { "date": "2026-07-04", "label": "Jul 4",
       "firstResponseMedian": 18.5, "firstResponseP90": 240, "firstResponseCount": 12, "firstResponseBreachCount": 1,
@@ -390,6 +415,11 @@ zero-filled, oldest first, anchored to the **requested range** (not to "today").
 First-response buckets are keyed by the day the **conversation started**;
 resolution buckets by the day the task was **completed**. An empty bucket
 reports `null` medians and `0` counts — render the gap, not a zero.
+
+The top-level `medianMethod` applies to every `*Median` in `buckets[]` and
+follows the same rule as the summary (audit M-6). It reads `"approximate"` if
+**any** bucket exceeded `SLA_EXACT_MEDIAN_MAX_SAMPLES` — conservatively, rather
+than flagging methods bucket by bucket.
 
 ### `GET /api/reports/sla/policy` (Admin, Head)
 

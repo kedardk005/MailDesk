@@ -88,6 +88,92 @@ The new indexes and fields are inert until these run.
 
 ---
 
+## 3a. Encrypt stored OAuth tokens — do this before the first Gmail connect
+
+**Audit L-4.** `TOKEN_ENCRYPTION_KEY` encrypts Google refresh tokens at rest,
+but only for tokens written *after* it was configured. Any account connected
+before that still holds its refresh token in **plaintext** in the `users`
+collection — and a Gmail refresh token is a standing grant to the whole
+mailbox, so a stolen database dump is a stolen mailbox.
+
+The API tells you when this is the case. At startup, with plaintext tokens
+present, it logs once:
+
+```
+"OAuth tokens are stored in PLAINTEXT for some accounts. See docs/DEPLOY-WINDOWS.md."
+  accounts: 8
+  allowLegacyPlaintextTokens: true
+  remediation: node scripts/encryptExistingTokens.js --apply
+```
+
+### The operator step, exactly
+
+From `C:\apps\maildesk\server`, with the same `.env` the service uses:
+
+```
+:: 1. DRY RUN. Reads only, writes nothing, prints how many tokens are affected.
+node scripts/encryptExistingTokens.js
+
+:: 2. Rewrite them. Prints the target host/database and asks you to type the
+::    database name back before it writes anything. Add --yes to skip the
+::    prompt in an unattended run.
+node scripts/encryptExistingTokens.js --apply
+```
+
+The script:
+- refuses to start without `MONGO_URI` **and** a usable `TOKEN_ENCRYPTION_KEY`
+  (it encrypts and decrypts a probe value first, so a malformed key fails
+  before a single record is touched);
+- skips values that are already encrypted, and identifies them structurally
+  (`iv:ciphertext:tag`, hex, correct IV and tag lengths) rather than by looking
+  for a colon;
+- verifies every value it writes decrypts back to the original before saving;
+- never prints a token;
+- reports each failure by email address and exits non-zero, rather than
+  aborting mid-collection.
+
+**Then, and only after a clean run:**
+
+```
+ALLOW_LEGACY_PLAINTEXT_TOKENS=false
+```
+
+and restart the API service. From that point an unencrypted token is a hard
+error on read (that mailbox reports a sync failure) instead of being used
+silently.
+
+> With `NODE_ENV=production` and `ALLOW_LEGACY_PLAINTEXT_TOKENS` **unset**, the
+> guard is already closed — production fails safe by default. Setting it to
+> `true` in production is a deliberate, visible choice to run before the
+> migration.
+
+**Never run this against a database you have not backed up** (§9), and never
+against production from a developer machine — `dotenv` loads whatever
+`MONGO_URI` your local `.env` happens to point at, which is why `--apply` makes
+you type the database name.
+
+---
+
+## 3b. Password policy
+
+**Audit L-3.** The shipped minimum was **6 characters**. It is now **12**, with
+no composition rule — length is what resists an offline attack on a bcrypt
+hash, while a forced symbol/digit rule mostly produces `Passw0rd!`.
+
+This governs **new** passwords only: registration, Admin user creation,
+password reset and change-password. **No existing account is locked out** —
+sign-in accepts whatever password the account already has, and the new floor
+applies the next time that password is set.
+
+`PASSWORD_MIN_LENGTH` overrides it and is clamped to `[8, 64]`, so it can only
+be used to tighten the policy. Leave it unset unless you have a reason.
+
+If you want existing six-character passwords gone, there is no forced-rotation
+mechanism in the product: set the affected accounts back to `Pending` in
+**Users & Approvals**, or use the password-reset flow per user.
+
+---
+
 ## 4. Build the client
 
 `VITE_*` variables are inlined at **build** time, not read at runtime. If the
@@ -314,6 +400,9 @@ Keep at least 14 days, copy off-machine (a NAS or object storage), and
 - [ ] `mongosh --eval "db.version()"` reports **7.x**
 - [ ] Fresh production secrets generated; `.env` is not in git (it is gitignored)
 - [ ] All four migration scripts run
+- [ ] `node scripts/encryptExistingTokens.js` reports **0 plaintext token fields** (§3a)
+- [ ] `ALLOW_LEGACY_PLAINTEXT_TOKENS=false` in `.env`, and the API restarted since (§3a)
+- [ ] `PASSWORD_MIN_LENGTH` left at its default of 12, or raised — never lowered (§3b)
 - [ ] `GET /api/health` returns 200 with `"database":"connected"`
 - [ ] HTTPS works and HTTP redirects to it
 - [ ] `FRONTEND_URL`, `VITE_API_URL` and `GOOGLE_REDIRECT_URI` all use the same public origin

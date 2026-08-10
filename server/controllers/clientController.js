@@ -7,6 +7,8 @@ const { parseListParams, listResponse, firstString } = require('../utils/paginat
 const { listClients, CLIENT_SORT_FIELDS, getUnattributedCounts } = require('../utils/clientService');
 const { logActivity } = require('../utils/activityLogger');
 const { log } = require('../utils/logger');
+// M-13: one error envelope, `{ message, errors: [{ path, message }] }`.
+const { fieldError, duplicateKeyPaths, isDuplicateKeyError } = require('../utils/apiError');
 
 const logger = log('clients');
 
@@ -80,7 +82,7 @@ const getClientTimeline = async (req, res) => {
   try {
     const { id } = req.params;
     if (!/^[0-9a-fA-F]{24}$/.test(String(id))) {
-      return res.status(400).json({ success: false, message: 'Invalid client ID' });
+      return fieldError(res, 400, 'Invalid client ID', ['id'], { success: false });
     }
 
     const client = await Client.findById(id).select('name createdAt').lean();
@@ -108,9 +110,24 @@ const getClientTimeline = async (req, res) => {
       emailFilter.fetchedBy = req.user._id;
     }
 
+    /*
+     * M-9 — `counts` used to be `{ tasks: tasks.length, emails: emails.length }`
+     * computed AFTER each side had been `.limit(limit)`-ed, so it tracked
+     * whatever `limit` the caller happened to send:
+     *
+     *   .../timeline            -> counts {tasks: 20, emails: 20}
+     *   .../timeline?limit=100  -> counts {tasks: 24, emails: 55}
+     *   Mongo truth             ->        {tasks: 24, emails: 77}
+     *
+     * — a number named like a total that was never the total and, at the
+     * default limit, was not even the right shape of wrong. `counts` is now two
+     * real `countDocuments` over the SAME role-scoped filters the entries come
+     * from, and what the payload actually carries is reported separately under
+     * `returned`.
+     */
     // Each side is over-fetched to `limit` and the merge trims back to `limit`,
     // so a client with only emails still fills the timeline.
-    const [tasks, emails] = await Promise.all([
+    const [tasks, emails, taskTotal, emailTotal] = await Promise.all([
       Task.find(taskFilter)
         .select('_id title status priority deadline createdAt')
         .sort({ createdAt: -1 })
@@ -121,7 +138,9 @@ const getClientTimeline = async (req, res) => {
         .select('_id subject from date fetchedAt status')
         .sort({ date: -1 })
         .limit(limit)
-        .lean()
+        .lean(),
+      Task.countDocuments(taskFilter),
+      Email.countDocuments(emailFilter)
     ]);
 
     const entries = [
@@ -148,6 +167,9 @@ const getClientTimeline = async (req, res) => {
 
     res.set('Cache-Control', 'private, max-age=30, stale-while-revalidate=60');
 
+    const returnedTasks = entries.filter((e) => e.type === 'task').length;
+    const returnedEmails = entries.filter((e) => e.type === 'email').length;
+
     return res.json({
       success: true,
       data: {
@@ -155,7 +177,14 @@ const getClientTimeline = async (req, res) => {
         name: client.name,
         createdAt: client.createdAt,
         timeline: entries,
-        counts: { tasks: tasks.length, emails: emails.length }
+        // M-9: real totals for this client, in the caller's scope. Independent
+        // of `limit`, and NOT the length of `timeline` below.
+        counts: { tasks: taskTotal, emails: emailTotal },
+        // What this payload actually carries, after the merge and the trim.
+        returned: { tasks: returnedTasks, emails: returnedEmails, entries: entries.length },
+        limit,
+        // True when the timeline is a window onto more activity than it shows.
+        truncated: entries.length < taskTotal + emailTotal
       }
     });
   } catch (err) {
@@ -172,12 +201,14 @@ const createClient = async (req, res) => {
     const { name, associatedEmails, contactPerson, email, phone, notes, status } = req.body;
 
     if (!name) {
-      return res.status(400).json({ success: false, message: 'Client name is required' });
+      // M-13: `success: false` is preserved — this endpoint has always sent it
+      // and the client reads it — and `errors[]` is added alongside.
+      return fieldError(res, 400, 'Client name is required', ['name'], { success: false });
     }
 
     const existingClient = await Client.findOne({ name: { $regex: new RegExp(`^${escapeRegex(name.trim())}$`, 'i') } });
     if (existingClient) {
-      return res.status(400).json({ success: false, message: 'Client with this name already exists' });
+      return fieldError(res, 400, 'Client with this name already exists', ['name'], { success: false });
     }
 
     const formattedEmails = Array.isArray(associatedEmails)
@@ -224,6 +255,21 @@ const createClient = async (req, res) => {
       data: { ...newClient.toObject(), taskCount: 0, completedTaskCount: 0, openTaskCount: 0, mailCount: 0 }
     });
   } catch (err) {
+    /*
+     * M-13 — `Client.name` carries a unique index, so two simultaneous creates
+     * race past the `findOne` above and the loser arrived here as a 500 with no
+     * field on it. A duplicate key names its own field; report it as the same
+     * 400 the non-racing path already returns.
+     */
+    if (isDuplicateKeyError(err)) {
+      return fieldError(
+        res,
+        400,
+        'Client with this name already exists',
+        duplicateKeyPaths(err).map((path) => ({ path, message: 'This value is already taken.' })),
+        { success: false }
+      );
+    }
     logger.error({ err: err.message }, 'createClient failed');
     // H-9: never echo the raw driver/JS message back. It is how
     // `{"name":[]}` answered 500 "name.trim is not a function"; the shape is
@@ -255,7 +301,7 @@ const updateClient = async (req, res) => {
     if (name && name.trim().toLowerCase() !== client.name.toLowerCase()) {
       const existing = await Client.findOne({ name: { $regex: new RegExp(`^${escapeRegex(name.trim())}$`, 'i') } });
       if (existing) {
-        return res.status(400).json({ success: false, message: 'Client with this name already exists' });
+        return fieldError(res, 400, 'Client with this name already exists', ['name'], { success: false });
       }
       client.name = name.trim();
     }

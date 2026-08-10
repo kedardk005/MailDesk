@@ -53,12 +53,102 @@ class TokenDecryptionError extends Error {
   }
 }
 
-// Migration guard. A workspace that predates scripts/encryptExistingTokens.js
-// still holds raw Google tokens (which contain no ':' and therefore cannot be
-// confused with the iv:ciphertext:tag format). Those pass through with a
-// warning while this is 'true'. Set it to 'false' once the migration script has
-// been run so an unencrypted token becomes a hard error.
-const allowLegacyPlaintext = () => process.env.ALLOW_LEGACY_PLAINTEXT_TOKENS !== 'false';
+/**
+ * Does this stored value carry the `iv:ciphertext:tag` envelope `encrypt()`
+ * produces?
+ *
+ * Structural, not a guess: three colon-separated parts, each valid lowercase
+ * hex, with an IV and an auth tag of exactly the right length. The migration
+ * script used to test `!value.includes(':')`, which would have classified any
+ * token containing a single stray colon as already-encrypted and SILENTLY LEFT
+ * IT IN PLAINTEXT — the one failure mode a migration must not have (L-4).
+ *
+ * @param {*} value
+ * @returns {Boolean}
+ */
+const isEncrypted = (value) => {
+  if (typeof value !== 'string' || value === '') return false;
+  const parts = value.split(':');
+  if (parts.length !== 3) return false;
+  const [iv, payload, tag] = parts;
+  const hex = /^[0-9a-f]+$/i;
+  return (
+    iv.length === IV_LENGTH * 2 &&
+    tag.length === TAG_LENGTH * 2 &&
+    hex.test(iv) &&
+    hex.test(tag) &&
+    payload.length > 0 &&
+    payload.length % 2 === 0 &&
+    hex.test(payload)
+  );
+};
+
+/*
+ * L-4 — plaintext OAuth refresh tokens at rest.
+ *
+ * A workspace that predates scripts/encryptExistingTokens.js still holds raw
+ * Google refresh tokens. Those used to pass through with a `console.warn`
+ * whose default was PERMISSIVE EVERYWHERE, including production — so the only
+ * signal that a firm's mailbox credentials were sitting unencrypted in Mongo
+ * was an unstructured line in a log nobody greps, repeated once per mailbox per
+ * sync (the audit found eight of them in one dev run).
+ *
+ * Two changes:
+ *
+ *  1. The default is now permissive only OUTSIDE production. In production the
+ *     guard fails closed unless an operator sets
+ *     ALLOW_LEGACY_PLAINTEXT_TOKENS=true deliberately — a decision that then
+ *     appears in the deployment config rather than in nobody's memory.
+ *  2. The warning goes through the structured logger, is throttled, and
+ *     carries a running count, so it is loud once rather than noise forever.
+ *     `utils/logger` is required lazily: this module is pulled in by scripts
+ *     that must not drag the whole logging stack in with it.
+ */
+const allowLegacyPlaintext = () => {
+  const configured = process.env.ALLOW_LEGACY_PLAINTEXT_TOKENS;
+  if (configured === 'true') return true;
+  if (configured === 'false') return false;
+  return process.env.NODE_ENV !== 'production';
+};
+
+const LEGACY_WARN_INTERVAL_MS = Number(process.env.LEGACY_TOKEN_WARN_INTERVAL_MS || 300000);
+let legacyPlaintextSeen = 0;
+let legacyWarnedAt = 0;
+
+/**
+ * Warn — loudly, once, then at most every LEGACY_TOKEN_WARN_INTERVAL_MS — that
+ * an unencrypted token was read. Never logs the token itself.
+ * @returns {void}
+ */
+const warnLegacyPlaintext = () => {
+  legacyPlaintextSeen += 1;
+  const now = Date.now();
+  if (legacyWarnedAt !== 0 && now - legacyWarnedAt < LEGACY_WARN_INTERVAL_MS) return;
+  legacyWarnedAt = now;
+
+  const payload = {
+    occurrences: legacyPlaintextSeen,
+    remediation: 'node scripts/encryptExistingTokens.js --apply',
+    then: 'set ALLOW_LEGACY_PLAINTEXT_TOKENS=false'
+  };
+  const message =
+    'UNENCRYPTED OAuth token read from the database. Refresh tokens are stored in plaintext ' +
+    'until the migration script is run. See docs/DEPLOY-WINDOWS.md.';
+
+  try {
+    // eslint-disable-next-line global-require
+    require('./logger').log('crypto').warn(payload, message);
+  } catch {
+    console.warn(`[CRYPTO] ${message} ${JSON.stringify(payload)}`);
+  }
+};
+
+/**
+ * How many unencrypted tokens this process has read. Exposed for the boot-time
+ * audit and for tests.
+ * @returns {Number}
+ */
+const legacyPlaintextCount = () => legacyPlaintextSeen;
 
 /**
  * Decrypt a stored OAuth token.
@@ -80,19 +170,16 @@ const decrypt = (ciphertext) => {
     throw new TokenDecryptionError('Stored token is not a string.');
   }
 
-  const parts = ciphertext.split(':');
   // Not in iv:encrypted:authTag form — this is a legacy plaintext token.
-  if (parts.length !== 3) {
+  if (!isEncrypted(ciphertext)) {
     if (allowLegacyPlaintext()) {
-      console.warn(
-        '[CRYPTO] Encountered an unencrypted legacy token. Run scripts/encryptExistingTokens.js, ' +
-          'then set ALLOW_LEGACY_PLAINTEXT_TOKENS=false.'
-      );
+      warnLegacyPlaintext();
       return ciphertext;
     }
     throw new TokenDecryptionError('Stored token is not encrypted and legacy plaintext is disabled.');
   }
 
+  const parts = ciphertext.split(':');
   try {
     const key = getEncryptionKey();
     const iv = Buffer.from(parts[0], 'hex');
@@ -127,4 +214,12 @@ const tryDecrypt = (ciphertext) => {
   }
 };
 
-module.exports = { encrypt, decrypt, tryDecrypt, TokenDecryptionError };
+module.exports = {
+  encrypt,
+  decrypt,
+  tryDecrypt,
+  isEncrypted,
+  allowLegacyPlaintext,
+  legacyPlaintextCount,
+  TokenDecryptionError
+};

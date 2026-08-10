@@ -451,11 +451,73 @@ server.keepAliveTimeout = Number(process.env.KEEPALIVE_TIMEOUT_MS || 65000);
 // Register the job processors BEFORE the workers start consuming.
 registerJobHandlers();
 
+/*
+ * L-4 — say at BOOT whether OAuth refresh tokens are sitting in the database in
+ * plaintext.
+ *
+ * Before this, the only evidence was a `console.warn` emitted once per mailbox
+ * per sync, buried in request logs, that named a script nobody had run. An
+ * operator who wants to know the state of their credentials should not have to
+ * grep for it: this asks once, at startup, and says nothing at all when there
+ * is nothing to say.
+ *
+ * Read-only, non-fatal, and deliberately not awaited by `listen` — a slow or
+ * unavailable database must not hold the port closed.
+ *
+ * @returns {Promise<void>}
+ */
+const auditLegacyTokens = async () => {
+  try {
+    // `bufferCommands` is false (config/db.js), so a query issued before the
+    // handshake completes THROWS rather than queueing. The listen callback
+    // usually wins that race, which is why this waits for the connection
+    // instead of assuming it.
+    if (mongoose.connection.readyState !== 1) {
+      await new Promise((resolve, reject) => {
+        const timer = setTimeout(() => reject(new Error('database not connected in time')), 15000);
+        mongoose.connection.once('connected', () => {
+          clearTimeout(timer);
+          resolve();
+        });
+      });
+    }
+
+    const { allowLegacyPlaintext } = require('./utils/tokenCrypto');
+    // A plaintext Google token contains no ':'; every encrypted one is
+    // `iv:ciphertext:tag`. This is a cheap negative match for the report only —
+    // `tokenCrypto.isEncrypted` is the authority on the read path.
+    const plaintext = { $exists: true, $nin: [null, ''], $not: /:/ };
+    const count = await User.countDocuments({
+      $or: [
+        { gmailRefreshToken: plaintext },
+        { gmailAccessToken: plaintext },
+        { 'linkedGmailAccounts.gmailRefreshToken': plaintext },
+        { 'linkedGmailAccounts.gmailAccessToken': plaintext }
+      ]
+    });
+
+    if (count === 0) return;
+
+    logger.warn(
+      {
+        accounts: count,
+        allowLegacyPlaintextTokens: allowLegacyPlaintext(),
+        remediation: 'node scripts/encryptExistingTokens.js --apply',
+        then: 'set ALLOW_LEGACY_PLAINTEXT_TOKENS=false and restart'
+      },
+      'OAuth tokens are stored in PLAINTEXT for some accounts. See docs/DEPLOY-WINDOWS.md.'
+    );
+  } catch (err) {
+    logger.debug({ err: err.message }, 'legacy token audit skipped');
+  }
+};
+
 server.listen(PORT, () => {
   logger.info(
     { port: PORT, queue: queue.backend(), redis: isRedisConfigured(), env: process.env.NODE_ENV || 'development' },
     'server listening'
   );
+  auditLegacyTokens();
   queue.startWorkers();
   // F-4: expire stale presence entries and re-broadcast a roster that changed
   // because somebody's tab went away without a clean disconnect.

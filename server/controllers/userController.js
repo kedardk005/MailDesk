@@ -12,6 +12,8 @@ const cache = require('../utils/cache');
 const { escapeRegex } = require('../utils/regexHelper');
 const { parseListParams, paginate, listResponse, firstString } = require('../utils/paginate');
 const { log } = require('../utils/logger');
+// M-13: one error envelope, `{ message, errors: [{ path, message }] }`.
+const { fieldError, duplicateKeyPaths, isDuplicateKeyError } = require('../utils/apiError');
 
 const logger = log('users');
 
@@ -122,20 +124,27 @@ exports.createUser = async (req, res) => {
 
     // Validate: all fields required
     if (!name || !email || !password || !role) {
-      return res.status(400).json({ message: 'All fields (name, email, password, role) are required.' });
+      return fieldError(res, 400, 'All fields (name, email, password, role) are required.', [
+        !name && { path: 'name', message: 'Name is required.' },
+        !email && { path: 'email', message: 'Email address is required.' },
+        !password && { path: 'password', message: 'Password is required.' },
+        !role && { path: 'role', message: 'Role is required.' }
+      ].filter(Boolean));
     }
 
     // Validate: role must be Head or Employee (Admin cannot create another Admin)
     const allowedRoles = ['Head', 'Employee'];
     if (!allowedRoles.includes(role)) {
-      return res.status(400).json({ message: 'Invalid role. Admin can only create Head or Employee accounts.' });
+      return fieldError(res, 400, 'Invalid role. Admin can only create Head or Employee accounts.', ['role']);
     }
 
     // Check if email already exists (soft-deleted accounts tombstone their address)
     const emailNormalized = email.toLowerCase().trim();
     const userExists = await User.findOne({ email: emailNormalized, deletedAt: null });
     if (userExists) {
-      return res.status(400).json({ message: 'User with this email already exists.' });
+      // M-13: a duplicate is a field error. It named no path at all before, so
+      // the form could not mark the address the user has to change.
+      return fieldError(res, 400, 'User with this email already exists.', ['email']);
     }
 
     // Hash password using bcryptjs
@@ -179,6 +188,16 @@ exports.createUser = async (req, res) => {
 
     return res.status(201).json(userResponse);
   } catch (error) {
+    // M-13: `User.email` is unique, so a race past the `findOne` above landed
+    // here as a 500 with no field on it. Same 400 as the non-racing path.
+    if (isDuplicateKeyError(error)) {
+      return fieldError(
+        res,
+        400,
+        'User with this email already exists.',
+        duplicateKeyPaths(error).map((path) => ({ path, message: 'This value is already taken.' }))
+      );
+    }
     logger.error({ err: error.message }, 'createUser failed');
     return res.status(500).json({ message: 'Server error. Failed to create user.' });
   }
@@ -228,7 +247,7 @@ exports.updateUser = async (req, res) => {
     if (role) {
       const allowedRoles = ['Admin', 'Head', 'Employee'];
       if (!allowedRoles.includes(role)) {
-        return res.status(400).json({ message: 'Invalid role selection.' });
+        return fieldError(res, 400, 'Invalid role selection.', ['role']);
       }
       // Enforce single Admin constraint
       if (role === 'Admin') {
@@ -239,7 +258,7 @@ exports.updateUser = async (req, res) => {
           _id: { $ne: user._id }
         }).select('_id').lean();
         if (approvedAdminExists) {
-          return res.status(400).json({ message: 'There can only be one Admin in the system.' });
+          return fieldError(res, 400, 'There can only be one Admin in the system.', ['role']);
         }
       }
       user.role = role;
@@ -249,7 +268,7 @@ exports.updateUser = async (req, res) => {
     if (status) {
       const allowedStatuses = ['Pending', 'Approved', 'Rejected'];
       if (!allowedStatuses.includes(status)) {
-        return res.status(400).json({ message: 'Invalid status selection.' });
+        return fieldError(res, 400, 'Invalid status selection.', ['status']);
       }
       
       // Enforce single Admin constraint on status approval
@@ -261,7 +280,7 @@ exports.updateUser = async (req, res) => {
           _id: { $ne: user._id }
         }).select('_id').lean();
         if (approvedAdminExists) {
-          return res.status(400).json({ message: 'There can only be one Admin in the system.' });
+          return fieldError(res, 400, 'There can only be one Admin in the system.', ['role']);
         }
       }
 
@@ -294,7 +313,7 @@ exports.updateUser = async (req, res) => {
       if (emailNormalized !== user.email) {
         const emailExists = await User.findOne({ email: emailNormalized, deletedAt: null });
         if (emailExists) {
-          return res.status(400).json({ message: 'Email address is already in use by another user.' });
+          return fieldError(res, 400, 'Email address is already in use by another user.', ['email']);
         }
         user.email = emailNormalized;
       }
@@ -551,7 +570,7 @@ exports.updateUserProfile = async (req, res) => {
       if (emailNormalized !== user.email) {
         const emailExists = await User.findOne({ email: emailNormalized, deletedAt: null });
         if (emailExists) {
-          return res.status(400).json({ message: 'Email address is already in use by another user.' });
+          return fieldError(res, 400, 'Email address is already in use by another user.', ['email']);
         }
         user.email = emailNormalized;
       }
@@ -609,7 +628,10 @@ exports.changePassword = async (req, res) => {
     const { currentPassword, newPassword } = req.body;
 
     if (!currentPassword || !newPassword) {
-      return res.status(400).json({ message: 'Current password and new password are required.' });
+      return fieldError(res, 400, 'Current password and new password are required.', [
+        !currentPassword && { path: 'currentPassword', message: 'Current password is required.' },
+        !newPassword && { path: 'newPassword', message: 'New password is required.' }
+      ].filter(Boolean));
     }
 
     const user = await User.findById(req.user._id).select('+password');
@@ -620,7 +642,7 @@ exports.changePassword = async (req, res) => {
     // Compare current password
     const isMatch = await bcrypt.compare(currentPassword, user.password);
     if (!isMatch) {
-      return res.status(400).json({ message: 'Incorrect current password.' });
+      return fieldError(res, 400, 'Incorrect current password.', ['currentPassword']);
     }
 
     // Hash the new password

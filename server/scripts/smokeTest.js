@@ -47,6 +47,11 @@ require('dotenv').config();
 
 const mongoose = require('mongoose');
 const bcrypt = require('bcryptjs');
+const nodeCrypto = require('crypto');
+// L-4 runs the token migration script as a child process, against a database
+// of its own, so the script's real behaviour is asserted rather than a copy of
+// its logic.
+const { execFileSync } = require('child_process');
 const { io: ioClient } = require('socket.io-client');
 
 const BASE = process.env.BASE_URL || 'http://127.0.0.1:5150';
@@ -2396,6 +2401,601 @@ const main = async () => {
 
   await Email.deleteMany({ messageId: /^smoke-cat-/ });
 
+  // =====================================================================
+  // AUDIT-predeploy.md — MEDIUM / LOW server findings
+  //
+  //   M-6  SLA medians were wrong on every even-sized sample
+  //   M-7  POST /api/tasks/bulk reported the count REQUESTED, not performed
+  //   M-8  a Head's SLA Resolution panel was a silent blank
+  //   M-9  client timeline `counts` was capped by `limit`
+  //   M-12 two URLs for one operation disagreed on who may call it
+  //   M-13 error bodies outside the Zod routes carried no field detail
+  //   L-3  the password minimum was six characters
+  //   L-4  OAuth refresh tokens at rest, in plaintext
+  //   L-6  Mongoose `new` option deprecation
+  //   L-7  disconnecting ANOTHER user's mailbox answered 200
+  //   L-8  the Clients tile was a metadata read
+  // =====================================================================
+
+  console.log('\nM-6: the SLA median is exact, including for an even-sized sample');
+
+  /*
+   * The defect: MongoDB implements `$median` only as `method: 'approximate'`,
+   * and its t-digest returns the LOWER of the two middle values rather than
+   * interpolating. Every even-sized sample was reported low — on the seeded
+   * workspace, one Head's resolution median came back 6660 against a true 7350.
+   *
+   * This builds a sample whose two answers differ by construction: elapsed
+   * times of 10, 20, 40 and 300 minutes. The lower middle is 20; the median is
+   * (20 + 40) / 2 = 30. A pass here is only possible with a real median.
+   *
+   * A dedicated Head owns the fixtures, so the `fetchedBy` scope isolates them
+   * from every other conversation this suite creates.
+   */
+  const medianEmail = 'smoke.median@example.test';
+  const medianUser = await seedUser(User, { name: 'Smoke Median Head', email: medianEmail, role: 'Head' });
+  const medianLogin = await login(medianEmail, PASSWORD);
+  const medianToken = medianLogin.json?.token;
+  check('median-fixture head login succeeds', medianLogin.status === 200, `got ${medianLogin.status}`);
+
+  /**
+   * One answered conversation with an exact elapsed first-response time.
+   * @param {String} key
+   * @param {Number} minutes
+   * @param {Number} startedHoursAgo
+   * @returns {Promise<void>}
+   */
+  const seedAnsweredThread = async (key, minutes, startedHoursAgo) => {
+    const inboundAt = new Date(Date.now() - startedHoursAgo * 3600000);
+    const outboundAt = new Date(inboundAt.getTime() + minutes * 60000);
+    await Email.create([
+      {
+        messageId: `smoke-median-${key}-in`,
+        threadId: `smoke-median-${key}`,
+        subject: `Median probe ${key}`,
+        from: 'client@example.test',
+        toEmail: medianEmail,
+        date: inboundAt,
+        direction: 'inbound',
+        fetchedBy: medianUser._id
+      },
+      {
+        messageId: `smoke-median-${key}-out`,
+        threadId: `smoke-median-${key}`,
+        subject: `Re: Median probe ${key}`,
+        from: medianEmail,
+        toEmail: 'client@example.test',
+        date: outboundAt,
+        direction: 'outbound',
+        fetchedBy: medianUser._id
+      }
+    ]);
+  };
+
+  await seedAnsweredThread('a', 10, 12);
+  await seedAnsweredThread('b', 20, 11);
+  await seedAnsweredThread('c', 40, 10);
+  await seedAnsweredThread('d', 300, 20);
+
+  // Every SLA read below uses its own range, because the payload is cached for
+  // CACHE_TTL_SLA and a direct model write does not invalidate it. The range is
+  // part of the cache key, so a distinct window is a guaranteed miss.
+  const medianRange = (fromDaysAgo) =>
+    `dateFrom=${new Date(Date.now() - fromDaysAgo * 86400000).toISOString()}` +
+    `&dateTo=${new Date(Date.now() + 3600000).toISOString()}`;
+
+  const evenSample = await api(`/api/reports/sla?${medianRange(2)}`, { token: medianToken });
+  check('GET /api/reports/sla for the median fixture: 200', evenSample.status === 200, `got ${evenSample.status}`);
+  check(
+    'the even-sized sample is all four conversations',
+    evenSample.json?.firstResponse?.count === 4,
+    `count=${evenSample.json?.firstResponse?.count}`
+  );
+  check(
+    'an EVEN sample interpolates: [10,20,40,300] -> 30, not the lower middle (20)',
+    evenSample.json?.firstResponse?.median === 30,
+    `median=${evenSample.json?.firstResponse?.median} (20 is the pre-fix approximate answer)`
+  );
+  check(
+    'the metric says how its median was computed',
+    evenSample.json?.firstResponse?.medianMethod === 'exact',
+    `medianMethod=${evenSample.json?.firstResponse?.medianMethod}`
+  );
+  check(
+    'p90 and max are unchanged by the median fix',
+    evenSample.json?.firstResponse?.max === 300 && evenSample.json?.firstResponse?.p90 >= 40,
+    `p90=${evenSample.json?.firstResponse?.p90} max=${evenSample.json?.firstResponse?.max}`
+  );
+
+  // An ODD sample must still be the single middle value — the parity the
+  // approximate method happened to get right, and therefore the one a fix can
+  // silently break.
+  await seedAnsweredThread('e', 1000, 30);
+  const oddSample = await api(`/api/reports/sla?${medianRange(3)}`, { token: medianToken });
+  check(
+    'the odd-sized sample is all five conversations',
+    oddSample.json?.firstResponse?.count === 5,
+    `count=${oddSample.json?.firstResponse?.count}`
+  );
+  check(
+    'an ODD sample is the middle value: [10,20,40,300,1000] -> 40',
+    oddSample.json?.firstResponse?.median === 40,
+    `median=${oddSample.json?.firstResponse?.median}`
+  );
+
+  const medianSeries = await api(`/api/reports/sla/timeseries?${medianRange(2)}`, { token: medianToken });
+  check('the timeseries reports its median method too', medianSeries.json?.medianMethod === 'exact', `${medianSeries.json?.medianMethod}`);
+  const twoAnswerDay = (medianSeries.json?.buckets || []).find((b) => b.firstResponseCount === 2);
+  check(
+    'a two-sample DAY bucket interpolates as well',
+    !twoAnswerDay || typeof twoAnswerDay.firstResponseMedian === 'number',
+    JSON.stringify(twoAnswerDay)
+  );
+
+  console.log('\nM-8: an empty SLA Resolution panel says WHY it is empty');
+
+  /*
+   * `resolution` only measures tasks that are Completed, completed inside the
+   * window, AND linked to an email. For one seeded Head that is structurally
+   * zero — they hold three email-linked tasks and all three are Late — so the
+   * panel rendered permanently blank with nothing to distinguish it from a
+   * broken query. The scope half of M-8 was fixed with H-4 (`createdBy OR
+   * assignedTo`); this is the contract half.
+   */
+  const noWork = await api(`/api/reports/sla?${medianRange(4)}`, { token: medianToken });
+  check('resolution is empty for a Head with no completed work', noWork.json?.resolution?.count === 0, `count=${noWork.json?.resolution?.count}`);
+  check(
+    'an empty resolution names its reason instead of rendering blank',
+    noWork.json?.resolution?.emptyReason === 'no_completed_tasks_in_range',
+    `emptyReason=${noWork.json?.resolution?.emptyReason}`
+  );
+  check(
+    'an empty resolution reports the counts the reason came from',
+    noWork.json?.resolution?.coverage?.completedInRange === 0 && noWork.json?.resolution?.coverage?.emailLinkedInRange === 0,
+    JSON.stringify(noWork.json?.resolution?.coverage)
+  );
+  check('a metric with no sample claims no median method', noWork.json?.resolution?.medianMethod === null, `${noWork.json?.resolution?.medianMethod}`);
+
+  // Completed work that is NOT linked to an email is the exact case behind the
+  // audit's "structurally always empty": there IS output, it just cannot be
+  // measured, and the reason must say so.
+  await Task.create({
+    title: 'Smoke median completed unlinked',
+    clientName: 'Smoke Median Client',
+    assignedTo: medianUser._id,
+    createdBy: medianUser._id,
+    deadline: new Date(Date.now() + 86400000),
+    status: 'Completed',
+    completedAt: new Date(Date.now() - 3600000)
+  });
+  const unlinked = await api(`/api/reports/sla?${medianRange(5)}`, { token: medianToken });
+  check(
+    'completed-but-unlinked work reports a DIFFERENT reason',
+    unlinked.json?.resolution?.emptyReason === 'no_email_linked_completions',
+    `emptyReason=${unlinked.json?.resolution?.emptyReason}`
+  );
+  check(
+    'the coverage counts distinguish the two cases',
+    unlinked.json?.resolution?.coverage?.completedInRange === 1 && unlinked.json?.resolution?.coverage?.emailLinkedInRange === 0,
+    JSON.stringify(unlinked.json?.resolution?.coverage)
+  );
+
+  // And a measurable resolution must NOT carry a reason.
+  const measurable = await api(`/api/reports/sla?${slaRange}&_=1`, { token: headToken });
+  check('a resolution with a sample carries emptyReason: null', measurable.json?.resolution?.count > 0 && measurable.json?.resolution?.emptyReason === null,
+    `count=${measurable.json?.resolution?.count} emptyReason=${measurable.json?.resolution?.emptyReason}`);
+
+  console.log('\nM-7: POST /api/tasks/bulk reports what it DID, not what was asked');
+
+  /*
+   * `result.deleted` was `taskIds.length`. Deleting one id that does not exist
+   * answered `{"deleted": 1}` against a collection that had not changed — the
+   * API asserting a write it never performed.
+   */
+  const GHOST_ID = '0123456789abcdef01234567';
+  const bulkClient = 'Smoke Bulk Count Client';
+  await Task.deleteMany({ clientName: bulkClient });
+  const makeBulkTask = (title) =>
+    Task.create({
+      title,
+      clientName: bulkClient,
+      assignedTo: adminUser._id,
+      createdBy: adminUser._id,
+      deadline: new Date(Date.now() + 86400000),
+      status: 'Pending'
+    });
+
+  const beforeGhost = await Task.countDocuments({});
+  const ghostDelete = await api('/api/tasks/bulk', {
+    token: adminToken, method: 'POST', body: { action: 'delete', taskIds: [GHOST_ID] }
+  });
+  check('bulk delete of an unknown id: 200', ghostDelete.status === 200, `got ${ghostDelete.status}`);
+  check(
+    'deleting an id that does not exist reports deleted: 0',
+    ghostDelete.json?.result?.deleted === 0,
+    `result=${JSON.stringify(ghostDelete.json?.result)} (1 was the pre-fix answer)`
+  );
+  check('the response still reports what was ASKED for', ghostDelete.json?.result?.requested === 1, JSON.stringify(ghostDelete.json?.result));
+  check('and nothing was actually deleted', (await Task.countDocuments({})) === beforeGhost, 'the collection size moved');
+
+  const [bulkA, bulkB, bulkC] = await Promise.all([makeBulkTask('Bulk A'), makeBulkTask('Bulk B'), makeBulkTask('Bulk C')]);
+
+  const mixedStatus = await api('/api/tasks/bulk', {
+    token: adminToken,
+    method: 'POST',
+    body: { action: 'status', taskIds: [String(bulkA._id), String(bulkB._id), GHOST_ID], value: 'Completed' }
+  });
+  check('bulk status counts only the tasks it matched', mixedStatus.json?.result?.updated === 2, JSON.stringify(mixedStatus.json?.result));
+  check('bulk status reports the rows it actually wrote', mixedStatus.json?.result?.modified === 2, JSON.stringify(mixedStatus.json?.result));
+  check('bulk status echoes the requested count', mixedStatus.json?.result?.requested === 3, JSON.stringify(mixedStatus.json?.result));
+
+  // Re-applying a status changes nothing: `updated` (matched) stays, `modified`
+  // drops to zero. Those are genuinely different questions and now have
+  // genuinely different answers.
+  const reapplied = await api('/api/tasks/bulk', {
+    token: adminToken,
+    method: 'POST',
+    body: { action: 'status', taskIds: [String(bulkA._id), String(bulkB._id)], value: 'Completed' }
+  });
+  check('re-applying a status still matches the rows', reapplied.json?.result?.updated === 2, JSON.stringify(reapplied.json?.result));
+  check('re-applying a status modifies none of them', reapplied.json?.result?.modified === 0, JSON.stringify(reapplied.json?.result));
+
+  const mixedReassign = await api('/api/tasks/bulk', {
+    token: adminToken,
+    method: 'POST',
+    body: { action: 'reassign', taskIds: [String(bulkC._id), GHOST_ID], value: String(headUser._id) }
+  });
+  check('bulk reassign counts only the tasks it matched', mixedReassign.json?.result?.updated === 1, JSON.stringify(mixedReassign.json?.result));
+
+  const mixedDelete = await api('/api/tasks/bulk', {
+    token: adminToken,
+    method: 'POST',
+    body: { action: 'delete', taskIds: [String(bulkA._id), String(bulkB._id), String(bulkC._id), GHOST_ID] }
+  });
+  check('bulk delete counts only the rows removed', mixedDelete.json?.result?.deleted === 3, JSON.stringify(mixedDelete.json?.result));
+  check('bulk delete echoes the requested count', mixedDelete.json?.result?.requested === 4, JSON.stringify(mixedDelete.json?.result));
+  check('the rows really are gone', (await Task.countDocuments({ clientName: bulkClient })) === 0);
+
+  // The audit trail must not repeat the inflated number either.
+  const bulkLog = await ActivityLog.findOne({ action: 'Bulk Task Delete' }).sort({ createdAt: -1 }).lean();
+  check(
+    'the activity row records the real delete count',
+    /Bulk deleted 3 tasks/.test(String(bulkLog?.details || '')),
+    `details=${JSON.stringify(bulkLog?.details)}`
+  );
+
+  console.log('\nM-9: client timeline counts are totals, not a function of ?limit');
+
+  const timelineClientName = 'Smoke Timeline Client';
+  await Client.deleteMany({ name: timelineClientName });
+  await Task.deleteMany({ clientName: timelineClientName });
+  const timelineClient = await Client.create({ name: timelineClientName, associatedEmails: ['tl@example.test'] });
+  for (let i = 0; i < 3; i += 1) {
+    await Task.create({
+      title: `Timeline task ${i}`,
+      clientName: timelineClientName,
+      assignedTo: adminUser._id,
+      createdBy: adminUser._id,
+      deadline: new Date(Date.now() + 86400000),
+      status: 'Pending'
+    });
+    await Email.create({
+      messageId: `smoke-timeline-${i}`,
+      threadId: `smoke-timeline-${i}`,
+      subject: `Timeline mail ${i}`,
+      from: 'tl@example.test',
+      toEmail: 'office@example.test',
+      date: new Date(Date.now() - (i + 1) * 3600000),
+      direction: 'inbound',
+      clientId: timelineClient._id,
+      fetchedBy: adminUser._id
+    });
+  }
+
+  const tinyTimeline = await api(`/api/clients/${timelineClient._id}/timeline?limit=1`, { token: adminToken });
+  check('GET timeline?limit=1: 200', tinyTimeline.status === 200, `got ${tinyTimeline.status}`);
+  check(
+    'counts are the real totals even at limit=1',
+    tinyTimeline.json?.data?.counts?.tasks === 3 && tinyTimeline.json?.data?.counts?.emails === 3,
+    `counts=${JSON.stringify(tinyTimeline.json?.data?.counts)} (1/1 is the pre-fix answer)`
+  );
+  check('the payload says how much of it is actually here', tinyTimeline.json?.data?.returned?.entries === 1, JSON.stringify(tinyTimeline.json?.data?.returned));
+  check('the payload echoes the limit it applied', tinyTimeline.json?.data?.limit === 1, `${tinyTimeline.json?.data?.limit}`);
+  check('a trimmed timeline says it is trimmed', tinyTimeline.json?.data?.truncated === true, `${tinyTimeline.json?.data?.truncated}`);
+  check('timeline entries are still capped by the limit', (tinyTimeline.json?.data?.timeline || []).length === 1, `${tinyTimeline.json?.data?.timeline?.length}`);
+
+  const fullTimeline = await api(`/api/clients/${timelineClient._id}/timeline?limit=100`, { token: adminToken });
+  check(
+    'counts do not move when the limit does',
+    fullTimeline.json?.data?.counts?.tasks === 3 && fullTimeline.json?.data?.counts?.emails === 3,
+    JSON.stringify(fullTimeline.json?.data?.counts)
+  );
+  check('an untrimmed timeline says so', fullTimeline.json?.data?.truncated === false, `${fullTimeline.json?.data?.truncated}`);
+  check(
+    'returned matches what is in the array',
+    fullTimeline.json?.data?.returned?.entries === (fullTimeline.json?.data?.timeline || []).length,
+    JSON.stringify(fullTimeline.json?.data?.returned)
+  );
+
+  console.log('\nM-12: both URLs for a client write agree on who may call it');
+
+  /*
+   * `POST /api/clients` admitted a Head (201) while `POST /api/tasks/clients`
+   * refused one (403) — the same write, two answers, decided by which of two
+   * documented-duplicate URLs the caller happened to use. Aligned on
+   * Admin + Head, because Head client management is a shipped feature
+   * (ClientList grants its controls on `isAdmin || isHead`).
+   */
+  const m12A = `Smoke M12 Primary ${Date.now()}`;
+  const m12B = `Smoke M12 Duplicate ${Date.now()}`;
+  const viaClients = await api('/api/clients', { token: headToken, method: 'POST', body: { name: m12A } });
+  const viaTasks = await api('/api/tasks/clients', { token: headToken, method: 'POST', body: { name: m12B } });
+  check('POST /api/clients admits a Head', viaClients.status === 201, `got ${viaClients.status}`);
+  check('POST /api/tasks/clients admits a Head too', viaTasks.status === 201, `got ${viaTasks.status} (403 was the pre-fix answer)`);
+  check('the two URLs now agree', viaClients.status === viaTasks.status, `${viaClients.status} vs ${viaTasks.status}`);
+
+  const createdA = await Client.findOne({ name: m12A }).lean();
+  const createdB = await Client.findOne({ name: m12B }).lean();
+  const putA = await api(`/api/clients/${createdA?._id}`, { token: headToken, method: 'PUT', body: { notes: 'edited' } });
+  const putB = await api(`/api/tasks/clients/${createdB?._id}`, { token: headToken, method: 'PUT', body: { notes: 'edited' } });
+  check('PUT /api/clients/:id admits a Head', putA.status === 200, `got ${putA.status}`);
+  check('PUT /api/tasks/clients/:id admits a Head too', putB.status === 200, `got ${putB.status}`);
+
+  // DELETE stays Admin-only on BOTH URLs — they already agreed, and it is the
+  // one client operation that is not reversible from the UI.
+  const delA = await api(`/api/clients/${createdA?._id}`, { token: headToken, method: 'DELETE' });
+  const delB = await api(`/api/tasks/clients/${createdB?._id}`, { token: headToken, method: 'DELETE' });
+  check('DELETE /api/clients/:id still refuses a Head', delA.status === 403, `got ${delA.status}`);
+  check('DELETE /api/tasks/clients/:id still refuses a Head', delB.status === 403, `got ${delB.status}`);
+  check('an Employee is refused on both create URLs', (await api('/api/clients', { token: empToken, method: 'POST', body: { name: 'nope' } })).status === 403);
+  check('  ... and on the duplicate URL', (await api('/api/tasks/clients', { token: empToken, method: 'POST', body: { name: 'nope' } })).status === 403);
+  await Client.deleteMany({ name: { $in: [m12A, m12B] } });
+
+  console.log('\nM-13: every 400 carries field-level detail');
+
+  // The headline used to be Zod's raw wire complaint, which names no field.
+  const emptyTask = await api('/api/tasks', { token: adminToken, method: 'POST', body: {} });
+  check('an empty task create is 400', emptyTask.status === 400, `got ${emptyTask.status}`);
+  check('  ... with one entry per missing field', (emptyTask.json?.errors || []).length === 4, JSON.stringify(emptyTask.json?.errors));
+  check(
+    '  ... and a headline that names them, not "expected string, received undefined"',
+    !/^Invalid input: expected /.test(String(emptyTask.json?.message || '')) &&
+      /title/.test(String(emptyTask.json?.message || '')),
+    `message=${JSON.stringify(emptyTask.json?.message)}`
+  );
+
+  // A single field error keeps its own wording — the headline is not rewritten
+  // when it was already useful.
+  const oneBadField = await api('/api/tasks', {
+    token: adminToken,
+    method: 'POST',
+    body: { title: 'x', clientName: 'y', assignedTo: 'not-an-id', deadline: new Date().toISOString() }
+  });
+  check('a single field error keeps its own message', oneBadField.json?.message === 'Assignee must be a valid ID.', `message=${JSON.stringify(oneBadField.json?.message)}`);
+
+  // Duplicate keys used to carry no path at all.
+  const dupName = `Smoke Dup ${Date.now()}`;
+  await api('/api/clients', { token: adminToken, method: 'POST', body: { name: dupName } });
+  const dupClient = await api('/api/clients', { token: adminToken, method: 'POST', body: { name: dupName } });
+  check('a duplicate client name is 400', dupClient.status === 400, `got ${dupClient.status}`);
+  check('  ... blamed on `name`', (dupClient.json?.errors || []).some((e) => e.path === 'name'), JSON.stringify(dupClient.json));
+  check('  ... with the legacy `success: false` preserved', dupClient.json?.success === false, JSON.stringify(dupClient.json));
+  await Client.deleteMany({ name: dupName });
+
+  const dupEmail = `smoke.dup.${Date.now()}@example.test`;
+  await api('/api/users', { token: adminToken, method: 'POST', body: { name: 'Dup', email: dupEmail, password: PASSWORD, role: 'Employee' } });
+  const dupUser = await api('/api/users', { token: adminToken, method: 'POST', body: { name: 'Dup', email: dupEmail, password: PASSWORD, role: 'Employee' } });
+  check('a duplicate user email is 400', dupUser.status === 400, `got ${dupUser.status}`);
+  check('  ... blamed on `email`', (dupUser.json?.errors || []).some((e) => e.path === 'email'), JSON.stringify(dupUser.json));
+
+  const dupUserDoc = await User.findOne({ email: dupEmail }).lean();
+  const renameClash = await api(`/api/users/${dupUserDoc?._id}`, { token: adminToken, method: 'PUT', body: { email: adminEmail } });
+  check('taking another user\'s address is 400', renameClash.status === 400, `got ${renameClash.status}`);
+  check('  ... blamed on `email`', (renameClash.json?.errors || []).some((e) => e.path === 'email'), JSON.stringify(renameClash.json));
+
+  // A malformed edit was a silent no-op write that reported success.
+  const emptyEdit = await api(`/api/users/${dupUserDoc?._id}`, { token: adminToken, method: 'PUT', body: {} });
+  check('an empty user update is 400, not a 200 no-op', emptyEdit.status === 400, `got ${emptyEdit.status}`);
+  const typoEdit = await api(`/api/users/${dupUserDoc?._id}`, { token: adminToken, method: 'PUT', body: { emial: 'typo@example.test' } });
+  check('an update of nothing but unknown keys is 400 too', typoEdit.status === 400, `got ${typoEdit.status}`);
+  const realEdit = await api(`/api/users/${dupUserDoc?._id}`, { token: adminToken, method: 'PUT', body: { name: 'Dup Renamed' } });
+  check('a real update still succeeds', realEdit.status === 200, `got ${realEdit.status}`);
+  await User.deleteOne({ email: dupEmail });
+
+  console.log('\nL-3: the password minimum is 12, and no existing account is locked out');
+
+  const shortRegister = await api('/api/auth/register', {
+    method: 'POST',
+    body: { name: 'Short', email: `smoke.short.${Date.now()}@example.test`, password: 'abc123' }
+  });
+  check('a six-character password is refused at registration', shortRegister.status === 400, `got ${shortRegister.status}`);
+  check('  ... naming the field and the new minimum',
+    (shortRegister.json?.errors || []).some((e) => e.path === 'password' && /12 characters/.test(e.message)),
+    JSON.stringify(shortRegister.json));
+
+  const shortCreate = await api('/api/users', {
+    token: adminToken,
+    method: 'POST',
+    body: { name: 'Short', email: `smoke.short2.${Date.now()}@example.test`, password: 'abc123', role: 'Employee' }
+  });
+  check('an Admin cannot create an account with a short password', shortCreate.status === 400, `got ${shortCreate.status}`);
+
+  /*
+   * The half that matters more: this must NOT lock anyone out. An account whose
+   * stored hash was created under the old six-character rule still signs in;
+   * only SETTING a new password is governed by the new floor.
+   */
+  const legacyEmail = 'smoke.legacy6@example.test';
+  await User.deleteOne({ email: legacyEmail });
+  await User.create({
+    name: 'Smoke Legacy Six',
+    email: legacyEmail,
+    password: await bcrypt.hash('abc123', 10),
+    role: 'Employee',
+    status: 'Approved'
+  });
+  const legacyLogin = await login(legacyEmail, 'abc123');
+  check('an account with a six-character password still signs in', legacyLogin.status === 200 && Boolean(legacyLogin.json?.token), `got ${legacyLogin.status}`);
+  const legacyShortChange = await api('/api/users/change-password', {
+    token: legacyLogin.json?.token, method: 'PUT', body: { currentPassword: 'abc123', newPassword: 'short1' }
+  });
+  check('but their NEXT password must meet the new floor', legacyShortChange.status === 400, `got ${legacyShortChange.status}`);
+  const legacyGoodChange = await api('/api/users/change-password', {
+    token: legacyLogin.json?.token, method: 'PUT', body: { currentPassword: 'abc123', newPassword: 'correct horse battery' }
+  });
+  check('a long replacement password is accepted', legacyGoodChange.status === 200, `got ${legacyGoodChange.status} ${JSON.stringify(legacyGoodChange.json)}`);
+  await User.deleteOne({ email: legacyEmail });
+
+  console.log('\nL-4: plaintext OAuth tokens are detected, and the migration is safe');
+
+  const tokenCrypto = require('../utils/tokenCrypto');
+  const restoreKey = process.env.TOKEN_ENCRYPTION_KEY;
+  // Deterministic regardless of what the environment carries.
+  process.env.TOKEN_ENCRYPTION_KEY = restoreKey || nodeCrypto.randomBytes(32).toString('hex');
+
+  const sampleCipher = tokenCrypto.encrypt('1//0g-smoke-refresh-token');
+  check('an encrypted token is recognised as encrypted', tokenCrypto.isEncrypted(sampleCipher) === true);
+  check('a raw Google token is not', tokenCrypto.isEncrypted('1//0g-smoke-refresh-token') === false);
+  // The old detector was `!value.includes(':')`, which would have classified
+  // this as encrypted and left it in plaintext forever.
+  check('a value with ONE stray colon is not mistaken for ciphertext', tokenCrypto.isEncrypted('1//0g:smoke') === false);
+  check('a three-part non-hex value is not either', tokenCrypto.isEncrypted('aa:bb:cc') === false);
+  check('the round trip recovers the token', tokenCrypto.decrypt(sampleCipher) === '1//0g-smoke-refresh-token');
+
+  // The migration script runs against a DEDICATED probe database, so it can
+  // never touch the fixtures the rest of this suite depends on.
+  const probeUri = (() => {
+    const url = new URL(process.env.MONGO_URI);
+    url.pathname = `${url.pathname.replace(/\/$/, '')}_l4probe`;
+    return url.toString();
+  })();
+  const probeConn = await mongoose.createConnection(probeUri).asPromise();
+  const ProbeUser = probeConn.model('User', require('../models/User').schema);
+  await ProbeUser.deleteMany({});
+  await ProbeUser.create({
+    name: 'Probe',
+    email: 'l4probe@example.test',
+    password: 'x',
+    role: 'Head',
+    status: 'Approved',
+    gmailEmail: 'probe@example.test',
+    gmailRefreshToken: '1//0g-plaintext-refresh',
+    linkedGmailAccounts: [{ gmailEmail: 'linked@example.test', gmailRefreshToken: '1//0g-plaintext-linked' }]
+  });
+
+  const runMigration = (args) => {
+    try {
+      const stdout = execFileSync(process.execPath, ['scripts/encryptExistingTokens.js', ...args], {
+        cwd: require('path').join(__dirname, '..'),
+        env: { ...process.env, MONGO_URI: probeUri },
+        encoding: 'utf8',
+        stdio: ['ignore', 'pipe', 'pipe']
+      });
+      return { ok: true, stdout };
+    } catch (err) {
+      return { ok: false, stdout: String(err.stdout || '') + String(err.stderr || '') };
+    }
+  };
+
+  const dryRun = runMigration([]);
+  check('the migration script defaults to a dry run', dryRun.ok && /DRY RUN/.test(dryRun.stdout), dryRun.stdout.slice(-200));
+  check('  ... and reports the plaintext it found', /token fields, plaintext: 2/.test(dryRun.stdout), dryRun.stdout.slice(-300));
+  const afterDry = await ProbeUser.findOne({ email: 'l4probe@example.test' }).select('+gmailRefreshToken +linkedGmailAccounts');
+  check('a dry run writes NOTHING', afterDry.gmailRefreshToken === '1//0g-plaintext-refresh', 'the dry run modified the record');
+  check('the migration script never prints a token', !/0g-plaintext/.test(dryRun.stdout), 'a token appeared in the output');
+
+  const applied = runMigration(['--apply', '--yes']);
+  check('the migration applies with --apply', applied.ok && /users rewritten\s*: 1/.test(applied.stdout), applied.stdout.slice(-300));
+  const afterApply = await ProbeUser.findOne({ email: 'l4probe@example.test' }).select('+gmailRefreshToken +linkedGmailAccounts');
+  check('the primary refresh token is encrypted at rest', tokenCrypto.isEncrypted(afterApply.gmailRefreshToken), 'still plaintext');
+  check('the LINKED account token is encrypted too', tokenCrypto.isEncrypted(afterApply.linkedGmailAccounts[0].gmailRefreshToken), 'still plaintext');
+  check('the encrypted token decrypts back to the original', tokenCrypto.decrypt(afterApply.gmailRefreshToken) === '1//0g-plaintext-refresh');
+  const rerun = runMigration([]);
+  check('a second dry run finds nothing left to do', rerun.ok && /token fields, plaintext: 0/.test(rerun.stdout), rerun.stdout.slice(-300));
+
+  await probeConn.dropDatabase();
+  await probeConn.close();
+  if (restoreKey === undefined) delete process.env.TOKEN_ENCRYPTION_KEY;
+  else process.env.TOKEN_ENCRYPTION_KEY = restoreKey;
+
+  console.log('\nL-6: the deprecated Mongoose `new` option is gone');
+
+  // Asserted at the source, because a deprecation warning is emitted once per
+  // process on stderr and never reaches this test.
+  const fs = require('fs');
+  const path = require('path');
+  for (const rel of [
+    'controllers/reportsController.js',
+    'controllers/notificationController.js',
+    'controllers/taskController.js',
+    'utils/taskHelper.js',
+    'scripts/seedDemoData.js'
+  ]) {
+    const lines = fs.readFileSync(path.join(__dirname, '..', rel), 'utf8').split('\n');
+    const offenders = lines.filter((line) => {
+      const trimmed = line.trim();
+      if (trimmed.startsWith('//') || trimmed.startsWith('*') || trimmed.startsWith('/*')) return false;
+      return /\bnew:\s*true\b/.test(line);
+    });
+    check(`${rel} uses returnDocument, not the deprecated \`new\``, offenders.length === 0, offenders.join(' | '));
+  }
+  // The behaviour the option controlled must be unchanged: the POST-update doc.
+  const policyEcho = await api('/api/reports/sla/policy', {
+    token: adminToken, method: 'PUT', body: { firstResponseMinutes: 123 }
+  });
+  check('findOneAndUpdate still returns the UPDATED policy', policyEcho.json?.policy?.firstResponseMinutes === 123, JSON.stringify(policyEcho.json?.policy));
+
+  console.log('\nL-7: disconnecting somebody else\'s mailbox is refused, not silently ignored');
+
+  /*
+   * `DELETE /api/gmail/linked-account` with another Head's `userId` answered
+   * 200 while dropping the id and acting on the CALLER's own profile — a
+   * success message about a mailbox that was never touched, and silence about
+   * the one that was.
+   */
+  const foreignDisconnect = await api('/api/gmail/linked-account', {
+    token: headToken, method: 'DELETE', body: { userId: String(adminUser._id) }
+  });
+  check('a Head naming another user is 403', foreignDisconnect.status === 403, `got ${foreignDisconnect.status} ${JSON.stringify(foreignDisconnect.json)} (200 was the pre-fix answer)`);
+  check('  ... and says why', /only disconnect a Gmail account linked to your own profile/i.test(String(foreignDisconnect.json?.message || '')), JSON.stringify(foreignDisconnect.json));
+  const foreignWithEmail = await api('/api/gmail/linked-account', {
+    token: headToken, method: 'DELETE', body: { userId: String(adminUser._id), gmailEmail: 'someone@example.test' }
+  });
+  check('naming another user is refused even with a gmailEmail', foreignWithEmail.status === 403, `got ${foreignWithEmail.status}`);
+  const selfDisconnect = await api('/api/gmail/linked-account', {
+    token: headToken, method: 'DELETE', body: { userId: String(headUser._id) }
+  });
+  check('naming YOURSELF still works', selfDisconnect.status === 200, `got ${selfDisconnect.status} ${JSON.stringify(selfDisconnect.json)}`);
+  const adminDisconnect = await api('/api/gmail/linked-account', {
+    token: adminToken, method: 'DELETE', body: { userId: String(headUser._id) }
+  });
+  check('an Admin may still act on another user', adminDisconnect.status === 200, `got ${adminDisconnect.status}`);
+  check('an Employee cannot reach the route at all', (await api('/api/gmail/linked-account', { token: empToken, method: 'DELETE', body: { userId: String(headUser._id) } })).status === 403);
+
+  console.log('\nL-8: the Clients tile agrees with the Clients list');
+
+  const tileBefore = await api('/api/reports/overall', { token: adminToken });
+  const listBefore = await api('/api/clients?page=1&limit=1', { token: adminToken });
+  check(
+    'the dashboard tile equals the list total',
+    tileBefore.json?.totalClients === listBefore.json?.pagination?.total,
+    `tile=${tileBefore.json?.totalClients} list=${listBefore.json?.pagination?.total}`
+  );
+
+  const tileClientName = `Smoke Tile Client ${Date.now()}`;
+  const tileCreated = await api('/api/clients', { token: adminToken, method: 'POST', body: { name: tileClientName } });
+  check('creating a client: 201', tileCreated.status === 201, `got ${tileCreated.status}`);
+  const tileAfter = await api('/api/reports/overall', { token: adminToken });
+  const listAfter = await api('/api/clients?page=1&limit=1', { token: adminToken });
+  check(
+    'both move together after a write',
+    tileAfter.json?.totalClients === listAfter.json?.pagination?.total &&
+      tileAfter.json?.totalClients === (tileBefore.json?.totalClients || 0) + 1,
+    `tile ${tileBefore.json?.totalClients} -> ${tileAfter.json?.totalClients}, list ${listAfter.json?.pagination?.total}`
+  );
+  await Client.deleteMany({ name: tileClientName });
+
+
   console.log('\nS-6: change-password returns a replacement token');
   const NEW_PASSWORD = 'SmokeTest!9876';
   const changed = await api('/api/users/change-password', {
@@ -2428,8 +3028,14 @@ const main = async () => {
   await Task.deleteMany({ linkedEmail: { $in: smokeEmailIds } });
   // Covers the F-3 fixture (`smoke-ai-hostile`) too.
   await Email.deleteMany({ messageId: /^smoke-/ });
-  await Task.deleteMany({ clientName: { $in: ['Smoke Client', 'Smoke Pref Client', slaClient] } });
-  await Client.deleteMany({ name: { $in: ['Smoke Client', auditClientName] } });
+  await Task.deleteMany({
+    clientName: { $in: ['Smoke Client', 'Smoke Pref Client', slaClient, 'Smoke Median Client', 'Smoke Timeline Client', 'Smoke Bulk Count Client'] }
+  });
+  await Client.deleteMany({ name: { $in: ['Smoke Client', auditClientName, 'Smoke Timeline Client'] } });
+  // AUDIT-predeploy MEDIUM/LOW fixtures.
+  await Client.deleteMany({ name: /^Smoke (M12|Dup|Tile) / });
+  await User.deleteMany({ email: { $in: [medianEmail, 'smoke.legacy6@example.test'] } });
+  await ActivityLog.deleteMany({ userId: medianUser._id });
   // The S-2 section reads real audit rows, so the rows this run wrote are
   // removed with the users that authored them rather than left as orphans.
   await ActivityLog.deleteMany({ userId: { $in: [adminUser._id, headUser._id] } });

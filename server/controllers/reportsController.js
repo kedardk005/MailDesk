@@ -9,7 +9,8 @@ const {
   getTaskCountsByClient,
   getMailCountsByClient,
   getUnattributedCounts,
-  unattributedRow
+  unattributedRow,
+  countClients
 } = require('../utils/clientService');
 const { getEffectivePolicies, targetMsExpr } = require('../utils/slaPolicy');
 const { businessWindows, elapsedMsExpr } = require('../utils/slaCalendar');
@@ -207,8 +208,23 @@ exports.getOverallStats = async (req, res) => {
             }
           ]),
           User.countDocuments({ deletedAt: null }),
-          // O(1) metadata read: an exact count is not meaningful on a tile.
-          Client.estimatedDocumentCount()
+          /*
+           * L-8 — this was `Client.estimatedDocumentCount()`.
+           *
+           * It agreed with `/api/clients` on the audited run, so nothing was
+           * observably wrong — but it is a collection-metadata read, not a
+           * count: it is restored from the last checkpoint after an unclean
+           * shutdown and can sit wrong indefinitely, and unlike every other
+           * tile here it applied no filter at all. `countClients` runs the SAME
+           * base filter the client list runs, so the tile and the page it links
+           * to cannot disagree.
+           *
+           * Deliberately NOT role-scoped: `GET /api/clients` is not either (all
+           * 25 rows are visible to every role; only the per-client COUNTERS are
+           * scoped), and a tile scoped differently from the list beneath it is
+           * exactly the H-4 defect.
+           */
+          countClients()
         ]);
 
         const tasks = taskAgg[0] || { total: 0, pending: 0, completed: 0, late: 0 };
@@ -602,10 +618,15 @@ const toMinutes = (ms) =>
 /**
  * The percentile `$group` stage.
  *
- * `$median` and `$percentile` (MongoDB 7.0+) with `method: 'approximate'`: the
- * t-digest is computed by the server in bounded memory. The alternative —
- * `$push` + `$sortArray` — materialises every value into one 16 MB document and
- * falls over at exactly the volume where the metric starts to matter.
+ * `$percentile` (MongoDB 7.0+) with `method: 'approximate'`: the t-digest is
+ * computed by the server in bounded memory. The alternative — `$push` +
+ * `$sortArray` — materialises every value into one 16 MB document and falls
+ * over at exactly the volume where the metric starts to matter.
+ *
+ * `medianMs` here is the APPROXIMATE median and is only ever used as a fallback
+ * for a sample too large for the exact pass below (audit M-6). `p90` and `max`
+ * are unaffected: the audit re-derived every `count`, `breachCount`,
+ * `breachRate`, `max` and `p90` and found them correct.
  *
  * @param {String} valueField - e.g. '$elapsedMs'
  * @returns {Object}
@@ -621,19 +642,120 @@ const percentileGroup = (valueField) => ({
   }
 });
 
+/*
+ * M-6 — the median was wrong on every even-sized sample.
+ *
+ * MongoDB implements `$median` ONLY as `method: 'approximate'`, and the
+ * t-digest returns the LOWER of the two middle data points instead of
+ * interpolating between them. Re-verified against this MongoDB 7.0:
+ *
+ *   [1800, 3060, 6480, 6660, 8040, 9000, 10200, 11220]
+ *     $median approximate -> 6660
+ *     true median (6660 + 8040) / 2 -> 7350        (the API was 9.4% low)
+ *
+ * and the number is rendered to a tenth of a minute, implying an exactness it
+ * did not have. Odd-sized samples happened to agree, so the defect was
+ * invisible exactly half the time.
+ *
+ * The exact pass below ranks the sample with `$setWindowFields` and averages
+ * the one or two middle rows — the textbook median for both parities. It is a
+ * SORT rather than a t-digest, so it is bounded by `allowDiskUse(true)` (which
+ * every SLA aggregate already sets) rather than by the 16 MB document limit
+ * that `$push` + `$sortArray` would hit.
+ *
+ * Above `SLA_EXACT_MEDIAN_MAX_SAMPLES` rows in one sample the exact pass yields
+ * nothing and the approximate value is reported instead — but the payload then
+ * says `medianMethod: 'approximate'` rather than pretending.
+ */
+const SLA_EXACT_MEDIAN_MAX_SAMPLES = Number(process.env.SLA_EXACT_MEDIAN_MAX_SAMPLES || 200000);
+
 /**
- * Shape a percentileGroup row into the documented metric object.
- * @param {Object|undefined} row
+ * Stages computing an EXACT median.
+ *
+ * Ranks are 1-based, so for a sample of size n the middle rows are
+ * `ceil(n/2)` and `floor(n/2) + 1`: identical for odd n (one row, averaged with
+ * itself) and the two middle rows for even n.
+ *
+ * @param {String} valueField - e.g. '$elapsedMs'
+ * @param {Object} [options]
+ * @param {String} [options.partitionBy] - e.g. '$day' for the daily buckets
+ * @param {String} [options.groupBy] - group key for the output row
+ * @returns {Object[]} pipeline stages
+ */
+const exactMedianStages = (valueField, { partitionBy = null, groupBy = null } = {}) => [
+  {
+    $setWindowFields: {
+      ...(partitionBy ? { partitionBy } : {}),
+      sortBy: { [valueField.replace(/^\$/, '')]: 1 },
+      output: {
+        __rank: { $documentNumber: {} },
+        __n: { $count: {}, window: { documents: ['unbounded', 'unbounded'] } }
+      }
+    }
+  },
+  {
+    $match: {
+      $expr: {
+        $and: [
+          { $lte: ['$__n', SLA_EXACT_MEDIAN_MAX_SAMPLES] },
+          {
+            $in: [
+              '$__rank',
+              [{ $ceil: { $divide: ['$__n', 2] } }, { $add: [{ $floor: { $divide: ['$__n', 2] } }, 1] }]
+            ]
+          }
+        ]
+      }
+    }
+  },
+  {
+    $group: {
+      _id: groupBy || null,
+      medianMs: { $avg: valueField },
+      sampleSize: { $max: '$__n' }
+    }
+  }
+];
+
+/**
+ * Terminal stage for a single-metric pipeline: the approximate stats and the
+ * exact median over the same input, in one pass.
+ *
+ * `$facet` cannot be nested, so the first-response pipeline (which already ends
+ * in a `$facet`) spreads these branches into its own facet instead.
+ *
+ * @param {String} valueField
+ * @returns {Object} a $facet stage
+ */
+const slaMetricFacet = (valueField) => ({
+  $facet: {
+    stats: [percentileGroup(valueField)],
+    exactMedian: exactMedianStages(valueField)
+  }
+});
+
+/**
+ * Shape a percentileGroup row plus its exact-median row into the documented
+ * metric object.
+ *
+ * @param {Object} [rows]
+ * @param {Object} [rows.stats] - the percentileGroup row
+ * @param {Object} [rows.exact] - the exactMedianStages row
  * @param {Object} [extra]
  * @returns {Object}
  */
-const shapeMetric = (row, extra = {}) => {
-  const count = row?.count || 0;
-  const breachCount = row?.breachCount || 0;
+const shapeMetric = ({ stats, exact } = {}, extra = {}) => {
+  const count = stats?.count || 0;
+  const breachCount = stats?.breachCount || 0;
+  const exactMs = typeof exact?.medianMs === 'number' ? exact.medianMs : null;
   return {
-    median: toMinutes(row?.medianMs ?? null),
-    p90: toMinutes(Array.isArray(row?.p90Ms) ? row.p90Ms[0] : row?.p90Ms ?? null),
-    max: toMinutes(row?.maxMs ?? null),
+    median: toMinutes(exactMs !== null ? exactMs : stats?.medianMs ?? null),
+    // M-6: never claim a precision the number does not have. `null` when there
+    // is no sample at all, 'exact' for the ranked median, 'approximate' only
+    // for a sample above SLA_EXACT_MEDIAN_MAX_SAMPLES.
+    medianMethod: count === 0 ? null : exactMs !== null ? 'exact' : 'approximate',
+    p90: toMinutes(Array.isArray(stats?.p90Ms) ? stats.p90Ms[0] : stats?.p90Ms ?? null),
+    max: toMinutes(stats?.maxMs ?? null),
     count,
     breachCount,
     breachRate: count > 0 ? Math.round((breachCount / count) * 1000) / 1000 : 0,
@@ -657,6 +779,76 @@ const slaThreadGroup = () => ({
     clientId: { $max: '$clientId' }
   }
 });
+
+/*
+ * M-8 — the Resolution panel is empty far more often than it is wrong, and an
+ * empty panel with no explanation is indistinguishable from a broken one.
+ *
+ * `resolution` only measures tasks that are Completed, carry a `completedAt`
+ * inside the reporting window, AND are linked to an email. For `head@` in the
+ * seeded workspace that is structurally zero: they hold 3 email-linked tasks
+ * and all 3 are Late, so no widening of the scope rule can produce a number.
+ * (The scope half of M-8 — a Head narrowed to `createdBy` only while
+ * `GET /api/tasks` used `createdBy OR assignedTo` — was fixed with H-4; see
+ * `resolveSlaScope`. `ops.head@` measures 22 tasks under that rule.)
+ *
+ * So the contract states WHY instead of rendering a silent blank:
+ *
+ *   resolution.emptyReason:
+ *     null                            - there is a measurement
+ *     'no_completed_tasks_in_range'   - nothing was completed in this window
+ *     'no_email_linked_completions'   - work was completed, but none of it is
+ *                                       linked to an email, so there is no
+ *                                       conversation to measure from
+ *     'linked_emails_unavailable'     - linked, but the emails are deleted or
+ *                                       carry no usable date
+ *   resolution.coverage: the three counts that reason was derived from.
+ */
+const RESOLUTION_EMPTY_REASONS = {
+  NO_COMPLETIONS: 'no_completed_tasks_in_range',
+  NO_LINKS: 'no_email_linked_completions',
+  NO_EMAILS: 'linked_emails_unavailable'
+};
+
+/**
+ * The two counts that explain an empty resolution metric.
+ *
+ * @param {Object} args
+ * @returns {Promise<{completedInRange: Number, emailLinkedInRange: Number}>}
+ */
+const resolutionCoverageFor = async ({ range, scope }) => {
+  const completedInRange = {
+    status: 'Completed',
+    completedAt: { $gte: range.from, $lte: range.to },
+    ...scope.taskScope
+  };
+
+  const [completed, linked] = await Promise.all([
+    Task.countDocuments(completedInRange),
+    Task.countDocuments({ ...completedInRange, linkedEmail: { $ne: null } })
+  ]);
+
+  return { completedInRange: completed, emailLinkedInRange: linked };
+};
+
+/**
+ * Attach `emptyReason` to a shaped resolution metric.
+ * @param {Object} metric - the result of shapeMetric, carrying `coverage`
+ * @returns {Object} the same object
+ */
+const withEmptyReason = (metric) => {
+  const { completedInRange = 0, emailLinkedInRange = 0 } = metric.coverage || {};
+  if (metric.count > 0) {
+    metric.emptyReason = null;
+  } else if (completedInRange === 0) {
+    metric.emptyReason = RESOLUTION_EMPTY_REASONS.NO_COMPLETIONS;
+  } else if (emailLinkedInRange === 0) {
+    metric.emptyReason = RESOLUTION_EMPTY_REASONS.NO_LINKS;
+  } else {
+    metric.emptyReason = RESOLUTION_EMPTY_REASONS.NO_EMAILS;
+  }
+  return metric;
+};
 
 /**
  * Build the three SLA pipelines for one request.
@@ -693,8 +885,14 @@ const computeSla = async ({ range, scope, policies }) => {
       }
     },
     {
+      // The exact median is a SIBLING branch here, not a nested $facet — a
+      // $facet inside a $facet is rejected by the server.
       $facet: {
         answered: [{ $match: { elapsedMs: { $ne: null } } }, percentileGroup('$elapsedMs')],
+        answeredMedian: [
+          { $match: { elapsedMs: { $ne: null } } },
+          ...exactMedianStages('$elapsedMs')
+        ],
         // Threads that have had no reply at all are NOT a zero-minute response
         // and must never be folded into the median; they are reported
         // separately as `pendingCount`.
@@ -728,7 +926,7 @@ const computeSla = async ({ range, scope, policies }) => {
       }
     },
     { $match: { elapsedMs: { $ne: null } } },
-    percentileGroup('$elapsedMs')
+    slaMetricFacet('$elapsedMs')
   ];
 
   // --- resolution: linked task completedAt minus the thread's first inbound ---
@@ -794,16 +992,20 @@ const computeSla = async ({ range, scope, policies }) => {
       }
     },
     { $match: { elapsedMs: { $ne: null } } },
-    percentileGroup('$elapsedMs')
+    slaMetricFacet('$elapsedMs')
   ];
 
-  const [firstResponseResult, backlogRows, resolutionRows] = await Promise.all([
+  const [firstResponseResult, backlogResult, resolutionResult, resolutionCoverage] = await Promise.all([
     Email.aggregate(firstResponsePipeline).allowDiskUse(true),
     Email.aggregate(backlogPipeline).allowDiskUse(true),
-    Task.aggregate(resolutionPipeline).allowDiskUse(true)
+    Task.aggregate(resolutionPipeline).allowDiskUse(true),
+    // M-8 — why the Resolution panel is empty, when it is.
+    resolutionCoverageFor({ range, scope })
   ]);
 
   const facet = firstResponseResult?.[0] || {};
+  const backlogFacet = backlogResult?.[0] || {};
+  const resolutionFacet = resolutionResult?.[0] || {};
 
   return {
     range: {
@@ -821,11 +1023,17 @@ const computeSla = async ({ range, scope, policies }) => {
       businessHours: policies.default.businessHours,
       clientOverrides: Object.keys(policies.byClient).length
     },
-    firstResponse: shapeMetric(facet.answered?.[0], {
-      pendingCount: facet.pending?.[0]?.value || 0
-    }),
-    resolution: shapeMetric(resolutionRows?.[0]),
-    backlog: shapeMetric(backlogRows?.[0]),
+    firstResponse: shapeMetric(
+      { stats: facet.answered?.[0], exact: facet.answeredMedian?.[0] },
+      { pendingCount: facet.pending?.[0]?.value || 0 }
+    ),
+    resolution: withEmptyReason(
+      shapeMetric(
+        { stats: resolutionFacet.stats?.[0], exact: resolutionFacet.exactMedian?.[0] },
+        { coverage: resolutionCoverage }
+      )
+    ),
+    backlog: shapeMetric({ stats: backlogFacet.stats?.[0], exact: backlogFacet.exactMedian?.[0] }),
     generatedAt: new Date().toISOString()
   };
 };
@@ -856,6 +1064,32 @@ exports.getSlaSummary = async (req, res) => {
 };
 
 /**
+ * Terminal stage for a day-bucketed metric: the per-day approximate stats and
+ * the per-day EXACT median (M-6), over the same input, in one pass.
+ *
+ * The exact branch partitions by the same `$day` key the stats branch groups
+ * on, so the two sides join row-for-row.
+ *
+ * @returns {Object} a $facet stage
+ */
+const dailyMetricFacet = () => ({
+  $facet: {
+    stats: [
+      {
+        $group: {
+          _id: '$day',
+          count: { $sum: 1 },
+          breachCount: { $sum: { $cond: [{ $gt: ['$elapsedMs', '$targetMs'] }, 1, 0] } },
+          medianMs: { $median: { input: '$elapsedMs', method: 'approximate' } },
+          p90Ms: { $percentile: { input: '$elapsedMs', p: [0.9], method: 'approximate' } }
+        }
+      }
+    ],
+    exactMedian: exactMedianStages('$elapsedMs', { partitionBy: '$day', groupBy: '$day' })
+  }
+});
+
+/**
  * Day-bucketed SLA metrics.
  * @param {Object} args
  * @returns {Promise<Object>}
@@ -879,15 +1113,7 @@ const computeSlaTimeseries = async ({ range, scope, policies }) => {
       }
     },
     { $match: { elapsedMs: { $ne: null } } },
-    {
-      $group: {
-        _id: '$day',
-        count: { $sum: 1 },
-        breachCount: { $sum: { $cond: [{ $gt: ['$elapsedMs', '$targetMs'] }, 1, 0] } },
-        medianMs: { $median: { input: '$elapsedMs', method: 'approximate' } },
-        p90Ms: { $percentile: { input: '$elapsedMs', p: [0.9], method: 'approximate' } }
-      }
-    }
+    dailyMetricFacet()
   ];
 
   const resolutionPipeline = [
@@ -948,21 +1174,18 @@ const computeSlaTimeseries = async ({ range, scope, policies }) => {
       }
     },
     { $match: { elapsedMs: { $ne: null } } },
-    {
-      $group: {
-        _id: '$day',
-        count: { $sum: 1 },
-        breachCount: { $sum: { $cond: [{ $gt: ['$elapsedMs', '$targetMs'] }, 1, 0] } },
-        medianMs: { $median: { input: '$elapsedMs', method: 'approximate' } },
-        p90Ms: { $percentile: { input: '$elapsedMs', p: [0.9], method: 'approximate' } }
-      }
-    }
+    dailyMetricFacet()
   ];
 
-  const [frRows, resRows] = await Promise.all([
+  const [frResult, resResult] = await Promise.all([
     Email.aggregate(firstResponsePipeline).allowDiskUse(true),
     Task.aggregate(resolutionPipeline).allowDiskUse(true)
   ]);
+
+  const frRows = frResult?.[0]?.stats || [];
+  const resRows = resResult?.[0]?.stats || [];
+  const frExact = frResult?.[0]?.exactMedian || [];
+  const resExact = resResult?.[0]?.exactMedian || [];
 
   // Zero-filled buckets, in the SAME timezone as `$dateToString` above — a
   // mismatch here silently reads boundary days as zero. Anchored to the
@@ -971,7 +1194,38 @@ const computeSlaTimeseries = async ({ range, scope, policies }) => {
   const { dates, labels } = buildRangeBuckets(range.from, range.to);
   const byDayFr = Object.fromEntries(frRows.map((r) => [r._id, r]));
   const byDayRes = Object.fromEntries(resRows.map((r) => [r._id, r]));
+  const byDayFrExact = Object.fromEntries(frExact.map((r) => [r._id, r]));
+  const byDayResExact = Object.fromEntries(resExact.map((r) => [r._id, r]));
   const p90 = (row) => (Array.isArray(row?.p90Ms) ? row.p90Ms[0] : row?.p90Ms ?? null);
+
+  // M-6: the exact per-day median when there is one, the approximate value only
+  // for a day above SLA_EXACT_MEDIAN_MAX_SAMPLES. `approximated` records
+  // whether ANY bucket fell back, so the payload can say so once rather than
+  // repeating a method flag on every bucket.
+  let approximated = false;
+  const medianOf = (stats, exact) => {
+    if (!stats?.count) return null;
+    if (typeof exact?.medianMs === 'number') return exact.medianMs;
+    approximated = true;
+    return stats.medianMs ?? null;
+  };
+
+  const buckets = dates.map((date) => {
+    const fr = byDayFr[date];
+    const rs = byDayRes[date];
+    return {
+      date,
+      label: labels[date],
+      firstResponseMedian: toMinutes(medianOf(fr, byDayFrExact[date])),
+      firstResponseP90: toMinutes(p90(fr)),
+      firstResponseCount: fr?.count || 0,
+      firstResponseBreachCount: fr?.breachCount || 0,
+      resolutionMedian: toMinutes(medianOf(rs, byDayResExact[date])),
+      resolutionP90: toMinutes(p90(rs)),
+      resolutionCount: rs?.count || 0,
+      resolutionBreachCount: rs?.breachCount || 0
+    };
+  });
 
   return {
     range: {
@@ -982,22 +1236,10 @@ const computeSlaTimeseries = async ({ range, scope, policies }) => {
     },
     scope: scope.scope,
     unit: 'minutes',
-    buckets: dates.map((date) => {
-      const fr = byDayFr[date];
-      const rs = byDayRes[date];
-      return {
-        date,
-        label: labels[date],
-        firstResponseMedian: toMinutes(fr?.medianMs ?? null),
-        firstResponseP90: toMinutes(p90(fr)),
-        firstResponseCount: fr?.count || 0,
-        firstResponseBreachCount: fr?.breachCount || 0,
-        resolutionMedian: toMinutes(rs?.medianMs ?? null),
-        resolutionP90: toMinutes(p90(rs)),
-        resolutionCount: rs?.count || 0,
-        resolutionBreachCount: rs?.breachCount || 0
-      };
-    }),
+    // How every `*Median` below was computed. 'approximate' means at least one
+    // bucket held more than SLA_EXACT_MEDIAN_MAX_SAMPLES samples.
+    medianMethod: approximated ? 'approximate' : 'exact',
+    buckets,
     generatedAt: new Date().toISOString()
   };
 };
@@ -1077,7 +1319,10 @@ exports.updateSlaPolicyConfig = async (req, res) => {
     const saved = await SlaPolicy.findOneAndUpdate(
       filter,
       { $set: update, $setOnInsert: filter },
-      { new: true, upsert: true, setDefaultsOnInsert: true }
+      // L-6: `new: true` is deprecated in Mongoose 9 ("the `new` option for
+      // `findOneAndUpdate()` and `findOneAndReplace()` is deprecated. Use
+      // `returnDocument: 'after'` instead."). Same semantics, no warning.
+      { returnDocument: 'after', upsert: true, setDefaultsOnInsert: true }
     ).lean();
 
     // Changing a TARGET moves every breach count without any task or email

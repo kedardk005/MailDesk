@@ -4,6 +4,8 @@ const { createNotification } = require('../utils/notificationHelper');
 const { logActivity } = require('../utils/activityLogger');
 const { parseListParams, paginate, listResponse } = require('../utils/paginate');
 const { log } = require('../utils/logger');
+// M-13: one error envelope, `{ message, errors: [{ path, message }] }`.
+const { fieldError } = require('../utils/apiError');
 
 const logger = log('comments');
 
@@ -63,7 +65,7 @@ exports.addComment = async (req, res) => {
   try {
     const { message } = req.body;
     if (!message || !message.trim()) {
-      return res.status(400).json({ message: 'Comment message is required.' });
+      return fieldError(res, 400, 'Comment message is required.', ['message']);
     }
 
     const task = await Task.findById(req.params.id)

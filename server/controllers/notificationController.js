@@ -62,7 +62,9 @@ exports.markAsRead = async (req, res) => {
     const notification = await Notification.findOneAndUpdate(
       { _id: req.params.id, userId: req.user._id },
       { $set: { read: true } },
-      { new: true }
+      // L-6: `new` is deprecated in Mongoose 9; `returnDocument` is the
+      // supported spelling of the same behaviour.
+      { returnDocument: 'after' }
     ).lean();
 
     if (!notification) {

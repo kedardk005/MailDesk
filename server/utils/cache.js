@@ -215,10 +215,22 @@ const TTL = {
 /** Invalidate everything that depends on the keyword-rule set. @returns {Promise<void>} */
 const invalidateRules = () => del(KEYS.activeRules());
 
-/** Invalidate everything that depends on the client list. @returns {Promise<void>} */
+/**
+ * Invalidate everything that depends on the client list.
+ *
+ * L-8: the `dash:` prefix goes too. The dashboard payload carries
+ * `totalClients`, but only `invalidateStats` (task/email/user writes) dropped
+ * it — so creating a client moved `GET /api/clients` immediately and left the
+ * tile above it reading the old number for up to CACHE_TTL_DASHBOARD. Every
+ * other tile on that payload is already invalidated by the write that changes
+ * it; this makes the Clients tile behave the same.
+ *
+ * @returns {Promise<void>}
+ */
 const invalidateClients = async () => {
   await del(KEYS.allClients(), KEYS.clientMatcher());
   await delPrefix(KEYS.reportPrefix());
+  await delPrefix(KEYS.dashboardPrefix());
 };
 
 /** Invalidate report + dashboard aggregates after a task/email write. @returns {Promise<void>} */
