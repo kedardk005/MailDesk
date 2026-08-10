@@ -236,30 +236,14 @@ exports.forgotPassword = async (req, res) => {
     const resetLink = `${frontendUrl}/reset-password?token=${rawToken}`;
 
     const { sendEmail } = require('../utils/emailHelper');
-    const emailSubject = 'K M KOTHARI - Password Reset Request';
+    const { passwordReset } = require('../utils/emailTemplates');
+    const mail = passwordReset({
+      name: user.name,
+      resetLink,
+      expiresMinutes: Math.round(RESET_TOKEN_TTL_MS / 60000)
+    });
 
-    const emailBody = `Hello ${user.name},\n\nYou requested a password reset for K M KOTHARI. Open the link below to choose a new password. This link can be used once and expires in 30 minutes.\n\n${resetLink}\n\nIf you did not request this, you can safely ignore this email — your password has not been changed.\n\nBest regards,\nThe K M KOTHARI Team`;
-
-    const emailHtml = `
-      <div style="font-family: 'Helvetica Neue', Helvetica, Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px; border: 1px solid #e2e8f0; border-radius: 12px; background-color: #ffffff;">
-        <div style="text-align: center; padding-bottom: 20px; border-bottom: 1px solid #f1f5f9;">
-          <h1 style="color: #4f46e5; margin: 0; font-size: 24px; font-weight: 800;">K M KOTHARI</h1>
-        </div>
-        <div style="padding: 20px 0;">
-          <p style="font-size: 16px; line-height: 1.6; color: #334155;">Hello <strong>${user.name}</strong>,</p>
-          <p style="font-size: 16px; line-height: 1.6; color: #334155;">You requested a password reset for your K M KOTHARI account. Click the button below to choose a new password.</p>
-          <div style="margin: 24px 0; text-align: center;">
-            <a href="${resetLink}" style="background-color: #4f46e5; color: #ffffff; text-decoration: none; padding: 12px 24px; font-size: 14px; font-weight: 700; border-radius: 8px; display: inline-block;">Reset My Password</a>
-          </div>
-          <p style="font-size: 14px; line-height: 1.6; color: #64748b;">This link can be used once and expires in 30 minutes.</p>
-        </div>
-        <div style="padding-top: 20px; border-top: 1px solid #f1f5f9; text-align: center; font-size: 12px; color: #94a3b8;">
-          <p style="margin: 0;">If you did not request this reset, you can ignore this email — your password has not been changed.</p>
-        </div>
-      </div>
-    `;
-
-    await sendEmail(user.email, emailSubject, emailBody, emailHtml);
+    await sendEmail(user.email, mail.subject, mail.text, mail.html);
     await logActivity(user._id, 'Password Reset Request', 'Sent password reset link', {
       req,
       targetType: 'User',
