@@ -20,9 +20,15 @@ const {
   updateUserProfileSchema,
   changePasswordSchema
 } = require('../middleware/schemas');
+const { guardObjectIdParams } = require('../middleware/objectIdParam');
 
 // All routes here require authenticating first
 router.use(protect);
+
+// H-10: `/api/users/notanoid` was a 500. Literal paths registered below
+// ('profile', 'change-password', 'notification-preferences', 'activity-logs')
+// are matched before `/:id`, so they are unaffected.
+guardObjectIdParams(router, 'user', ['id']);
 
 // PUT /api/users/profile - Update own profile (all roles)
 router.put('/profile', validate(updateUserProfileSchema), updateUserProfile);

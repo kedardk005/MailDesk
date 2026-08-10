@@ -45,11 +45,10 @@ const CLIENT_FIELDS = 'name associatedEmails contactPerson email phone notes sta
  */
 const toId = (user) => new mongoose.Types.ObjectId(String(user._id));
 
-const taskScopeFor = (user) => {
-  if (!user || user.role === 'Admin') return {};
-  if (user.role === 'Employee') return { assignedTo: toId(user) };
-  return { $or: [{ createdBy: toId(user) }, { assignedTo: toId(user) }] };
-};
+// H-4: the task rule lives in utils/taskScope.js now. It was already correct
+// here and wrong in reportsController; there is one copy so it cannot drift
+// again.
+const { taskScopeFor } = require('./taskScope');
 
 const mailScopeFor = (user) => {
   if (!user || user.role === 'Admin') return {};
@@ -113,6 +112,108 @@ const getMailCountsByClient = (user = null) =>
   });
 
 /**
+ * Rows that belong to NO client, for the caller's scope (audit H-5).
+ *
+ * Client analytics join tasks to clients by lowercased NAME STRING, and
+ * `POST /api/tasks` accepts any client name at all (`createTaskSchema` asks
+ * only for a 1-200 character string). The consequence, on the same screen as
+ * the totals they contradict:
+ *
+ *   Reports -> Clients tiles:  EMAILS 1,397   TASKS 427   COMPLETED 224
+ *   the table's own columns:   EMAILS 1,185   TASKS 353   COMPLETED 186
+ *
+ * 74 of 427 tasks (17%) and 212 of 1,397 emails (15%) simply vanished between
+ * the tile and the table: 70 tasks with an empty `clientName`, 3 with the
+ * literal string "unassigned", 1 naming a client that does not exist, and every
+ * email whose sender matched no client at ingest (`clientId: null`).
+ *
+ * Dropping them silently is the defect. This computes the residual explicitly —
+ * always as TOTAL MINUS MATCHED, never by re-deriving it from a second rule —
+ * so the bucket reconciles with the tile by construction, whatever new way a
+ * row finds of belonging to nothing.
+ *
+ * @param {Object} [user] - the requesting user; omitted = unscoped (Admin)
+ * @returns {Promise<{taskCount: Number, completedTaskCount: Number,
+ *   openTaskCount: Number, emailCount: Number, totals: Object,
+ *   matched: Object, orphanClientNames: String[]}>}
+ */
+const getUnattributedCounts = (user = null) =>
+  cache.wrap(cache.KEYS.report('client-unattributed', 'all', counterScopeKey(user)), cache.TTL.clients, async () => {
+    const taskScope = taskScopeFor(user);
+    const mailScope = { deletedAt: null, direction: { $ne: 'outbound' }, ...mailScopeFor(user) };
+
+    const [clients, taskCounts, mailCounts, totalTasks, totalCompleted, totalEmails] = await Promise.all([
+      Client.find({}).select('_id name').lean(),
+      getTaskCountsByClient(user),
+      getMailCountsByClient(user),
+      Task.countDocuments(taskScope),
+      Task.countDocuments({ ...taskScope, status: 'Completed' }),
+      Email.countDocuments(mailScope)
+    ]);
+
+    const knownNames = new Set(clients.map((c) => String(c.name || '').toLowerCase()));
+    const knownIds = new Set(clients.map((c) => String(c._id)));
+
+    let matchedTasks = 0;
+    let matchedCompleted = 0;
+    const orphanClientNames = [];
+    for (const [key, counts] of Object.entries(taskCounts)) {
+      if (knownNames.has(key)) {
+        matchedTasks += counts.total;
+        matchedCompleted += counts.completed;
+      } else if (key) {
+        // An empty key is "no client named at all"; a non-empty one names a
+        // client that does not exist, which is worth being able to see.
+        orphanClientNames.push(key);
+      }
+    }
+
+    // A `clientId` pointing at a deleted client is unattributed too, so the
+    // matched side is summed over ids that still exist rather than over the
+    // whole aggregation.
+    let matchedEmails = 0;
+    for (const [id, total] of Object.entries(mailCounts)) {
+      if (knownIds.has(id)) matchedEmails += total;
+    }
+
+    const taskCount = Math.max(0, totalTasks - matchedTasks);
+    const completedTaskCount = Math.max(0, totalCompleted - matchedCompleted);
+
+    return {
+      taskCount,
+      completedTaskCount,
+      openTaskCount: Math.max(0, taskCount - completedTaskCount),
+      emailCount: Math.max(0, totalEmails - matchedEmails),
+      totals: { taskCount: totalTasks, completedTaskCount: totalCompleted, emailCount: totalEmails },
+      matched: { taskCount: matchedTasks, completedTaskCount: matchedCompleted, emailCount: matchedEmails },
+      orphanClientNames: orphanClientNames.sort().slice(0, 50)
+    };
+  });
+
+/**
+ * The synthetic table row that makes a client table reconcile with its own
+ * tiles. `_id` is a stable STRING sentinel, not null, so it is safe as a React
+ * key and can never collide with a real ObjectId; `isUnattributed` marks it as
+ * not-a-client so the UI can render it inert (no drill-down link).
+ *
+ * @param {Object} counts - result of getUnattributedCounts
+ * @returns {Object}
+ */
+const UNATTRIBUTED_ID = '__unattributed__';
+const unattributedRow = (counts) => ({
+  _id: UNATTRIBUTED_ID,
+  name: 'Unattributed',
+  isUnattributed: true,
+  associatedEmails: [],
+  emailCount: counts.emailCount,
+  mailCount: counts.emailCount,
+  taskCount: counts.taskCount,
+  completedTaskCount: counts.completedTaskCount,
+  openTaskCount: counts.openTaskCount,
+  orphanClientNames: counts.orphanClientNames
+});
+
+/**
  * List clients with their task and mail counters.
  *
  * @param {Object} params - result of parseListParams
@@ -165,6 +266,9 @@ module.exports = {
   listClients,
   getTaskCountsByClient,
   getMailCountsByClient,
+  getUnattributedCounts,
+  unattributedRow,
+  UNATTRIBUTED_ID,
   CLIENT_SORT_FIELDS,
   CLIENT_FIELDS
 };

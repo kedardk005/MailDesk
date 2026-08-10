@@ -133,6 +133,57 @@ code change. Redis on WSL2 also works but is one more moving part to supervise.
 
 ---
 
+## 5a. Rate limiting — read this before the whole office is locked out
+
+Your staff sit behind **one public IP**. Any rate limit keyed on the client
+address is therefore a budget for the *entire firm*, not per person. That is
+exactly what the pre-deployment audit found (H-8): with the old per-IP defaults
+of 300 requests / 15 min and **10 sign-ins / 15 min**, and a dashboard load
+costing about **11 counted API calls**, the office got roughly 27 dashboard
+loads per quarter hour between them, and the eleventh person to sign in on a
+Monday morning was told *"Too many authentication attempts from this IP"* — as
+was everyone after them.
+
+The limits are now keyed differently, and you should still size them for your
+office:
+
+| Variable | Default | Counted per | What it protects |
+|---|---|---|---|
+| `RATE_LIMIT_GENERAL_MAX` | `1000` / 15 min | **signed-in user** (IP when anonymous) | one runaway client or scraper |
+| `RATE_LIMIT_AUTH_ACCOUNT_MAX` | `10` / 15 min | **email address**, failed attempts only | password guessing / credential stuffing |
+| `RATE_LIMIT_AUTH_IP_MAX` | `200` / 15 min | IP address, all `/api/auth/*` calls | bulk abuse from one source |
+| `AI_RATE_LIMIT_PER_MINUTE` | `10` / min | IP address | the unmetered LLM proxy |
+
+Sizing notes:
+
+- **`RATE_LIMIT_GENERAL_MAX` is per person.** A busy hour is roughly 60-100
+  requests per person; 1000 leaves a wide margin. Raise it, do not lower it,
+  unless you have a specific reason.
+- **`RATE_LIMIT_AUTH_ACCOUNT_MAX` is the real password-guessing control**, and a
+  *successful* sign-in costs nothing against it. Someone who types their own
+  password correctly never consumes budget, so there is no reason to raise this
+  to accommodate the office. 10 failed attempts in 15 minutes for one account is
+  generous for a human and useless for a bot.
+- **`RATE_LIMIT_AUTH_IP_MAX` must comfortably exceed** (staff count × sign-ins
+  per morning). For 15 people, 200 is roughly 13 attempts each; raise it for a
+  larger office or a shared terminal.
+- `RATE_LIMIT_AUTH_MAX` is kept as a deprecated alias for
+  `RATE_LIMIT_AUTH_IP_MAX` so an existing `.env` keeps working.
+
+**`trust proxy` matters.** The API sets `app.set('trust proxy', 1)` — exactly one
+hop. Behind Caddy (§7) that is correct. If you add a second proxy in front
+(Cloudflare Tunnel *and* Caddy, §8B), the IP-keyed limiters will see the inner
+proxy's address and collapse into a single bucket; the per-user and per-account
+limiters are unaffected, which is another reason those carry the real load.
+
+**Without Redis the counters are per process and reset on restart.** With
+`REDIS_URL` set they are shared and durable (§5). The store initialises its
+Redis connection with the offline queue enabled — without that it failed to
+start and silently fell back to in-memory counting, which under PM2 clustering
+means N× the intended budget.
+
+---
+
 ## 6. Run the API as a Windows Service
 
 Node must survive reboots and crashes. Use **NSSM** (simplest) or PM2.

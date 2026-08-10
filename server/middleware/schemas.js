@@ -237,6 +237,71 @@ const extractActionsSchema = z
     message: 'Provide exactly one of emailId or threadId.'
   });
 
+/**
+ * H-2 — POST /api/ai/summarize-email.
+ *
+ * The id form (`{ emailId }`) is what the client has always sent and is the
+ * only shape that avoids posting a multi-megabyte body back at the server. The
+ * legacy `{ subject, from, body }` form is still accepted so nothing that
+ * predates the fix breaks; deliberately NOT `.strict()` for the same reason.
+ *
+ * "Exactly one of emailId/threadId" is enforced here; "there is something to
+ * summarise at all" stays in the controller, which already answers 400 with the
+ * message existing callers match on.
+ */
+const summarizeEmailSchema = z
+  .object({
+    emailId: objectId('Email ID').optional(),
+    threadId: z.string().trim().min(1, 'Thread ID is required.').max(200, 'Thread ID is too long.').optional(),
+    subject: z.string().max(2000, 'Subject is too long.').optional(),
+    from: z.string().max(320, 'Sender is too long.').optional(),
+    body: z.string().max(500000, 'Email body is too long.').optional()
+  })
+  .refine((data) => !(data.emailId && data.threadId), {
+    message: 'Provide either emailId or threadId, not both.'
+  });
+
+/**
+ * H-9 — POST /api/clients had NO validation at all. `{"name":[]}` reached
+ * `name.trim()` and returned 500 `"name.trim is not a function"`; a 5,000
+ * character name was accepted with 201. Bounds mirror `createUserSchema`
+ * (names capped at 120 there, 200 here to match `createTaskSchema.clientName`,
+ * which is the field these names are joined against).
+ */
+const clientEmailList = z
+  .union(
+    [
+      z
+        .array(z.string({ error: 'Associated emails must be text.' }).trim().email('Associated emails must be valid email addresses.').max(254))
+        .max(50, 'Too many associated email addresses.'),
+      // The UI also submits a comma-separated string; the controller splits it.
+      z.string().max(5000, 'Associated emails list is too long.')
+    ],
+    { error: 'Associated emails must be a list of email addresses.' }
+  )
+  .optional();
+
+const createClientSchema = z.object({
+  // The explicit type-level `error` matters: without it `{"name":[]}` leads
+  // with Zod's own "Invalid input: expected string, received array", which is
+  // the wire format's complaint rather than the user's.
+  name: z
+    .string({ error: 'Client name must be text.' })
+    .trim()
+    .min(1, 'Client name is required.')
+    .max(200, 'Client name is too long.'),
+  associatedEmails: clientEmailList,
+  contactPerson: z.string().trim().max(200, 'Contact person is too long.').optional(),
+  email: z.union([z.literal(''), z.string().trim().email('Invalid email address.').max(254)]).optional(),
+  phone: z.string().trim().max(40, 'Phone number is too long.').optional(),
+  notes: z.string().max(20000, 'Notes are too long.').optional(),
+  status: z.enum(['Active', 'Inactive'], { error: 'Status must be Active or Inactive.' }).optional()
+});
+
+const updateClientSchema = createClientSchema
+  .partial()
+  .refine((data) => Object.keys(data).length > 0, { message: 'No updatable fields were provided.' });
+
 module.exports = {
   registerSchema,
   loginSchema,
@@ -255,5 +320,8 @@ module.exports = {
   bulkApproveSchema,
   updateKeywordRuleSchema,
   slaPolicySchema,
-  extractActionsSchema
+  extractActionsSchema,
+  summarizeEmailSchema,
+  createClientSchema,
+  updateClientSchema
 };

@@ -159,13 +159,22 @@ const buildPagination = (params, total) => {
  * @param {Array} args.data
  * @param {Object|null} args.pagination
  * @param {Function} [args.legacy] - (data) => legacy body; defaults to the bare array
+ * @param {Object} [args.extra] - additional top-level keys, merged into the
+ *   paginated envelope alongside `data`/`pagination`. Additive only: never use
+ *   it to redefine either of those. Ignored in legacy (bare array) mode, where
+ *   there is no envelope to extend — a legacy caller that needs the extra data
+ *   must send `page`.
  * @returns {Object} the express response
  */
-const listResponse = (res, { params, data, pagination, legacy }) => {
+const listResponse = (res, { params, data, pagination, legacy, extra }) => {
   if (params.paginated) {
-    return res.status(200).json({ data, pagination });
+    return res.status(200).json({ data, pagination, ...(extra || {}) });
   }
-  return res.status(200).json(legacy ? legacy(data) : data);
+  const body = legacy ? legacy(data) : data;
+  if (extra && body && !Array.isArray(body) && typeof body === 'object') {
+    return res.status(200).json({ ...body, ...extra });
+  }
+  return res.status(200).json(body);
 };
 
 module.exports = {

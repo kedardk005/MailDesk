@@ -7,6 +7,7 @@ const { createNotification } = require('../utils/notificationHelper');
 const { sendEmail } = require('../utils/emailHelper');
 const { sendTaskAssignedEmail, sendTasksAssignedEmail } = require('../utils/taskMailer');
 const { escapeRegex } = require('../utils/regexHelper');
+const { taskScopeFor } = require('../utils/taskScope');
 const { parseDeadline, getAppTimezone } = require('../utils/dateHelper');
 const { sanitizeTaskLinkedEmail } = require('../utils/sanitizeEmailHtml');
 const cache = require('../utils/cache');
@@ -214,14 +215,11 @@ exports.getAllTasks = async (req, res) => {
       defaultSort: '-createdAt'
     });
 
-    const filter = {};
-
-    // Filter by role: Employees can only see tasks assigned to them, Heads can see tasks created by or assigned to them
-    if (req.user.role === 'Employee') {
-      filter.assignedTo = req.user._id;
-    } else if (req.user.role === 'Head') {
-      filter.$or = [{ createdBy: req.user._id }, { assignedTo: req.user._id }];
-    }
+    // H-4: the ONE definition of "tasks this user may see" — Employee:
+    // assignedTo, Head: createdBy OR assignedTo, Admin: everything. The
+    // dashboard and Reports now read the same module (utils/taskScope.js), so
+    // this page and those tiles can no longer disagree.
+    const filter = { ...taskScopeFor(req.user) };
 
     // Additive, endpoint-specific filters.
     const status = firstString(req.query.status, 20);
@@ -235,6 +233,32 @@ exports.getAllTasks = async (req, res) => {
 
     const clientName = firstString(req.query.clientName, 200);
     if (clientName) filter.clientName = clientName;
+
+    /*
+     * The two filters the client already sends and the server silently ignored.
+     * Both are strictly additive — omitting them behaves exactly as before —
+     * and both are needed by UI work happening in parallel:
+     *
+     *   createdBy               audit H-6: `/tasks?creator=<id>` rendered a
+     *                           "Priya Nair" chip and a Clear-filters button
+     *                           over all 430 tasks in the workspace. An
+     *                           Employee is not offered the filter and cannot
+     *                           widen their scope with it, so it is refused for
+     *                           them exactly as `assignedTo` is.
+     *   deadlineFrom/deadlineTo audit H-7: the Calendar could only ever load
+     *                           the newest 100 tasks because there was no way
+     *                           to ask for a month. Paging back one month
+     *                           showed "nothing scheduled" over 104 real tasks.
+     */
+    const createdBy = firstString(req.query.createdBy, 40);
+    if (/^[0-9a-fA-F]{24}$/.test(createdBy) && req.user.role !== 'Employee') filter.createdBy = createdBy;
+
+    const deadlineFrom = firstString(req.query.deadlineFrom, 40);
+    const deadlineTo = firstString(req.query.deadlineTo, 40);
+    const deadlineRange = {};
+    if (deadlineFrom && !Number.isNaN(Date.parse(deadlineFrom))) deadlineRange.$gte = new Date(deadlineFrom);
+    if (deadlineTo && !Number.isNaN(Date.parse(deadlineTo))) deadlineRange.$lte = new Date(deadlineTo);
+    if (Object.keys(deadlineRange).length > 0) filter.deadline = deadlineRange;
 
     if (params.q) {
       const regex = new RegExp(escapeRegex(params.q), 'i');

@@ -5,10 +5,16 @@ const Email = require('../models/Email');
 const Client = require('../models/Client');
 const SlaPolicy = require('../models/SlaPolicy');
 const cache = require('../utils/cache');
-const { getTaskCountsByClient, getMailCountsByClient } = require('../utils/clientService');
+const {
+  getTaskCountsByClient,
+  getMailCountsByClient,
+  getUnattributedCounts,
+  unattributedRow
+} = require('../utils/clientService');
 const { getEffectivePolicies, targetMsExpr } = require('../utils/slaPolicy');
 const { businessWindows, elapsedMsExpr } = require('../utils/slaCalendar');
 const { toObjectId } = require('../utils/threadHelper');
+const { taskScopeFor, ownedByScope } = require('../utils/taskScope');
 const { firstString } = require('../utils/paginate');
 const { zonedWallClockToUtc } = require('../utils/dateHelper');
 const { log } = require('../utils/logger');
@@ -159,12 +165,20 @@ exports.getOverallStats = async (req, res) => {
         // otherwise sending a reply would silently inflate "total emails" on
         // the dashboard.
         const emailQuery = { deletedAt: null, direction: { $ne: 'outbound' } };
-        const taskQuery = {};
         if (req.user.role === 'Head') {
           // See the toObjectId note in getEmployeeReport.
           emailQuery.fetchedBy = toObjectId(req.user._id);
-          taskQuery.createdBy = toObjectId(req.user._id);
         }
+
+        /*
+         * H-4 — this line used to be `taskQuery.createdBy = <head>`, i.e.
+         * created-by ONLY, while `GET /api/tasks` scoped a Head to
+         * `createdBy OR assignedTo`. Same Head, same instant: this tile said
+         * 48 tasks / 16 overdue / 6 pending and their own Tasks page said
+         * 55 / 17 / 7. Nothing errored; the manager simply read the smaller
+         * number. Both surfaces now read utils/taskScope.js.
+         */
+        const taskQuery = taskScopeFor(req.user);
 
         // Was: EIGHT sequential `countDocuments`, none parallel, none cached,
         // two of them full collection scans. Now three parallel round-trips,
@@ -396,18 +410,20 @@ exports.getClientStats = async (req, res) => {
         //
         // Now: two cached `$group` aggregations shared with the client list,
         // scoped to what the caller may actually access (audit D5).
-        const [clients, taskCounts, mailCounts] = await Promise.all([
+        const [clients, taskCounts, mailCounts, unattributed] = await Promise.all([
           Client.find({}).select('name associatedEmails').sort({ name: 1 }).limit(1000).lean(),
           getTaskCountsByClient(req.user),
-          getMailCountsByClient(req.user)
+          getMailCountsByClient(req.user),
+          getUnattributedCounts(req.user)
         ]);
 
-        return clients.map((client) => {
+        const rows = clients.map((client) => {
           const key = String(client.name || '').toLowerCase();
           const tasks = taskCounts[key] || { total: 0, completed: 0 };
           return {
             _id: client._id,
             name: client.name,
+            isUnattributed: false,
             associatedEmails: client.associatedEmails || [],
             emailCount: mailCounts[String(client._id)] || 0,
             taskCount: tasks.total,
@@ -417,6 +433,24 @@ exports.getClientStats = async (req, res) => {
             openTaskCount: Math.max(0, tasks.total - tasks.completed)
           };
         });
+
+        /*
+         * H-5 — the honest residual row.
+         *
+         * These 25 rows summed to 353 tasks and 1,185 emails on a page whose
+         * own tiles read 427 and 1,397: 17% of tasks and 15% of mail were
+         * discarded by a lowercased-name join, silently, on the screen an owner
+         * prices work from. Appended only when it is non-empty, so a workspace
+         * where everything IS attributed gains no phantom row.
+         *
+         * `_id` is the string sentinel '__unattributed__' and `isUnattributed`
+         * is true, so the UI can key it safely and render it inert.
+         */
+        if (unattributed.taskCount > 0 || unattributed.emailCount > 0) {
+          rows.push(unattributedRow(unattributed));
+        }
+
+        return rows;
       }
     );
 
@@ -551,7 +585,11 @@ const resolveSlaScope = (req) => {
 
   return {
     emailScope: mine ? { fetchedBy: userId } : {},
-    taskScope: mine ? { createdBy: userId } : {},
+    // H-4 / M-8: the same `createdBy OR assignedTo` rule the Tasks page and the
+    // dashboard now use. A Head's SLA "Resolution" panel was scoped to
+    // created-by only, which is a third definition of a Head's tasks in one
+    // product.
+    taskScope: mine ? ownedByScope(userId) : {},
     scope: mine ? 'mine' : 'all',
     discriminator: mine ? `${req.user.role}:${String(req.user._id)}` : 'all'
   };

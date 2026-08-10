@@ -104,6 +104,37 @@ const UserSchema = new mongoose.Schema({
     default: [],
     select: false
   },
+  // --- Gmail sync health (audit H-1) ---------------------------------------
+  //
+  // Written by `syncUserEmails` after every run, one entry per mailbox. Without
+  // it, `GET /api/gmail/status` reported `connected: true` for four mailboxes
+  // that had answered `invalid_grant` on every sync for days: a stored token is
+  // not the same fact as a WORKING token, and only the sync knows the
+  // difference. NOT `select: false` — it is status, not a credential.
+  gmailSyncHealth: {
+    type: [
+      {
+        _id: false,
+        gmailEmail: { type: String, default: '' },
+        ok: { type: Boolean, default: false },
+        // 'REAUTH_REQUIRED' | 'PERMISSION_DENIED' | 'RATE_LIMITED' | 'NETWORK'
+        // | 'SYNC_FAILED' | null — see gmailController.classifySyncError.
+        errorCode: { type: String, default: null },
+        error: { type: String, default: null },
+        at: { type: Date, default: Date.now }
+      }
+    ],
+    default: []
+  },
+  lastGmailSyncAt: {
+    type: Date,
+    default: null
+  },
+  // 'ok' | 'partial' | 'failed' | 'no_accounts'
+  lastGmailSyncStatus: {
+    type: String,
+    default: null
+  },
   maxConnectedAccounts: {
     type: Number,
     default: 5

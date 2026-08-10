@@ -9,7 +9,7 @@ const {
 } = require('../controllers/aiController');
 const { protect, authorizeRoles } = require('../middleware/authMiddleware');
 const validate = require('../middleware/validate');
-const { extractActionsSchema } = require('../middleware/schemas');
+const { extractActionsSchema, summarizeEmailSchema } = require('../middleware/schemas');
 
 // A dedicated limiter: this route is an unmetered LLM proxy, and the shared
 // 300/15min general limiter is far too permissive for it.
@@ -21,7 +21,19 @@ const aiLimiter = rateLimit({
   legacyHeaders: false
 });
 
-router.post('/summarize-email', protect, authorizeRoles('Admin', 'Head'), aiLimiter, summarizeEmail);
+// POST /api/ai/summarize-email — H-2.
+//
+// Accepts `{ emailId }` (what the client has always sent; the message is loaded
+// server-side under the same ownership rule as GET /api/gmail/emails/:id),
+// `{ threadId }`, or the legacy `{ subject, from, body }` payload.
+router.post(
+  '/summarize-email',
+  protect,
+  authorizeRoles('Admin', 'Head'),
+  aiLimiter,
+  validate(summarizeEmailSchema),
+  summarizeEmail
+);
 
 // POST /api/ai/extract-actions - F-3 action-item extraction.
 //
