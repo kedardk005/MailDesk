@@ -76,6 +76,17 @@ param(
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 
+# PowerShell 5.1 is what ships on Windows 10/Server, and on older .NET it
+# negotiates TLS 1.0 by default — github.com refuses that, so Get-CiState would
+# return 'unknown' on every run and the deploy would refuse forever while
+# looking like a CI problem. .NET 4.7+ usually gets this right on its own;
+# pinning costs nothing and removes the doubt. install-windows.ps1 does the
+# same at its top.
+if ([Net.ServicePointManager]::SecurityProtocol -notmatch 'Tls12') {
+    [Net.ServicePointManager]::SecurityProtocol =
+        [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+}
+
 # --------------------------------------------------------------------------
 # Logging - every run appends here; Task Scheduler swallows stdout otherwise
 # --------------------------------------------------------------------------
