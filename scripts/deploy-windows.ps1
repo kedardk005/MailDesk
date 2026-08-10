@@ -248,20 +248,27 @@ function Get-HeadSha {
     return (Invoke-Native git @('rev-parse', $Ref) -WorkingDirectory $InstallDir)
 }
 
-function Test-CiGreen {
+function Get-CiState {
     <#
-        Asks GitHub whether this exact commit's checks passed. Returns
-        $true (green), $false (red), or $null (could not tell — no token on a
-        private repo, GitHub down, no checks configured). A $null is treated as
-        "do not deploy" unless -SkipCiCheck, because "I could not verify" and
-        "it is fine" are not the same claim.
+        Asks GitHub whether this exact commit's checks passed. Returns the
+        string 'green', 'red', or 'unknown' (no token on a private repo, GitHub
+        down, checks still running, no checks configured). 'unknown' is treated
+        as do-not-deploy, because "I could not verify" and "it is fine" are not
+        the same claim.
+
+        This returns a string rather than a bool deliberately, and the caller
+        tests `-ne 'green'`. An earlier version returned $true/$false/$null,
+        which fails OPEN: any stray pipeline output inside this function makes
+        the return value an array, and then both `$x -eq $false` and
+        `$null -eq $x` are falsy, so a red commit sails through the gate. With
+        a string and an -ne test, anything unexpected refuses to deploy.
     #>
     param([string]$Sha)
 
     $originUrl = Invoke-Native git @('remote', 'get-url', $Remote) -WorkingDirectory $InstallDir
     if ($originUrl -notmatch 'github\.com[:/](?<owner>[^/]+)/(?<repo>[^/.]+)') {
         Write-Log "remote '$originUrl' is not a GitHub URL - cannot check CI" 'WARN'
-        return $null
+        return 'unknown'
     }
     $owner = $Matches['owner']
     $repo  = $Matches['repo']
@@ -279,18 +286,18 @@ function Test-CiGreen {
     }
     catch {
         Write-Log "GitHub check-runs query failed: $($_.Exception.Message)" 'WARN'
-        return $null
+        return 'unknown'
     }
 
     if (-not $resp.check_runs -or $resp.check_runs.Count -eq 0) {
         Write-Log "no check-runs reported for $($Sha.Substring(0,7))" 'WARN'
-        return $null
+        return 'unknown'
     }
 
     $incomplete = @($resp.check_runs | Where-Object { $_.status -ne 'completed' })
     if ($incomplete.Count -gt 0) {
         Write-Log "CI still running ($($incomplete.Count) of $($resp.check_runs.Count) incomplete)" 'WARN'
-        return $null
+        return 'unknown'
     }
 
     # 'neutral' and 'skipped' are not failures; anything else is.
@@ -299,11 +306,11 @@ function Test-CiGreen {
     })
     if ($bad.Count -gt 0) {
         foreach ($b in $bad) { Write-Log "  check '$($b.name)' -> $($b.conclusion)" 'WARN' }
-        return $false
+        return 'red'
     }
 
     Write-Log "CI green ($($resp.check_runs.Count) checks)" 'OK'
-    return $true
+    return 'green'
 }
 
 function Install-And-Restart {
@@ -369,14 +376,16 @@ try {
         Write-Log 'CI check skipped by flag - deploying unverified code' 'WARN'
     }
     else {
-        $green = Test-CiGreen -Sha $targetSha
-        if ($green -eq $false) {
-            Write-Log "CI is RED for $($targetSha.Substring(0,7)) - refusing to deploy" 'FAIL'
-            exit 2
-        }
-        if ($null -eq $green) {
-            Write-Log 'could not confirm CI status - refusing to deploy' 'FAIL'
-            Write-Log 'set GITHUB_TOKEN, or pass -SkipCiCheck to accept the risk' 'INFO'
+        # -ne 'green' so that anything other than an explicit pass refuses.
+        $ciState = Get-CiState -Sha $targetSha
+        if ($ciState -ne 'green') {
+            if ($ciState -eq 'red') {
+                Write-Log "CI is RED for $($targetSha.Substring(0,7)) - refusing to deploy" 'FAIL'
+            }
+            else {
+                Write-Log "could not confirm CI status (got '$ciState') - refusing to deploy" 'FAIL'
+                Write-Log 'set GITHUB_TOKEN, or pass -SkipCiCheck to accept the risk' 'INFO'
+            }
             exit 2
         }
     }
