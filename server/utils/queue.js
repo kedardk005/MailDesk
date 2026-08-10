@@ -120,7 +120,13 @@ const runLocalJob = async (name, record) => {
     logger.info({ queue: name, jobId: record.id, attempts: record.attemptsMade }, 'job completed');
   } catch (err) {
     record.error = err.message;
-    if (record.attemptsMade < record.attempts) {
+    // A handler can mark a failure as unrecoverable (`err.permanent = true`) —
+    // e.g. Brevo answering 400 for an unverified sender or a malformed
+    // address. Retrying a certain failure five times with backoff delays every
+    // other job in the queue behind work that cannot succeed, so those go
+    // straight to the dead-letter queue.
+    const permanent = err && err.permanent === true;
+    if (!permanent && record.attemptsMade < record.attempts) {
       record.state = STATES.QUEUED;
       const delay = jitteredBackoff(record.attemptsMade, record.backoffMs);
       logger.warn({ queue: name, jobId: record.id, attempt: record.attemptsMade, delay, err: err.message },
@@ -142,8 +148,10 @@ const runLocalJob = async (name, record) => {
         error: err.message,
         failedAt: record.finishedAt
       });
-      logger.error({ queue: name, jobId: record.id, err: err.message, stack: err.stack },
-        'job moved to dead-letter after exhausting attempts');
+      logger.error({ queue: name, jobId: record.id, err: err.message, permanent, stack: err.stack },
+        permanent
+          ? 'job moved to dead-letter: handler marked the failure permanent'
+          : 'job moved to dead-letter after exhausting attempts');
     }
   }
 };
