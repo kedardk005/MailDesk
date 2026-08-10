@@ -122,6 +122,10 @@ jobs:
           # failure. Raised for the test run ONLY — the defaults are what ship.
           RATE_LIMIT_AUTH_MAX: 500
           RATE_LIMIT_GENERAL_MAX: 5000
+          # The suite exercises /api/ai/* well past the shipped 10/minute
+          # limiter, so without this the run aborts partway with a 429 that
+          # looks like a code failure. Test-run value only.
+          AI_RATE_LIMIT_PER_MINUTE: 500
           JWT_SECRET: ci-test-secret-not-a-real-key
           # 32 bytes hex — required by tokenCrypto's AES-256-GCM key derivation.
           TOKEN_ENCRYPTION_KEY: 0000000000000000000000000000000000000000000000000000000000000000
