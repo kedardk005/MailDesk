@@ -90,15 +90,74 @@ Respond with only the bullet points, nothing else.`;
   return { summary };
 };
 
-// @desc    Summarize an email body using Gemini
+/**
+ * Resolve what a summarization request is actually asking us to summarise.
+ *
+ * H-2: the client has always posted `{ emailId }` (deliberately — sending the
+ * body back is what produced 413s), and this controller destructured
+ * `{ subject, from, body }`, so EVERY Summarise click in the product answered
+ * 400 "Email subject or body is required for summarization." on an email whose
+ * subject and body were visible directly above the button. The Gemini backend
+ * was never the problem.
+ *
+ * The id path loads the message server-side under the SAME ownership rule as
+ * `GET /api/gmail/emails/:id` — `loadExtractionSource`, shared verbatim with
+ * `POST /api/ai/extract-actions`, so a Head cannot summarise a mailbox they
+ * cannot read (403) and a missing message is a 404, not a silent empty summary.
+ *
+ * The legacy `{ subject, from, body }` payload is still honoured unchanged.
+ *
+ * @param {Object} req
+ * @returns {Promise<{status: Number, message: String}|{subject: String, from: String, plainBody: String}>}
+ */
+const loadSummarizationSource = async (req) => {
+  const { emailId, threadId, subject, from, body } = req.body;
+
+  if (!emailId && !threadId) {
+    // Legacy shape. Unchanged, including its 400.
+    if (!body && !subject) {
+      return { status: 400, message: 'Email subject or body is required for summarization.' };
+    }
+    return { subject: subject || '', from: from || '', plainBody: toPlainPrompt(body) };
+  }
+
+  const source = await loadExtractionSource(req);
+  if (source.status) return source;
+
+  const messages = source.messages;
+
+  if (emailId) {
+    const email = messages[0];
+    return {
+      subject: email.subject || '',
+      from: email.from || '',
+      plainBody: toPlainPrompt(email.body)
+    };
+  }
+
+  // A conversation: summarise the whole thing, using the same bounded,
+  // tag-stripped document builder the extraction endpoint feeds the model.
+  const latest = messages[messages.length - 1];
+  return {
+    subject: latest.subject || '',
+    from: [...new Set(messages.map((m) => m.from).filter(Boolean))].join(', '),
+    plainBody: extraction.buildDocument(messages) || ''
+  };
+};
+
+// @desc    Summarize an email (by id) or a raw payload using Gemini
 // @route   POST /api/ai/summarize-email
-// @access  Private (Admin, Head only)
+// @access  Private (Admin, Head; additionally gated per email by the same
+//          object-level check as GET /api/gmail/emails/:id)
 exports.summarizeEmail = async (req, res) => {
   try {
-    const { subject, from, body } = req.body;
+    const source = await loadSummarizationSource(req);
+    if (source.status) return res.status(source.status).json({ message: source.message });
 
-    if (!body && !subject) {
-      return res.status(400).json({ message: 'Email subject or body is required for summarization.' });
+    const { subject, from, plainBody } = source;
+
+    if (!plainBody && !subject) {
+      return res.status(400).json({ message: 'This message has no readable content to summarise.' });
     }
 
     if (!process.env.GEMINI_API_KEY) {
@@ -106,7 +165,18 @@ exports.summarizeEmail = async (req, res) => {
       return res.status(503).json({ message: 'AI service is not configured. GEMINI_API_KEY is missing.' });
     }
 
-    const plainBody = toPlainPrompt(body);
+    // Fail fast while the breaker is open instead of enqueueing work that is
+    // guaranteed to be rejected and then reported as a generic 502. Same
+    // treatment the extraction endpoint already gives its caller.
+    const breaker = getBreaker('gemini').stats();
+    if (breaker.state === 'open') {
+      return res.status(503).json({
+        message: 'The AI service is temporarily unavailable. Please try again shortly.',
+        code: 'AI_UNAVAILABLE',
+        retryInMs: Math.max(0, 30000 - (Date.now() - breaker.openedAt))
+      });
+    }
+
     const key = summaryKey(subject, plainBody);
 
     // Summarising the same email twice used to cost two full inference calls.

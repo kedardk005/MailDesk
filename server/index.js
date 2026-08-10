@@ -17,6 +17,12 @@ const { isRedisConfigured, createConnection, closeRedis } = require('./utils/red
 const queue = require('./utils/queue');
 const { registerJobHandlers } = require('./jobs');
 const { breakerStats } = require('./utils/resilience');
+const {
+  attachRateLimitIdentity,
+  userOrIpKey,
+  accountKey,
+  ipOnlyKey
+} = require('./middleware/rateLimitKey');
 
 // Create Express app
 const app = express();
@@ -42,8 +48,26 @@ const buildLimiterStore = (prefix) => {
   if (!isRedisConfigured()) return undefined;
   try {
     const { RedisStore } = require('rate-limit-redis');
-    const client = createConnection({}, `ratelimit:${prefix}`);
+    /*
+     * `enableOfflineQueue: true` is REQUIRED here (audit L-5).
+     *
+     * The shared Redis client disables the offline queue so a request-path
+     * cache read fails fast instead of hanging while Redis is down — correct
+     * there. But express-rate-limit calls `store.init()` synchronously at
+     * construction, before the socket is writeable, and with the queue disabled
+     * that rejected every boot with
+     *   "async error during store initialization. Error: Stream isn't writeable
+     *    and enableOfflineQueue options is false"
+     * The limiter then silently fell back to per-process in-memory counting —
+     * i.e. setting REDIS_URL, the whole point of the shared store, is what
+     * broke the shared store. Same reasoning as the Socket.io adapter below.
+     */
+    const client = createConnection(
+      { enableOfflineQueue: true, maxRetriesPerRequest: null },
+      `ratelimit:${prefix}`
+    );
     if (!client) return undefined;
+    client.on('error', (err) => logger.warn({ err: err.message, prefix }, 'rate-limit Redis error'));
     return new RedisStore({
       prefix: `rl:${prefix}:`,
       sendCommand: (...args) => client.call(...args)
@@ -54,21 +78,63 @@ const buildLimiterStore = (prefix) => {
   }
 };
 
-const authLimiter = rateLimit({
+/*
+ * Limiter keying — audit H-8.
+ *
+ * These were per-IP, and an office is one public NAT address, so 300/15min and
+ * 10 logins/15min were budgets for the WHOLE FIRM. A dashboard load costs ~11
+ * counted API calls (≈27 dashboard loads per 15 minutes for everyone combined)
+ * and the eleventh person to sign in on a Monday morning got
+ * "Too many authentication attempts from this IP" — as did everyone after them.
+ *
+ * The general limiter now counts per authenticated user, falling back to the IP
+ * only for anonymous requests. The login limiter is split in two:
+ *
+ *   authAccountLimiter  the real credential-stuffing control — FAILED attempts
+ *                       per ACCOUNT. Per-account is the correct axis: it does
+ *                       not care how many addresses an attacker spreads over,
+ *                       and it cannot be tripped by a colleague at the next
+ *                       desk. `skipSuccessfulRequests` means a staff member who
+ *                       types their password correctly spends nothing.
+ *   authIpLimiter       a coarse anti-abuse ceiling per IP, raised to a number
+ *                       a 15-person office survives.
+ */
+const attachedIdentity = attachRateLimitIdentity();
+
+const authIpLimiter = rateLimit({
   windowMs: 15 * 60 * 1000, // 15 minutes
-  max: Number(process.env.RATE_LIMIT_AUTH_MAX || 10),
-  message: { message: 'Too many authentication attempts from this IP, please try again after 15 minutes.' },
+  // RATE_LIMIT_AUTH_MAX is still read, so an existing deployment's override
+  // keeps working; the default rises from 10 to 200.
+  max: Number(process.env.RATE_LIMIT_AUTH_IP_MAX || process.env.RATE_LIMIT_AUTH_MAX || 200),
+  message: { message: 'Too many authentication attempts from this network, please try again after 15 minutes.' },
   standardHeaders: true,
   legacyHeaders: false,
-  store: buildLimiterStore('auth')
+  keyGenerator: ipOnlyKey,
+  store: buildLimiterStore('auth-ip')
+});
+
+const authAccountLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: Number(process.env.RATE_LIMIT_AUTH_ACCOUNT_MAX || 10),
+  message: {
+    message: 'Too many failed attempts for this account. Please wait 15 minutes or reset your password.'
+  },
+  standardHeaders: true,
+  legacyHeaders: false,
+  keyGenerator: accountKey,
+  // Only FAILED attempts count. This is what lets the office sign in freely
+  // while still stopping a password-guessing run against one account.
+  skipSuccessfulRequests: true,
+  store: buildLimiterStore('auth-account')
 });
 
 const generalLimiter = rateLimit({
   windowMs: 15 * 60 * 1000, // 15 minutes
-  max: Number(process.env.RATE_LIMIT_GENERAL_MAX || 300),
-  message: { message: 'Too many requests from this IP, please try again after 15 minutes.' },
+  max: Number(process.env.RATE_LIMIT_GENERAL_MAX || 1000),
+  message: { message: 'Too many requests, please try again after 15 minutes.' },
   standardHeaders: true,
   legacyHeaders: false,
+  keyGenerator: userOrIpKey,
   store: buildLimiterStore('general')
 });
 
@@ -119,11 +185,22 @@ app.use('/api', (req, res, next) => {
   next();
 });
 
-// Apply Limiters to routes
-app.use('/api', generalLimiter);
-app.use('/api/auth/login', authLimiter);
-app.use('/api/auth/register', authLimiter);
-app.use('/api/auth/forgot-password', authLimiter);
+// Apply Limiters to routes.
+//
+// `attachedIdentity` must run BEFORE generalLimiter: it is what turns the
+// office-wide per-IP bucket into a per-user one. It reads the bearer token's
+// signature only and makes no authorization decision — see
+// middleware/rateLimitKey.js.
+app.use('/api', attachedIdentity, generalLimiter);
+
+// Order matters: the per-account limiter is the control that actually stops
+// credential stuffing, so it is evaluated first and its message is the one a
+// guessing run sees.
+app.use('/api/auth/login', authAccountLimiter, authIpLimiter);
+app.use('/api/auth/register', authIpLimiter);
+// Per-account too: without it, one address can be mail-bombed with reset links
+// from a single request loop.
+app.use('/api/auth/forgot-password', authAccountLimiter, authIpLimiter);
 
 // Import routes and middleware
 const authRoutes = require('./routes/authRoutes');

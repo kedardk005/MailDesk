@@ -11,19 +11,29 @@
  * Creates its own users in the target database and removes them afterwards.
  * Point it at a scratch database, never production.
  *
- * RUNNING IT TWICE IN A ROW: the suite performs six logins, and `authLimiter`
- * in index.js allows RATE_LIMIT_AUTH_MAX (default 10) per 15-minute window per
- * IP. Two back-to-back runs therefore trip the limiter and every assertion
- * downstream of a login cascades. Start the server with
- * `RATE_LIMIT_AUTH_MAX=200` for repeat runs; the harness aborts with a clear
- * message rather than reporting a wall of false failures.
+ * RUNNING IT TWICE IN A ROW: the suite performs several logins. Since audit
+ * H-8 the auth limiter is split — RATE_LIMIT_AUTH_ACCOUNT_MAX (default 10)
+ * counts FAILED attempts per email address and RATE_LIMIT_AUTH_IP_MAX
+ * (default 200) is the coarse per-IP ceiling. Successful logins no longer count
+ * at all, so repeat runs are far less likely to trip anything; the harness
+ * still aborts with a clear message rather than reporting a wall of false
+ * failures.
  *
- * The suite now also issues well over 300 API calls in one pass (the F-1/F-2
- * sections roughly doubled it), which is `generalLimiter`'s default ceiling.
- * Start the server with `RATE_LIMIT_GENERAL_MAX=5000` as well:
+ * The H-8 section deliberately EXHAUSTS the per-account budget for a throwaway
+ * address, so leave RATE_LIMIT_AUTH_ACCOUNT_MAX at its default (or set it
+ * explicitly to the same value in the server's environment and in this
+ * process's) — the assertion reads it from `process.env`.
  *
- *   MONGO_URI=... REDIS_URL=... RATE_LIMIT_AUTH_MAX=200 \
+ * The suite issues well over 1000 API calls in one pass, which is
+ * `generalLimiter`'s default ceiling. Start the server with
+ * `RATE_LIMIT_GENERAL_MAX=5000`:
+ *
+ *   MONGO_URI=... REDIS_URL=... RATE_LIMIT_AUTH_IP_MAX=500 \
  *   RATE_LIMIT_GENERAL_MAX=5000 AI_RATE_LIMIT_PER_MINUTE=200 PORT=5150 node index.js
+ *
+ * The H-1 section writes deliberately dead LEGACY PLAINTEXT Gmail tokens onto
+ * its own Head fixture, so the server must run with
+ * ALLOW_LEGACY_PLAINTEXT_TOKENS unset or 'true' (the default).
  *
  * A THIRD limiter matters since F-3: `/api/ai/*` has its own `aiLimiter`,
  * default 10 per MINUTE, and the extraction section issues roughly eight calls.
@@ -1838,6 +1848,553 @@ const main = async () => {
     !/gmailAccessToken|gmailRefreshToken|"password"|resetTokenHash/i.test(auditPayloads),
     'a credential key survived into an audit payload'
   );
+
+  // =========================================================================
+  // Pre-deployment audit — HIGH severity server defects (docs/audits/AUDIT-predeploy.md)
+  // =========================================================================
+
+  console.log('\nH-10: a malformed ObjectId is 400, never 500');
+  for (const [label, path, method] of [
+    ['GET /api/tasks/:id', '/api/tasks/notanoid', 'GET'],
+    ['PUT /api/tasks/:id', '/api/tasks/notanoid', 'PUT'],
+    ['DELETE /api/tasks/:id', '/api/tasks/notanoid', 'DELETE'],
+    ['GET /api/tasks/:id/comments', '/api/tasks/notanoid/comments', 'GET'],
+    ['GET /api/users/:id', '/api/users/notanoid', 'GET'],
+    ['GET /api/gmail/emails/:id', '/api/gmail/emails/notanoid', 'GET'],
+    ['PATCH /api/gmail/emails/:id/read', '/api/gmail/emails/notanoid/read', 'PATCH'],
+    ['PUT /api/notifications/:id/read', '/api/notifications/notanoid/read', 'PUT'],
+    ['DELETE /api/keyword-rules/:id', '/api/keyword-rules/notanoid', 'DELETE'],
+    ['PUT /api/clients/:id', '/api/clients/notanoid', 'PUT'],
+    ['DELETE /api/clients/:id', '/api/clients/notanoid', 'DELETE'],
+    ['GET /api/clients/:id/timeline', '/api/clients/notanoid/timeline', 'GET']
+  ]) {
+    const r = await api(path, {
+      token: adminToken,
+      method,
+      body: method === 'PUT' || method === 'PATCH' ? { name: 'x', title: 'x', read: true } : undefined
+    });
+    check(`${label} with a malformed id is 400`, r.status === 400, `got ${r.status} ${JSON.stringify(r.json)}`);
+    check(
+      `${label} names the bad id and leaks no driver text`,
+      /^Invalid .+ ID\.$/.test(String(r.json?.message || '')),
+      `message=${JSON.stringify(r.json?.message)}`
+    );
+  }
+  // The control the audit relied on: a VALID but absent id is still a clean
+  // 404, so the guard has not turned "not found" into "malformed".
+  const absentTask = await api('/api/tasks/0123456789abcdef01234567', { token: adminToken });
+  check('a valid but absent task id is still 404', absentTask.status === 404, `got ${absentTask.status}`);
+  const absentComments = await api('/api/tasks/0123456789abcdef01234567/comments', { token: adminToken });
+  check('a valid but absent id on a sub-resource is not 400', absentComments.status !== 400, `got ${absentComments.status}`);
+
+  console.log('\nH-9: POST /api/clients is validated');
+  for (const [label, body, expectPath] of [
+    ['name as an array', { name: [] }, 'name'],
+    ['name as an object', { name: {} }, 'name'],
+    ['a 5,000 character name', { name: 'x'.repeat(5000) }, 'name'],
+    ['numeric associatedEmails', { name: 'Smoke Validation Client', associatedEmails: [123] }, 'associatedEmails'],
+    ['a missing name', {}, 'name']
+  ]) {
+    const r = await api('/api/clients', { token: adminToken, method: 'POST', body });
+    check(`POST /api/clients with ${label} is 400`, r.status === 400, `got ${r.status} ${JSON.stringify(r.json)}`);
+    check(
+      `POST /api/clients with ${label} returns field-level errors`,
+      Array.isArray(r.json?.errors) && r.json.errors.length > 0,
+      JSON.stringify(r.json)
+    );
+    check(
+      `POST /api/clients with ${label} blames the right field`,
+      (r.json?.errors || []).some((e) => String(e.path || '').includes(expectPath)),
+      JSON.stringify(r.json?.errors)
+    );
+    check(
+      `POST /api/clients with ${label} leaks no internal error text`,
+      !/is not a function|Cast to |ObjectId/i.test(String(r.json?.message || '')),
+      `message=${JSON.stringify(r.json?.message)}`
+    );
+  }
+  // The documented-duplicate URL must not be the unvalidated one (audit M-12).
+  const dupUrlBad = await api('/api/tasks/clients', { token: adminToken, method: 'POST', body: { name: [] } });
+  check('POST /api/tasks/clients with a non-string name is 400', dupUrlBad.status === 400, `got ${dupUrlBad.status}`);
+  // A well-formed create still works.
+  const validClientName = `Smoke Validated Client ${Date.now()}`;
+  const okClient = await api('/api/clients', {
+    token: adminToken,
+    method: 'POST',
+    body: { name: validClientName, associatedEmails: ['valid@example.test'], status: 'Active' }
+  });
+  check('a well-formed client is still created (201)', okClient.status === 201, `got ${okClient.status} ${JSON.stringify(okClient.json)}`);
+  if (okClient.json?.data?._id) await Client.deleteOne({ _id: okClient.json.data._id });
+
+  console.log('\nH-2: AI summarise accepts { emailId } and scopes it like GET /emails/:id');
+  const summarizeById = await api('/api/ai/summarize-email', {
+    token: headToken,
+    method: 'POST',
+    body: { emailId: String(hostileEmail._id) }
+  });
+  // The defect was a CONTRACT mismatch: this call answered 400 "Email subject
+  // or body is required for summarization." for every email, for every user.
+  // Any other outcome is acceptable here — 200, a 202 with a pollable job, 503
+  // when GEMINI_API_KEY is absent, 502 on an upstream failure — because the
+  // model backend is out of this suite's control. What must never come back is
+  // the 400 that says the server could not find content it was holding.
+  check(
+    'summarize-email { emailId } is no longer a 400 contract mismatch',
+    summarizeById.status !== 400,
+    `got ${summarizeById.status} ${JSON.stringify(summarizeById.json)}`
+  );
+  check(
+    'summarize-email never claims a loaded email has no subject or body',
+    !/subject or body is required/i.test(String(summarizeById.json?.message || '')),
+    JSON.stringify(summarizeById.json)
+  );
+  check(
+    'summarize-email { emailId } answers a documented status',
+    [200, 202, 502, 503].includes(summarizeById.status),
+    `got ${summarizeById.status}`
+  );
+
+  const summarizeForeign = await api('/api/ai/summarize-email', {
+    token: headToken,
+    method: 'POST',
+    body: { emailId: String(adminThreadMail._id) }
+  });
+  check(
+    'a Head cannot summarise an email in another mailbox (403)',
+    summarizeForeign.status === 403,
+    `got ${summarizeForeign.status} ${JSON.stringify(summarizeForeign.json)}`
+  );
+  const summarizeMissing = await api('/api/ai/summarize-email', {
+    token: headToken,
+    method: 'POST',
+    body: { emailId: '507f1f77bcf86cd799439011' }
+  });
+  check('summarize-email 404s for an unknown email', summarizeMissing.status === 404, `got ${summarizeMissing.status}`);
+  const summarizeBoth = await api('/api/ai/summarize-email', {
+    token: headToken,
+    method: 'POST',
+    body: { emailId: String(hostileEmail._id), threadId: 'smoke-thread-ai' }
+  });
+  check('summarize-email with BOTH ids is 400', summarizeBoth.status === 400, `got ${summarizeBoth.status}`);
+  const summarizeEmptyBody = await api('/api/ai/summarize-email', { token: headToken, method: 'POST', body: {} });
+  check('summarize-email with nothing to summarise is still 400', summarizeEmptyBody.status === 400, `got ${summarizeEmptyBody.status}`);
+  // The legacy payload keeps working, so nothing that predates the fix breaks.
+  const summarizeLegacy = await api('/api/ai/summarize-email', {
+    token: headToken,
+    method: 'POST',
+    body: { subject: 'Smoke legacy shape', from: 'a@example.test', body: 'Please send the revised quotation.' }
+  });
+  check(
+    'the legacy { subject, from, body } payload is still accepted',
+    summarizeLegacy.status !== 400,
+    `got ${summarizeLegacy.status} ${JSON.stringify(summarizeLegacy.json)}`
+  );
+
+  console.log('\nH-3: inbox category tabs actually filter');
+  await Email.deleteMany({ messageId: /^smoke-cat-/ });
+  const catFixtures = await Email.insertMany([
+    { messageId: 'smoke-cat-inbox', subject: 'ZQCAT inbox', from: 'i@example.test', date: new Date(), direction: 'inbound', labelIds: ['INBOX'], fetchedBy: adminUser._id, toEmail: 'inbox@example.test' },
+    { messageId: 'smoke-cat-spam', subject: 'ZQCAT spam', from: 's@example.test', date: new Date(), direction: 'inbound', labelIds: ['SPAM'], fetchedBy: adminUser._id, toEmail: 'inbox@example.test' },
+    { messageId: 'smoke-cat-promo', subject: 'ZQCAT promo', from: 'p@example.test', date: new Date(), direction: 'inbound', labelIds: ['INBOX', 'CATEGORY_PROMOTIONS'], fetchedBy: adminUser._id, toEmail: 'inbox@example.test' },
+    { messageId: 'smoke-cat-sent', subject: 'ZQCAT sent', from: 'inbox@example.test', date: new Date(), direction: 'outbound', labelIds: ['SENT'], fetchedBy: adminUser._id, toEmail: 'inbox@example.test' }
+  ]);
+  const catIds = Object.fromEntries(catFixtures.map((e) => [e.messageId, String(e._id)]));
+
+  const idsIn = async (query) => {
+    const r = await api(`/api/gmail/emails?page=1&limit=100&${query}`, { token: adminToken });
+    return { status: r.status, total: r.json?.pagination?.total, ids: (r.json?.data || []).map((e) => String(e._id)), rows: r.json?.data || [] };
+  };
+
+  const catInbox = await idsIn('category=inbox&q=ZQCAT');
+  check('category=inbox includes an inbound message', catInbox.ids.includes(catIds['smoke-cat-inbox']), JSON.stringify(catInbox.ids));
+  check('category=inbox excludes spam', !catInbox.ids.includes(catIds['smoke-cat-spam']), 'a SPAM row appeared in the Inbox');
+  check('category=inbox excludes sent mail', !catInbox.ids.includes(catIds['smoke-cat-sent']), 'an outbound row appeared in the Inbox');
+
+  const catSent = await idsIn('category=sent&q=ZQCAT');
+  check('category=sent returns the outbound row', catSent.ids.includes(catIds['smoke-cat-sent']), JSON.stringify(catSent.ids));
+  check('category=sent returns ONLY outbound rows', catSent.rows.every((e) => e.direction === 'outbound'), JSON.stringify(catSent.rows.map((e) => e.direction)));
+  check('category=sent does not return the Inbox row', !catSent.ids.includes(catIds['smoke-cat-inbox']), 'Sent showed received mail');
+
+  const catSpam = await idsIn('category=spam&q=ZQCAT');
+  check('category=spam returns only the SPAM row', catSpam.ids.length === 1 && catSpam.ids[0] === catIds['smoke-cat-spam'], JSON.stringify(catSpam.ids));
+
+  const catPromo = await idsIn('category=promotions&q=ZQCAT');
+  check('category=promotions returns only the CATEGORY_PROMOTIONS row', catPromo.ids.length === 1 && catPromo.ids[0] === catIds['smoke-cat-promo'], JSON.stringify(catPromo.ids));
+
+  const catSocial = await idsIn('category=social&q=ZQCAT');
+  check('category=social returns nothing when no message carries the label', catSocial.ids.length === 0, JSON.stringify(catSocial.ids));
+
+  // The defect in one assertion: five of six tabs used to report an identical
+  // total because the parameter was ignored outright.
+  const totalsByTab = {};
+  for (const name of ['inbox', 'sent', 'promotions', 'social', 'updates', 'spam']) {
+    const r = await api(`/api/gmail/emails?page=1&limit=1&category=${name}`, { token: adminToken });
+    totalsByTab[name] = r.json?.pagination?.total;
+  }
+  check(
+    'the six category tabs no longer all report one identical total',
+    new Set(Object.values(totalsByTab)).size > 1,
+    JSON.stringify(totalsByTab)
+  );
+  const outboundTruth = await Email.countDocuments({ deletedAt: null, direction: 'outbound' });
+  check(
+    'category=sent total equals the outbound row count in Mongo',
+    totalsByTab.sent === outboundTruth,
+    `api=${totalsByTab.sent} mongo=${outboundTruth}`
+  );
+
+  // An unsupported value is refused rather than silently falling back to the
+  // Inbox — silently ignoring this parameter is the entire defect.
+  const catBogus = await api('/api/gmail/emails?page=1&limit=1&category=not-a-tab', { token: adminToken });
+  check('an unknown category is 400, not a silent Inbox', catBogus.status === 400, `got ${catBogus.status}`);
+  check('the 400 names the supported categories', Array.isArray(catBogus.json?.supported) && catBogus.json.supported.includes('sent'), JSON.stringify(catBogus.json));
+
+  const catCounts = await api('/api/gmail/categories', { token: adminToken });
+  check('GET /api/gmail/categories is 200', catCounts.status === 200, `got ${catCounts.status}`);
+  const catRows = catCounts.json?.categories || [];
+  check('categories reports every tab', catRows.length >= 6, JSON.stringify(catRows.map((c) => c.name)));
+  check(
+    'the categories endpoint agrees with the list endpoint',
+    catRows.find((c) => c.name === 'sent')?.total === totalsByTab.sent,
+    JSON.stringify(catRows)
+  );
+  const empCats = await api('/api/gmail/categories', { token: empToken });
+  check('an Employee cannot read category counts (403)', empCats.status === 403, `got ${empCats.status}`);
+
+  console.log('\nH-4: the dashboard and the Tasks page agree on a Head\'s tasks');
+  const employeeUser = await User.findOne({ email: employeeEmail }).lean();
+  // Two tasks that only the union rule sees: one the Head CREATED, one merely
+  // ASSIGNED to them. Created through the API so the report cache is dropped
+  // exactly as it would be in production.
+  const h4Client = `Smoke H4 Client ${Date.now()}`;
+  const h4Created = await api('/api/tasks', {
+    token: headToken,
+    method: 'POST',
+    body: { title: 'H4 created by head', clientName: h4Client, assignedTo: String(employeeUser._id), deadline: new Date(Date.now() + 86400000).toISOString() }
+  });
+  check('H-4 fixture: a Head can create a task', h4Created.status === 201, `got ${h4Created.status} ${JSON.stringify(h4Created.json)}`);
+  const h4Assigned = await api('/api/tasks', {
+    token: adminToken,
+    method: 'POST',
+    body: { title: 'H4 assigned to head', clientName: h4Client, assignedTo: String(headUser._id), deadline: new Date(Date.now() + 86400000).toISOString() }
+  });
+  check('H-4 fixture: the Admin can assign a task to the Head', h4Assigned.status === 201, `got ${h4Assigned.status}`);
+
+  // All three read at the same moment: the tile, the list, and the database.
+  const h4Overall = await api('/api/reports/overall', { token: headToken });
+  const h4List = await api('/api/tasks?page=1&limit=1', { token: headToken });
+  const h4Late = await api('/api/tasks?page=1&limit=1&status=Late', { token: headToken });
+  const h4Pending = await api('/api/tasks?page=1&limit=1&status=Pending', { token: headToken });
+  const h4Scope = { $or: [{ createdBy: headUser._id }, { assignedTo: headUser._id }] };
+  const h4Truth = {
+    total: await TaskModel.countDocuments(h4Scope),
+    late: await TaskModel.countDocuments({ ...h4Scope, status: 'Late' }),
+    pending: await TaskModel.countDocuments({ ...h4Scope, status: 'Pending' }),
+    createdByOnly: await TaskModel.countDocuments({ createdBy: headUser._id })
+  };
+
+  check(
+    "the Head's dashboard total equals their Tasks page total",
+    h4Overall.json?.totalTasks === h4List.json?.pagination?.total,
+    `dashboard=${h4Overall.json?.totalTasks} tasks=${h4List.json?.pagination?.total}`
+  );
+  check(
+    "the Head's dashboard total is re-derivable from Mongo (createdBy OR assignedTo)",
+    h4Overall.json?.totalTasks === h4Truth.total,
+    `dashboard=${h4Overall.json?.totalTasks} mongo=${h4Truth.total}`
+  );
+  check(
+    'overdue agrees across the dashboard, the Tasks page and Mongo',
+    h4Overall.json?.totalLate === h4Late.json?.pagination?.total && h4Overall.json?.totalLate === h4Truth.late,
+    `dashboard=${h4Overall.json?.totalLate} tasks=${h4Late.json?.pagination?.total} mongo=${h4Truth.late}`
+  );
+  check(
+    'pending agrees across the dashboard, the Tasks page and Mongo',
+    h4Overall.json?.totalPending === h4Pending.json?.pagination?.total && h4Overall.json?.totalPending === h4Truth.pending,
+    `dashboard=${h4Overall.json?.totalPending} tasks=${h4Pending.json?.pagination?.total} mongo=${h4Truth.pending}`
+  );
+  // The fixtures guarantee the two definitions genuinely differ here, so an
+  // accidental return to `createdBy` only cannot pass this suite silently.
+  check(
+    'the fixtures make createdBy-only and createdBy-OR-assignedTo differ',
+    h4Truth.createdByOnly < h4Truth.total,
+    `createdByOnly=${h4Truth.createdByOnly} either=${h4Truth.total}`
+  );
+
+  // H-6's server half: the creator filter the Tasks page sends.
+  const byCreator = await api(`/api/tasks?page=1&limit=1&createdBy=${headUser._id}`, { token: adminToken });
+  check(
+    'GET /api/tasks?createdBy= narrows to that creator',
+    byCreator.json?.pagination?.total === h4Truth.createdByOnly,
+    `api=${byCreator.json?.pagination?.total} mongo=${h4Truth.createdByOnly}`
+  );
+  // H-7's server half: the month window the Calendar needs.
+  const windowFrom = new Date(Date.now() + 43200000).toISOString();
+  const windowTo = new Date(Date.now() + 172800000).toISOString();
+  const byDeadline = await api(`/api/tasks?page=1&limit=1&deadlineFrom=${windowFrom}&deadlineTo=${windowTo}`, { token: adminToken });
+  const deadlineTruth = await TaskModel.countDocuments({ deadline: { $gte: new Date(windowFrom), $lte: new Date(windowTo) } });
+  check(
+    'GET /api/tasks?deadlineFrom&deadlineTo narrows to that window',
+    byDeadline.json?.pagination?.total === deadlineTruth,
+    `api=${byDeadline.json?.pagination?.total} mongo=${deadlineTruth}`
+  );
+
+  console.log('\nH-5: client analytics account for unattributed rows');
+  // A task naming a client that does not exist. The API still accepts it (that
+  // is a separate decision), so the analytics must not pretend it is not there.
+  const ghostClientName = `Smoke Ghost Client ${Date.now()}`;
+  const ghostTask = await api('/api/tasks', {
+    token: adminToken,
+    method: 'POST',
+    body: { title: 'H5 ghost client task', clientName: ghostClientName, assignedTo: String(adminUser._id), deadline: new Date(Date.now() + 86400000).toISOString() }
+  });
+  check('H-5 fixture: a task naming an unknown client is created', ghostTask.status === 201, `got ${ghostTask.status}`);
+
+  const h5Overall = await api('/api/reports/overall', { token: adminToken });
+  const h5Stats = await api('/api/reports/client-stats', { token: adminToken });
+  const h5Rows = Array.isArray(h5Stats.json) ? h5Stats.json : h5Stats.json?.data || [];
+  const sumOf = (key) => h5Rows.reduce((total, row) => total + (row[key] || 0), 0);
+
+  check('client-stats is 200', h5Stats.status === 200, `got ${h5Stats.status}`);
+  check(
+    'client-stats carries an explicit Unattributed row',
+    h5Rows.some((r) => r.isUnattributed === true),
+    JSON.stringify(h5Rows.map((r) => r.name))
+  );
+  check(
+    'the Unattributed row is keyed by a stable non-ObjectId sentinel',
+    h5Rows.find((r) => r.isUnattributed)?._id === '__unattributed__',
+    JSON.stringify(h5Rows.find((r) => r.isUnattributed))
+  );
+  // The defect in one assertion: the table's own columns must add up to the
+  // tiles printed at the top of the same screen.
+  check(
+    'client-stats task column reconciles with the TASKS tile',
+    sumOf('taskCount') === h5Overall.json?.totalTasks,
+    `table=${sumOf('taskCount')} tile=${h5Overall.json?.totalTasks}`
+  );
+  check(
+    'client-stats email column reconciles with the EMAILS tile',
+    sumOf('emailCount') === h5Overall.json?.totalEmails,
+    `table=${sumOf('emailCount')} tile=${h5Overall.json?.totalEmails}`
+  );
+  check(
+    'client-stats completed column reconciles with the COMPLETED tile',
+    sumOf('completedTaskCount') === h5Overall.json?.totalCompleted,
+    `table=${sumOf('completedTaskCount')} tile=${h5Overall.json?.totalCompleted}`
+  );
+  check(
+    'the ghost client is named in the Unattributed row',
+    (h5Rows.find((r) => r.isUnattributed)?.orphanClientNames || []).includes(ghostClientName.toLowerCase()),
+    JSON.stringify(h5Rows.find((r) => r.isUnattributed)?.orphanClientNames)
+  );
+
+  const h5Clients = await api('/api/clients?page=1&limit=100', { token: adminToken });
+  const un = h5Clients.json?.unattributed;
+  check('GET /api/clients reports an unattributed bucket', Boolean(un), JSON.stringify(Object.keys(h5Clients.json || {})));
+  check(
+    'the unattributed bucket reconciles: matched + unattributed = total (tasks)',
+    un && un.matched.taskCount + un.taskCount === un.totals.taskCount,
+    JSON.stringify(un)
+  );
+  check(
+    'the unattributed bucket reconciles: matched + unattributed = total (emails)',
+    un && un.matched.emailCount + un.emailCount === un.totals.emailCount,
+    JSON.stringify(un)
+  );
+  check(
+    'the client list page and its unattributed bucket sum to the workspace total',
+    un && (h5Clients.json?.data || []).reduce((t, c) => t + (c.taskCount || 0), 0) + un.taskCount === un.totals.taskCount,
+    JSON.stringify({ page: (h5Clients.json?.data || []).reduce((t, c) => t + (c.taskCount || 0), 0), un: un?.taskCount, total: un?.totals?.taskCount })
+  );
+  const h5Truth = {
+    tasks: await TaskModel.countDocuments({}),
+    emails: await Email.countDocuments({ deletedAt: null, direction: { $ne: 'outbound' } })
+  };
+  check(
+    'the unattributed totals are re-derivable from Mongo',
+    un && un.totals.taskCount === h5Truth.tasks && un.totals.emailCount === h5Truth.emails,
+    JSON.stringify({ api: un?.totals, mongo: h5Truth })
+  );
+
+  await TaskModel.deleteMany({ clientName: { $in: [ghostClientName, h4Client] } });
+
+  console.log('\nH-8: rate limits are keyed per user, and login per account');
+  // Under one shared per-IP bucket, four consecutive requests from two users
+  // give a strictly decreasing `remaining`, so A's two reads differ by 2.
+  // With per-user buckets each user decrements only its own, so they differ by 1.
+  const remainingFor = async (token) => {
+    const res = await fetch(`${BASE}/api/tasks?page=1&limit=1`, { headers: { Authorization: `Bearer ${token}` } });
+    return Number(res.headers.get('ratelimit-remaining'));
+  };
+  const rA1 = await remainingFor(adminToken);
+  const rE1 = await remainingFor(empToken);
+  const rA2 = await remainingFor(adminToken);
+  const rE2 = await remainingFor(empToken);
+  check(
+    'the general limiter decrements only the calling user',
+    rA1 - rA2 === 1 && rE1 - rE2 === 1,
+    JSON.stringify({ rA1, rA2, rE1, rE2 })
+  );
+  check(
+    'two users do not share one rate-limit bucket',
+    rA1 !== rE1 || rA2 !== rE2,
+    JSON.stringify({ rA1, rE1, rA2, rE2 })
+  );
+
+  // Per-account login limiting: the control that actually stops credential
+  // stuffing, and the one that does NOT lock out an office behind one NAT.
+  const accountMax = Number(process.env.RATE_LIMIT_AUTH_ACCOUNT_MAX || 10);
+  const victimEmail = `smoke.lockout.${Date.now()}@example.test`;
+  let lockedOutAt = null;
+  for (let attempt = 1; attempt <= accountMax + 2; attempt += 1) {
+    const r = await api('/api/auth/login', { method: 'POST', body: { email: victimEmail, password: 'definitely-wrong' } });
+    if (r.status === 429) {
+      lockedOutAt = attempt;
+      break;
+    }
+  }
+  check(
+    `repeated failed logins for one account are locked out (within ${accountMax + 2} attempts)`,
+    lockedOutAt !== null,
+    `no 429 after ${accountMax + 2} failed attempts — is RATE_LIMIT_AUTH_ACCOUNT_MAX set very high?`
+  );
+  check(
+    'the lockout does not fire before the configured budget',
+    lockedOutAt === null || lockedOutAt > accountMax,
+    `locked out on attempt ${lockedOutAt} with a budget of ${accountMax}`
+  );
+  // The whole point: a colleague on the SAME IP can still sign in.
+  const colleague = await api('/api/auth/login', { method: 'POST', body: { email: headEmail, password: PASSWORD } });
+  check(
+    'a different account on the same IP can still sign in',
+    colleague.status === 200,
+    `got ${colleague.status} ${JSON.stringify(colleague.json)}`
+  );
+
+  console.log('\nH-1: a sync where every mailbox fails reports failure');
+  // Dead, deliberately unusable credentials on the Head's account: exactly the
+  // audit's condition, where all four seeded mailboxes answered invalid_grant
+  // and the UI showed a green "Inbox is already up to date".
+  //
+  // These are LEGACY PLAINTEXT tokens (no ':' separator), so they need
+  // ALLOW_LEGACY_PLAINTEXT_TOKENS to be unset or 'true' — the default.
+  const h1Primary = 'smoke-dead-primary@example.test';
+  const h1Linked = 'smoke-dead-linked@example.test';
+  await User.updateOne(
+    { _id: headUser._id },
+    {
+      $set: {
+        gmailEmail: h1Primary,
+        gmailAccessToken: 'smoke-dead-access-token',
+        gmailRefreshToken: 'smoke-dead-refresh-token',
+        linkedGmailAccounts: [
+          { gmailEmail: h1Linked, gmailAccessToken: 'smoke-dead-access-token-2', gmailRefreshToken: 'smoke-dead-refresh-token-2' }
+        ],
+        gmailSyncHealth: [],
+        lastGmailSyncStatus: null
+      }
+    }
+  );
+
+  const syncBefore = Date.now();
+  const syncRes = await api('/api/gmail/fetch', { token: headToken, method: 'POST' });
+  check(
+    'a sync in which every mailbox failed is NOT reported as accepted',
+    syncRes.status === 502,
+    `got ${syncRes.status} ${JSON.stringify(syncRes.json)}`
+  );
+  check('the failed sync response says ok:false', syncRes.json?.ok === false, JSON.stringify(syncRes.json));
+  check("the failed sync response says syncStatus:'failed'", syncRes.json?.syncStatus === 'failed', JSON.stringify(syncRes.json?.syncStatus));
+  check(
+    'the failed sync never reports a new-mail count',
+    syncRes.json?.count === null && syncRes.json?.newEmails === null,
+    JSON.stringify({ count: syncRes.json?.count, newEmails: syncRes.json?.newEmails })
+  );
+  check(
+    'the failed sync carries a renderable message naming the mailboxes',
+    typeof syncRes.json?.message === 'string' &&
+      syncRes.json.message.includes(h1Primary) &&
+      !/up to date/i.test(syncRes.json.message),
+    JSON.stringify(syncRes.json?.message)
+  );
+  const syncAccounts = syncRes.json?.accounts || [];
+  check('per-account results are returned', syncAccounts.length === 2, JSON.stringify(syncAccounts));
+  check('every account is reported as failed', syncAccounts.every((a) => a.ok === false), JSON.stringify(syncAccounts));
+  check(
+    'each failed account carries a machine-readable code and a human hint',
+    syncAccounts.every((a) => Boolean(a.errorCode) && Boolean(a.hint)),
+    JSON.stringify(syncAccounts)
+  );
+  check(
+    'both failing mailboxes are named',
+    syncAccounts.map((a) => a.inbox).sort().join(',') === [h1Primary, h1Linked].sort().join(','),
+    JSON.stringify(syncAccounts.map((a) => a.inbox))
+  );
+
+  // The poll endpoint must tell the same story.
+  const syncPoll = await api(`/api/gmail/sync/${syncRes.json?.jobId}`, { token: headToken });
+  check('the sync poll endpoint reports ok:false', syncPoll.json?.ok === false, JSON.stringify(syncPoll.json));
+  check("the sync poll endpoint reports syncStatus:'failed'", syncPoll.json?.syncStatus === 'failed', JSON.stringify(syncPoll.json?.syncStatus));
+  check('the sync poll endpoint populates `error`', Boolean(syncPoll.json?.error), JSON.stringify(syncPoll.json?.error));
+  check('the sync poll endpoint returns per-account results', (syncPoll.json?.accounts || []).length === 2, JSON.stringify(syncPoll.json?.accounts));
+
+  // The audit trail must not say the sync happened normally.
+  const syncLog = await ActivityLog.findOne({ userId: headUser._id, createdAt: { $gte: new Date(syncBefore - 5000) } })
+    .sort({ createdAt: -1 })
+    .lean();
+  check('the failed sync writes an activity row', Boolean(syncLog), 'no activity row for the failed sync');
+  check(
+    'the activity row says the sync FAILED',
+    syncLog?.action === 'Gmail Fetch Failed',
+    `action=${JSON.stringify(syncLog?.action)}`
+  );
+  check(
+    'the activity row does not read as an ordinary fetch',
+    !/Found 0 new emails/i.test(String(syncLog?.details || '')),
+    `details=${JSON.stringify(syncLog?.details)}`
+  );
+  check(
+    'the activity row records the structured outcome',
+    syncLog?.after?.syncStatus === 'failed' && syncLog?.after?.failed === 2 && syncLog?.after?.succeeded === 0,
+    JSON.stringify(syncLog?.after)
+  );
+
+  // The connection status must stop claiming a healthy mailbox.
+  const syncStatusRes = await api('/api/gmail/status', { token: headToken });
+  check('gmail status reports the primary mailbox as failing', syncStatusRes.json?.syncOk === false, JSON.stringify(syncStatusRes.json));
+  check(
+    'gmail status lists every failing mailbox',
+    (syncStatusRes.json?.failingAccounts || []).length === 2,
+    JSON.stringify(syncStatusRes.json?.failingAccounts)
+  );
+  check(
+    'gmail status reports the last sync as failed',
+    syncStatusRes.json?.lastSyncStatus === 'failed',
+    JSON.stringify(syncStatusRes.json?.lastSyncStatus)
+  );
+  check(
+    'a revoked credential is flagged as needing a reconnect',
+    syncStatusRes.json?.linkedAccounts?.[0]?.needsReconnect === true ||
+      syncStatusRes.json?.linkedAccounts?.[0]?.syncOk === false,
+    JSON.stringify(syncStatusRes.json?.linkedAccounts)
+  );
+
+  // "Nothing new" and "could not reach any mailbox" must be distinguishable:
+  // with NO mailbox connected the same endpoint refuses rather than reporting
+  // a successful empty sync.
+  await User.updateOne(
+    { _id: headUser._id },
+    { $set: { gmailEmail: '', gmailAccessToken: null, gmailRefreshToken: null, linkedGmailAccounts: [], gmailSyncHealth: [] } }
+  );
+  const syncNone = await api('/api/gmail/fetch', { token: headToken, method: 'POST' });
+  check(
+    'a sync with no connected mailbox is refused, not reported as up to date',
+    syncNone.status === 400,
+    `got ${syncNone.status} ${JSON.stringify(syncNone.json)}`
+  );
+
+  await Email.deleteMany({ messageId: /^smoke-cat-/ });
 
   console.log('\nS-6: change-password returns a replacement token');
   const NEW_PASSWORD = 'SmokeTest!9876';

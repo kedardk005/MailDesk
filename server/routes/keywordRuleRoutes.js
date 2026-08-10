@@ -12,10 +12,14 @@ const {
 } = require('../controllers/keywordRuleController');
 const validate = require('../middleware/validate');
 const { bulkApproveSchema, updateKeywordRuleSchema } = require('../middleware/schemas');
+const { guardObjectIdParams } = require('../middleware/objectIdParam');
 
 // All keyword rule routes are protected for Admin and Head
 router.use(protect);
 router.use(authorizeRoles('Admin', 'Head'));
+
+// H-10: covers both '/:id' and '/approve-email/:id'.
+guardObjectIdParams(router, 'keyword rule', ['id']);
 
 router.route('/')
   .get(getKeywordRules)

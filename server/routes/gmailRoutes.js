@@ -19,15 +19,23 @@ const {
   getEmailById,
   getSyncJobStatus,
   getThreads,
-  getThreadById
+  getThreadById,
+  getEmailCategories
 } = require('../controllers/gmailController');
 const { protect, authorizeRoles } = require('../middleware/authMiddleware');
 const validate = require('../middleware/validate');
+const { guardObjectIdParams } = require('../middleware/objectIdParam');
 const {
   replyToEmailSchema,
   bulkAssignEmailsSchema,
   disconnectLinkedAccountSchema
 } = require('../middleware/schemas');
+
+// H-10: `:id` on this router is always an Email ObjectId. A malformed one is
+// a 400 here rather than a Mongoose CastError -> 500 in the controller.
+// `:threadId`, `:jobId` and `:attachmentId` are deliberately NOT guarded: they
+// are opaque Gmail/BullMQ identifiers, not ObjectIds.
+guardObjectIdParams(router, 'email', ['id']);
 
 // GET /api/gmail/auth-url - Generate Google OAuth URL (protected, Admin/Head only)
 router.get('/auth-url', protect, authorizeRoles('Admin', 'Head'), getAuthUrl);
@@ -45,6 +53,10 @@ router.get('/sync/:jobId', protect, authorizeRoles('Admin', 'Head'), getSyncJobS
 // GET /api/gmail/emails - Paginated email list (see docs/audits/API-LIST-CONTRACT.md).
 // Carries `snippet`, never `body`. Each row carries `isRead` for the caller.
 router.get('/emails', protect, authorizeRoles('Admin', 'Head'), getEmails);
+
+// GET /api/gmail/categories - H-3. Real per-tab row counts for the caller, so
+// the inbox tab strip stops showing the Inbox total on all six tabs.
+router.get('/categories', protect, authorizeRoles('Admin', 'Head'), getEmailCategories);
 
 // GET /api/gmail/threads - F-1 conversation list, one row per thread.
 // Same role gate and the same ownership scoping as GET /api/gmail/emails.

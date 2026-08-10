@@ -7,9 +7,14 @@ const {
   markAsRead,
   markAllAsRead
 } = require('../controllers/notificationController');
+const { guardObjectIdParams } = require('../middleware/objectIdParam');
 
 // All routes require authentication
 router.use(protect);
+
+// H-10. '/read-all' is a literal path registered before '/:id/read', so it is
+// never seen as an id.
+guardObjectIdParams(router, 'notification', ['id']);
 
 // GET /api/notifications - Get all notifications for logged-in user
 router.get('/', getNotifications);

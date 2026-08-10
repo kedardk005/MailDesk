@@ -948,19 +948,107 @@ const collectMailboxes = (user) => {
 };
 
 /**
+ * Classify a mailbox sync failure into something a user can act on.
+ *
+ * `invalid_grant` in production means the refresh token was revoked, the Google
+ * password changed, or consent expired — all routine in a real office, and all
+ * of them require a human to reconnect the mailbox. Retrying will never fix it,
+ * so it must not be reported like a transient network blip.
+ *
+ * @param {String} message
+ * @returns {{code: String, retryable: Boolean, hint: String}}
+ */
+const classifySyncError = (message) => {
+  const text = String(message || '');
+  if (/invalid_grant|invalid_client|unauthorized_client|invalid_token|Token has been expired or revoked/i.test(text)) {
+    return {
+      code: 'REAUTH_REQUIRED',
+      retryable: false,
+      hint: 'Google rejected the stored credentials. Reconnect this mailbox from Profile → Connected Gmail.'
+    };
+  }
+  if (/insufficient|forbidden|403/i.test(text)) {
+    return { code: 'PERMISSION_DENIED', retryable: false, hint: 'Google refused access to this mailbox.' };
+  }
+  if (/rate|quota|429|userRateLimitExceeded/i.test(text)) {
+    return { code: 'RATE_LIMITED', retryable: true, hint: 'Google is rate limiting this mailbox. It will be retried.' };
+  }
+  if (/timeout|ETIMEDOUT|ECONNRESET|ENOTFOUND|EAI_AGAIN|network|socket hang up/i.test(text)) {
+    return { code: 'NETWORK', retryable: true, hint: 'Could not reach Google. It will be retried.' };
+  }
+  return { code: 'SYNC_FAILED', retryable: true, hint: 'The mailbox could not be synced.' };
+};
+
+/**
+ * One line of prose describing a sync outcome, for the toast and the audit
+ * trail. Deliberately distinguishes the three cases the old code collapsed into
+ * "Found 0 new emails":
+ *
+ *   nothing new          — every mailbox answered, none had new mail
+ *   partial failure      — some mailboxes answered, some did not
+ *   total failure        — no mailbox could be reached at all
+ *
+ * @param {Object} summary
+ * @returns {String}
+ */
+const describeSyncSummary = (summary) => {
+  const { syncStatus, attempted, succeeded, failed, newCount, accounts } = summary;
+  const failedNames = accounts.filter((a) => !a.ok).map((a) => a.inbox).filter(Boolean).join(', ');
+
+  if (syncStatus === 'no_accounts') return 'No Gmail mailbox is connected, so nothing was synced.';
+  if (syncStatus === 'failed') {
+    return attempted === 1
+      ? `Could not sync ${failedNames || 'the mailbox'} — reconnect the mailbox.`
+      : `Could not reach any of the ${attempted} connected mailboxes (${failedNames}).`;
+  }
+  if (syncStatus === 'partial') {
+    return `${newCount} new email(s) from ${succeeded} of ${attempted} mailboxes. ${failed} failed: ${failedNames}.`;
+  }
+  return newCount > 0 ? `Found ${newCount} new email(s).` : 'No new mail; every mailbox is up to date.';
+};
+
+/**
  * Sync every mailbox for one user. Runs inside a queue worker, never inside an
  * HTTP request.
+ *
+ * H-1 — this used to return a bare `Number` and throw the per-account errors
+ * away. With all four seeded mailboxes answering `invalid_grant`, the worker
+ * logged four failures, returned 0, and the product told the user
+ * "Inbox is already up to date" with a green tick while the Activity Log
+ * recorded an ordinary "Gmail Fetch Auto". Mail silently stopped arriving and
+ * the audit trail agreed that it had not. The failure is expected on dead demo
+ * tokens; the LIE is the defect.
+ *
+ * It now returns a summary that distinguishes "nothing new" from "could not
+ * reach any mailbox", carries the per-account outcome so one dead account among
+ * four is visible, logs at error level when everything failed, and writes an
+ * activity row that says so.
  *
  * @param {Object} user - user document selected with token fields
  * @param {Boolean} [isManual]
  * @param {Function} [onProgress]
- * @returns {Promise<Number>} number of new emails
+ * @returns {Promise<{newCount: Number, syncStatus: String, ok: Boolean,
+ *   attempted: Number, succeeded: Number, failed: Number, message: String,
+ *   accounts: Array<Object>}>}
  */
 const syncUserEmails = async (user, isManual = false, onProgress = null) => {
   if (!user) throw new Error('Invalid user.');
 
   const mailboxes = collectMailboxes(user);
-  if (mailboxes.length === 0) return 0;
+
+  if (mailboxes.length === 0) {
+    const summary = {
+      newCount: 0,
+      attempted: 0,
+      succeeded: 0,
+      failed: 0,
+      syncStatus: 'no_accounts',
+      ok: true,
+      accounts: []
+    };
+    summary.message = describeSyncSummary(summary);
+    return summary;
+  }
 
   // Accounts are independent, so they run concurrently — but bounded, because
   // each one is already issuing up to GMAIL_SYNC_CONCURRENCY requests.
@@ -970,49 +1058,152 @@ const syncUserEmails = async (user, isManual = false, onProgress = null) => {
     mailboxes.map((mailbox) =>
       accountLimit(async () => {
         try {
-          return await syncAccountEmails({ userId: user._id, ...mailbox, onProgress });
+          const result = await syncAccountEmails({ userId: user._id, ...mailbox, onProgress });
+          return { ...result, ok: true, error: null, errorCode: null, hint: null };
         } catch (err) {
-          logger.error({ err: err.message, inbox: mailbox.inboxEmail }, 'mailbox sync failed');
-          return { inbox: mailbox.inboxEmail, newCount: 0, failed: 0, scanned: 0, error: err.message };
+          const classified = classifySyncError(err.message);
+          logger.error(
+            { err: err.message, code: classified.code, inbox: mailbox.inboxEmail, userId: String(user._id) },
+            'mailbox sync failed'
+          );
+          return {
+            inbox: mailbox.inboxEmail,
+            newCount: 0,
+            failed: 0,
+            scanned: 0,
+            ok: false,
+            error: err.message,
+            errorCode: classified.code,
+            hint: classified.hint
+          };
         }
       })
     )
   );
 
-  const totalNew = results.reduce((sum, r) => sum + r.newCount, 0);
+  const accounts = results.map((r) => ({
+    inbox: r.inbox,
+    ok: r.ok,
+    newCount: r.newCount || 0,
+    scanned: r.scanned || 0,
+    // Messages that could not be persisted, distinct from a whole-mailbox failure.
+    skipped: r.failed || 0,
+    error: r.error || null,
+    errorCode: r.errorCode || null,
+    hint: r.hint || null
+  }));
+
+  const succeeded = accounts.filter((a) => a.ok).length;
+  const failed = accounts.length - succeeded;
+  const totalNew = accounts.reduce((sum, a) => sum + a.newCount, 0);
+
+  const summary = {
+    newCount: totalNew,
+    attempted: accounts.length,
+    succeeded,
+    failed,
+    // 'ok' | 'partial' | 'failed'. A sync where EVERY mailbox failed is a
+    // failure, whatever the transport said.
+    syncStatus: succeeded === 0 ? 'failed' : failed > 0 ? 'partial' : 'ok',
+    ok: succeeded > 0,
+    accounts
+  };
+  summary.message = describeSyncSummary(summary);
 
   if (totalNew > 0) {
     // New mail invalidates every dashboard and report aggregate.
     await cache.invalidateStats();
   }
 
+  // Record the outcome on the user so GET /api/gmail/status can stop claiming
+  // "Connected" for a mailbox Google is refusing. Best effort: a health write
+  // must never be the reason a sync is reported as failed.
+  try {
+    await User.updateOne(
+      { _id: user._id },
+      {
+        $set: {
+          gmailSyncHealth: accounts.map((a) => ({
+            gmailEmail: a.inbox,
+            ok: a.ok,
+            errorCode: a.errorCode,
+            error: a.ok ? null : String(a.error || '').slice(0, 300),
+            at: new Date()
+          })),
+          lastGmailSyncAt: new Date(),
+          lastGmailSyncStatus: summary.syncStatus
+        }
+      }
+    );
+  } catch (err) {
+    logger.warn({ err: err.message, userId: String(user._id) }, 'could not record gmail sync health');
+  }
+
+  if (summary.syncStatus === 'failed') {
+    logger.error(
+      {
+        userId: String(user._id),
+        attempted: summary.attempted,
+        inboxes: accounts.map((a) => a.inbox),
+        codes: [...new Set(accounts.map((a) => a.errorCode).filter(Boolean))]
+      },
+      'gmail sync failed for EVERY connected mailbox'
+    );
+  } else if (summary.syncStatus === 'partial') {
+    logger.warn(
+      { userId: String(user._id), failed: summary.failed, attempted: summary.attempted },
+      'gmail sync failed for some mailboxes'
+    );
+  }
+
   // NO `req`: this runs inside the gmail-sync queue worker (and the cron job),
   // so there genuinely is no client IP or user agent to record. Leaving them
   // null is the accurate answer; the actor's last request address would be a
   // fabrication. The target is the mailbox set that was synced.
+  //
+  // The action string now carries the outcome, so the Activity Log's own filter
+  // can separate a failed sync from a successful one instead of showing four
+  // dead mailboxes as an ordinary "Gmail Fetch Auto".
+  const baseAction = isManual ? 'Gmail Fetch' : 'Gmail Fetch Auto';
   await logActivity(
     user._id,
-    isManual ? 'Gmail Fetch' : 'Gmail Fetch Auto',
-    `${isManual ? 'Manually' : 'Automatically'} fetched Gmail emails (Found ${totalNew} new emails)`,
+    summary.syncStatus === 'failed' ? `${baseAction} Failed` : baseAction,
+    `${isManual ? 'Manual' : 'Automatic'} Gmail sync — ${summary.message}`,
     {
       targetType: 'User',
       targetId: user._id,
-      targetLabel: mailboxes.map((m) => m.inboxEmail).filter(Boolean).join(', ')
+      targetLabel: mailboxes.map((m) => m.inboxEmail).filter(Boolean).join(', '),
+      after: {
+        syncStatus: summary.syncStatus,
+        attempted: summary.attempted,
+        succeeded: summary.succeeded,
+        failed: summary.failed,
+        newCount: summary.newCount,
+        failedInboxes: accounts.filter((a) => !a.ok).map((a) => a.inbox)
+      }
     }
   );
 
-  return totalNew;
+  return summary;
 };
 
 // Export for the queue worker and the cron job.
 exports.syncUserEmails = syncUserEmails;
+exports.classifySyncError = classifySyncError;
 
 /**
  * The unit of work the `gmail-sync` queue processes.
  *
+ * H-1: the job result now carries the whole outcome, not just a count. It
+ * deliberately does NOT throw when every mailbox failed — throwing would lose
+ * the per-account detail the UI needs to say WHICH mailbox to reconnect, and
+ * would burn three BullMQ retries on an `invalid_grant` that no retry can fix.
+ * The truth is transported in the result instead: `ok: false`,
+ * `syncStatus: 'failed'`, and a populated `error`.
+ *
  * @param {{userId: String, isManual: Boolean}} data
  * @param {Object} [context] - queue job context
- * @returns {Promise<{userId: String, newCount: Number}>}
+ * @returns {Promise<Object>} the sync summary
  */
 exports.runGmailSyncJob = async (data, context) => {
   const user = await User.findOne({ _id: data.userId, deletedAt: null }).select(
@@ -1026,8 +1217,8 @@ exports.runGmailSyncJob = async (data, context) => {
       }
     : null;
 
-  const newCount = await syncUserEmails(user, Boolean(data.isManual), onProgress);
-  return { userId: String(user._id), email: user.email, newCount };
+  const summary = await syncUserEmails(user, Boolean(data.isManual), onProgress);
+  return { userId: String(user._id), email: user.email, ...summary };
 };
 
 // @desc    Queue a Gmail sync for the caller's connected accounts
@@ -1080,13 +1271,101 @@ exports.fetchEmails = async (req, res) => {
       );
     }
 
-    return res.status(202).json({
-      message: `Gmail sync queued for ${jobs.length} account holder(s). Poll GET /api/gmail/sync/:jobId for progress.`,
-      status: 'queued',
+    /*
+     * H-1 — give the caller the OUTCOME, not just a receipt.
+     *
+     * The endpoint used to 202 the instant the job was enqueued and nothing
+     * ever propagated the worker's terminal failure back, so the UI showed a
+     * green "Inbox is already up to date" while all four mailboxes were
+     * answering `invalid_grant`. A sync that finishes inside
+     * GMAIL_INLINE_WAIT_MS (the overwhelmingly common case — the audit's failing
+     * sync took ~450 ms) now returns its real result in this same response.
+     *
+     * The HTTP status stays 202 and every pre-existing field keeps its meaning,
+     * so this is purely additive: a caller that still only polls
+     * GET /api/gmail/sync/:jobId is unaffected.
+     */
+    const inlineWaitMs = Number(process.env.GMAIL_INLINE_WAIT_MS || 8000);
+    const settled = await Promise.all(
+      jobs.map(async (job) => {
+        try {
+          return await queue.waitForJob(job.jobId, inlineWaitMs);
+        } catch {
+          return null;
+        }
+      })
+    );
+
+    const finished = settled.filter((s) => s && (s.state === queue.STATES.COMPLETED || s.state === queue.STATES.FAILED));
+    const complete = finished.length === jobs.length;
+
+    const accounts = finished.flatMap((s) => s.result?.accounts || []);
+    const newEmails = finished.reduce((sum, s) => sum + (s.result?.newCount || 0), 0);
+    const jobFailed = finished.some((s) => s.state === queue.STATES.FAILED);
+    const attempted = finished.reduce((sum, s) => sum + (s.result?.attempted || 0), 0);
+    const succeeded = finished.reduce((sum, s) => sum + (s.result?.succeeded || 0), 0);
+
+    let syncStatus = null;
+    if (complete) {
+      if (jobFailed) syncStatus = 'failed';
+      else if (attempted === 0) syncStatus = 'no_accounts';
+      else if (succeeded === 0) syncStatus = 'failed';
+      else syncStatus = succeeded < attempted ? 'partial' : 'ok';
+    }
+
+    const failedInboxes = accounts.filter((a) => !a.ok).map((a) => a.inbox).filter(Boolean);
+    const outcomeMessage = !complete
+      ? null
+      : syncStatus === 'failed'
+      ? attempted <= 1
+        ? `Could not sync ${failedInboxes[0] || 'the mailbox'} — reconnect the mailbox.`
+        : `Could not reach any of the ${attempted} connected mailboxes (${failedInboxes.join(', ')}).`
+      : syncStatus === 'partial'
+      ? `${newEmails} new email(s). ${failedInboxes.length} mailbox(es) failed: ${failedInboxes.join(', ')}.`
+      : syncStatus === 'no_accounts'
+      ? 'No Gmail mailbox is connected, so nothing was synced.'
+      : newEmails > 0
+      ? `Found ${newEmails} new email(s).`
+      : 'No new mail; every mailbox is up to date.';
+
+    /*
+     * A sync we KNOW failed for every mailbox is not "Accepted". 502 is the
+     * accurate code — the upstream (Gmail) refused — and it is what makes this
+     * fix self-sufficient: the existing client already renders a failed POST as
+     * `toast.error('Sync failed', { description: <message> })`, so the green
+     * "Inbox is already up to date" cannot survive this change even before the
+     * UI is updated to read `accounts[]`.
+     *
+     * A PARTIAL failure stays 202: some mail really did arrive, and the detail
+     * is in `accounts[]` and `failedAccounts`.
+     */
+    const totalFailure = complete && syncStatus === 'failed';
+    const httpStatus = totalFailure ? 502 : 202;
+
+    return res.status(httpStatus).json({
+      message: complete
+        ? outcomeMessage
+        : `Gmail sync queued for ${jobs.length} account holder(s). Poll GET /api/gmail/sync/:jobId for progress.`,
+      status: complete ? (totalFailure ? 'failed' : 'completed') : 'queued',
       accepted: jobs.length,
       jobId: jobs[0].jobId,
       jobIds: jobs.map((j) => j.jobId),
-      deduped: jobs.every((j) => j.deduped)
+      deduped: jobs.every((j) => j.deduped),
+      // --- H-1 additions. Null while the outcome is still unknown. ---------
+      ok: complete ? !totalFailure : null,
+      syncStatus,
+      // `count` is the field the inbox toast reads. It is null — NEVER 0 —
+      // whenever the outcome is unknown or bad, so "no new mail" cannot be
+      // rendered for a sync that did not succeed.
+      count: complete && !totalFailure ? newEmails : null,
+      newEmails: complete && !totalFailure ? newEmails : null,
+      attemptedAccounts: complete ? attempted : null,
+      succeededAccounts: complete ? succeeded : null,
+      failedAccounts: complete ? attempted - succeeded : null,
+      // Per-mailbox outcome: [{ inbox, ok, newCount, scanned, skipped, error,
+      // errorCode, hint }]. One dead account among four is visible here.
+      accounts: complete ? accounts : null,
+      error: totalFailure ? outcomeMessage : null
     });
   } catch (error) {
     logger.error({ err: error.message, stack: error.stack }, 'failed to queue Gmail sync');
@@ -1104,6 +1383,31 @@ exports.getSyncJobStatus = async (req, res) => {
       return res.status(404).json({ message: 'Sync job not found or expired.' });
     }
 
+    const result = status.result || null;
+    const finished = status.state === 'completed' || status.state === 'failed';
+
+    /*
+     * H-1. The old body carried `newEmails: 0, error: null` for a sync in which
+     * every mailbox had answered `invalid_grant`, so the client rendered a
+     * green "Inbox is already up to date". The three cases are now distinct:
+     *
+     *   syncStatus 'ok'          every mailbox answered (newEmails may be 0)
+     *   syncStatus 'partial'     some mailboxes failed — `accounts` says which
+     *   syncStatus 'failed'      no mailbox could be reached at all
+     *   syncStatus 'no_accounts' nothing is connected
+     *
+     * `ok` is false for 'failed', and `error` is populated, so a client that
+     * only reads `error` still surfaces the failure. Every field is additive:
+     * `status`, `newEmails`, `progress`, `attempts` and `error` keep their
+     * previous meanings.
+     */
+    const jobFailed = status.state === 'failed';
+    const syncStatus = jobFailed ? 'failed' : result?.syncStatus ?? (finished ? 'ok' : null);
+    const ok = jobFailed ? false : result?.ok ?? null;
+    const message = jobFailed
+      ? 'The sync job did not complete. Please try again.'
+      : result?.message ?? null;
+
     return res.status(200).json({
       jobId: status.jobId,
       // 'queued' | 'active' | 'completed' | 'failed'
@@ -1111,8 +1415,21 @@ exports.getSyncJobStatus = async (req, res) => {
       progress: status.progress || 0,
       attempts: status.attemptsMade,
       // Present only once state === 'completed'.
-      newEmails: status.result?.newCount ?? null,
-      error: status.error || null,
+      newEmails: result?.newCount ?? null,
+      // --- H-1 additions -------------------------------------------------
+      // Null until the job finishes.
+      ok,
+      syncStatus,
+      message,
+      attemptedAccounts: result?.attempted ?? null,
+      succeededAccounts: result?.succeeded ?? null,
+      failedAccounts: result?.failed ?? null,
+      // Per-mailbox outcome, so one dead account among four is visible:
+      // [{ inbox, ok, newCount, scanned, skipped, error, errorCode, hint }]
+      accounts: result?.accounts ?? null,
+      // A total failure is reported through `error` as well, so a client that
+      // only checks this field cannot read the sync as a success.
+      error: status.error || (ok === false ? message : null),
       createdAt: status.createdAt,
       finishedAt: status.finishedAt
     });
@@ -1121,6 +1438,74 @@ exports.getSyncJobStatus = async (req, res) => {
     return res.status(500).json({ message: 'Server error. Failed to read sync status.' });
   }
 };
+
+/*
+ * ---------------------------------------------------------------------------
+ * H-3 — inbox category tabs
+ * ---------------------------------------------------------------------------
+ *
+ * The client has always sent `?category=<tab>` and `getEmails` never read it
+ * (`grep -c category gmailController.js` returned 0), so Sent, Promotions,
+ * Social, Updates and Spam all returned the same 1,397 inbound rows as Inbox —
+ * five of six tabs showed the Inbox, and "Sent" presented RECEIVED mail under a
+ * "Received" timestamp column.
+ *
+ * The data model does support this. `Email.direction` distinguishes the 599
+ * outbound replies F-1 began persisting, and `Email.labelIds` holds the Gmail
+ * label set captured at ingest, which is where Gmail's own category membership
+ * lives (`CATEGORY_PROMOTIONS`, `CATEGORY_SOCIAL`, `CATEGORY_UPDATES`, `SPAM`).
+ *
+ * Two honesty notes, because "the filter now works" is not the same as "the
+ * tabs are now full":
+ *
+ *  1. `sent` is not a category question at all — it is `direction: 'outbound'`,
+ *     which the default filter (`direction: { $ne: 'outbound' }`) was actively
+ *     excluding.
+ *  2. In a workspace whose mail was ingested without Gmail's category labels,
+ *     the four category tabs correctly return ZERO rows. That is the truthful
+ *     answer, and `GET /api/gmail/categories` reports it up front so the UI can
+ *     show a real count (or hide the tab) instead of promising 1,397 rows it
+ *     will not deliver. An unknown category is a 400, never a silent fallback
+ *     to the Inbox — silently ignoring this parameter is the whole defect.
+ */
+const EMAIL_CATEGORIES = {
+  // Everything received that is not spam. No positive `INBOX` label
+  // requirement: a message ingested before label capture would otherwise
+  // vanish from the default view.
+  inbox: { label: 'Inbox', direction: 'inbound', filter: { labelIds: { $ne: 'SPAM' } } },
+  // Replies we sent, persisted as Email rows since F-1.
+  sent: { label: 'Sent', direction: 'outbound', filter: {} },
+  spam: { label: 'Spam', direction: 'inbound', filter: { labelIds: 'SPAM' } },
+  promotions: { label: 'Promotions', direction: 'inbound', filter: { labelIds: 'CATEGORY_PROMOTIONS' } },
+  social: { label: 'Social', direction: 'inbound', filter: { labelIds: 'CATEGORY_SOCIAL' } },
+  updates: { label: 'Updates', direction: 'inbound', filter: { labelIds: 'CATEGORY_UPDATES' } },
+  // Explicit "everything", inbound and outbound.
+  all: { label: 'All mail', direction: 'all', filter: {} }
+};
+
+const CATEGORY_NAMES = Object.keys(EMAIL_CATEGORIES);
+
+/**
+ * Resolve `?category=`.
+ *
+ * @param {Object} req
+ * @returns {{name: String|null, spec: Object|null, invalid: Boolean}}
+ */
+const resolveCategory = (req) => {
+  const raw = firstStringOf(req.query.category, 30).toLowerCase().trim();
+  if (!raw) return { name: null, spec: null, invalid: false };
+  const spec = EMAIL_CATEGORIES[raw];
+  if (!spec) return { name: raw, spec: null, invalid: true };
+  return { name: raw, spec, invalid: false };
+};
+
+/** The 400 body for an unsupported category. */
+const unsupportedCategory = (res, name) =>
+  res.status(400).json({
+    message: `Unsupported category "${name}". Supported categories: ${CATEGORY_NAMES.join(', ')}.`,
+    code: 'UNSUPPORTED_CATEGORY',
+    supported: CATEGORY_NAMES
+  });
 
 // @desc    List emails (paginated per docs/audits/API-LIST-CONTRACT.md)
 // @route   GET /api/gmail/emails
@@ -1142,11 +1527,21 @@ exports.getEmails = async (req, res) => {
 
     const filter = { ...NOT_DELETED };
 
+    // H-3: the tab. An unknown value is refused rather than silently ignored.
+    const category = resolveCategory(req);
+    if (category.invalid) return unsupportedCategory(res, category.name);
+    if (category.spec) Object.assign(filter, category.spec.filter);
+
     // F-1: replies we sent are now persisted as Email rows. They must NOT
     // appear in the message list by default — before F-1 the collection held
     // inbound mail only, and the inbox is finished work. `?direction=outbound`
     // or `?direction=all` opts in.
-    const direction = firstStringOf(req.query.direction, 20).toLowerCase();
+    //
+    // H-3: a category implies a direction (Sent IS `direction: outbound`), but
+    // an explicit `?direction=` still wins, so `?category=sent&direction=all`
+    // remains expressible.
+    const direction =
+      firstStringOf(req.query.direction, 20).toLowerCase() || (category.spec ? category.spec.direction : '');
     if (direction === 'inbound' || direction === 'outbound') filter.direction = direction;
     else if (direction !== 'all') filter.direction = { $ne: 'outbound' };
 
@@ -1229,6 +1624,37 @@ exports.getEmails = async (req, res) => {
   }
 };
 
+// @desc    Row count for every inbox category, scoped to the caller
+// @route   GET /api/gmail/categories
+// @access  Private (Admin, Head — same gate as GET /api/gmail/emails)
+//
+// H-3. The tab strip used to render "1,397" on all six tabs because every tab
+// issued the same unfiltered query. This gives the UI the real number for each
+// tab in ONE request, so a category the workspace has no mail for can be shown
+// as 0 (or hidden) instead of advertising rows it cannot produce.
+exports.getEmailCategories = async (req, res) => {
+  try {
+    const scope = { ...NOT_DELETED };
+    if (req.user.role === 'Employee') scope.assignedTo = req.user._id;
+    else if (req.user.role === 'Head') scope.fetchedBy = req.user._id;
+
+    const counts = await Promise.all(
+      CATEGORY_NAMES.map(async (name) => {
+        const spec = EMAIL_CATEGORIES[name];
+        const filter = { ...scope, ...spec.filter };
+        if (spec.direction === 'inbound' || spec.direction === 'outbound') filter.direction = spec.direction;
+        return { name, label: spec.label, total: await Email.countDocuments(filter) };
+      })
+    );
+
+    res.set('Cache-Control', 'private, max-age=15, stale-while-revalidate=60');
+    return res.status(200).json({ categories: counts });
+  } catch (error) {
+    logger.error({ err: error.message }, 'getEmailCategories failed');
+    return res.status(500).json({ message: 'Server error. Failed to count email categories.' });
+  }
+};
+
 // Ceiling on the thread-id set resolved by a message-level narrowing filter
 // (`q` / date range). Beyond this the count is reported as the cap; the
 // alternative is an unbounded `$in`.
@@ -1287,6 +1713,17 @@ exports.getThreads = async (req, res) => {
 
     // Message-level narrowing filters, resolved to a thread-id set first.
     const narrowing = {};
+
+    // H-3. A conversation spans both directions, so the category selects the
+    // threads that CONTAIN a message in it — "Sent" is the conversations you
+    // have replied to, not a separate list of replies.
+    const category = resolveCategory(req);
+    if (category.invalid) return unsupportedCategory(res, category.name);
+    if (category.spec) {
+      Object.assign(narrowing, category.spec.filter);
+      if (category.spec.direction !== 'all') narrowing.direction = category.spec.direction;
+    }
+
     const dateFrom = firstStringOf(req.query.dateFrom, 40);
     const dateTo = firstStringOf(req.query.dateTo, 40);
     const range = {};
@@ -1759,13 +2196,39 @@ exports.getConnectedStatus = async (req, res) => {
     // return second, on every dashboard poll, with no audit trail. It is now an
     // explicit Admin action (POST /api/gmail/deduplicate).
     const currentUser = await User.findById(req.user._id)
-      .select('_id name role gmailEmail +gmailAccessToken +linkedGmailAccounts')
+      .select(
+        '_id name role gmailEmail gmailSyncHealth lastGmailSyncAt lastGmailSyncStatus ' +
+          '+gmailAccessToken +linkedGmailAccounts'
+      )
       .lean();
     if (!currentUser) {
       return res.status(404).json({ message: "User not found" });
     }
     const isConnected = !!currentUser.gmailAccessToken && currentUser.gmailAccessToken !== "";
-    
+
+    /*
+     * H-1 — "a token is stored" and "the mailbox works" are different facts.
+     * `connected` has always meant the former, and it kept saying Connected for
+     * four mailboxes Google had been refusing for days. It is left alone (the
+     * Profile page's Disconnect control depends on it) and the sync outcome is
+     * reported ALONGSIDE it, per mailbox, so the UI can show
+     * "Connected — needs reconnecting" instead of a healthy green tick.
+     */
+    const healthByInbox = new Map(
+      (currentUser.gmailSyncHealth || []).map((h) => [String(h.gmailEmail || '').toLowerCase(), h])
+    );
+    const healthOf = (inbox) => {
+      const h = healthByInbox.get(String(inbox || '').toLowerCase());
+      if (!h) return { syncOk: null, syncErrorCode: null, syncError: null, lastSyncAt: null, needsReconnect: false };
+      return {
+        syncOk: h.ok === true,
+        syncErrorCode: h.errorCode || null,
+        syncError: h.ok ? null : h.error || null,
+        lastSyncAt: h.at || null,
+        needsReconnect: h.ok === false && h.errorCode === 'REAUTH_REQUIRED'
+      };
+    };
+
     // Non-Admin users only see their own primary account status (if connected) and no linked accounts
     let linkedAccounts = [];
 
@@ -1775,7 +2238,8 @@ exports.getConnectedStatus = async (req, res) => {
         connected: !!a.gmailAccessToken,
         ownerName: 'Me',
         isOtherUser: false,
-        userId: currentUser._id.toString()
+        userId: currentUser._id.toString(),
+        ...healthOf(a.gmailEmail)
       }));
     }
 
@@ -1787,17 +2251,33 @@ exports.getConnectedStatus = async (req, res) => {
         deletedAt: null,
         gmailAccessToken: { $nin: [null, ''] }
       })
-        .select('_id name gmailEmail +gmailAccessToken +linkedGmailAccounts')
+        .select('_id name gmailEmail gmailSyncHealth +gmailAccessToken +linkedGmailAccounts')
         .lean();
 
       for (const u of otherUsers) {
+        const otherHealth = new Map(
+          (u.gmailSyncHealth || []).map((h) => [String(h.gmailEmail || '').toLowerCase(), h])
+        );
+        const otherHealthOf = (inbox) => {
+          const h = otherHealth.get(String(inbox || '').toLowerCase());
+          if (!h) return { syncOk: null, syncErrorCode: null, syncError: null, lastSyncAt: null, needsReconnect: false };
+          return {
+            syncOk: h.ok === true,
+            syncErrorCode: h.errorCode || null,
+            syncError: h.ok ? null : h.error || null,
+            lastSyncAt: h.at || null,
+            needsReconnect: h.ok === false && h.errorCode === 'REAUTH_REQUIRED'
+          };
+        };
+
         // Add their primary account
         linkedAccounts.push({
           gmailEmail: u.gmailEmail,
           connected: true,
           ownerName: u.name,
           isOtherUser: true,
-          userId: u._id.toString()
+          userId: u._id.toString(),
+          ...otherHealthOf(u.gmailEmail)
         });
 
         // Add their linked accounts
@@ -1807,11 +2287,16 @@ exports.getConnectedStatus = async (req, res) => {
             connected: !!la.gmailAccessToken,
             ownerName: u.name,
             isOtherUser: true,
-            userId: u._id.toString()
+            userId: u._id.toString(),
+            ...otherHealthOf(la.gmailEmail)
           });
         }
       }
     }
+
+    const primaryHealth = isConnected
+      ? healthOf(currentUser.gmailEmail)
+      : { syncOk: null, syncErrorCode: null, syncError: null, lastSyncAt: null, needsReconnect: false };
 
     return res.status(200).json({
       connected: isConnected,
@@ -1819,7 +2304,18 @@ exports.getConnectedStatus = async (req, res) => {
       // The Profile page reads `.email`; both keys are returned so the
       // "Inbox Address" field is no longer blank regardless of which is used.
       email: currentUser.gmailEmail || "",
-      linkedAccounts
+      linkedAccounts,
+      // --- H-1 additions -------------------------------------------------
+      // The primary mailbox's last sync outcome, and a workspace-level roll-up
+      // so a banner can be shown without walking `linkedAccounts`.
+      ...primaryHealth,
+      lastSyncAt: currentUser.lastGmailSyncAt || primaryHealth.lastSyncAt || null,
+      lastSyncStatus: currentUser.lastGmailSyncStatus || null,
+      // Every mailbox on this response that the sync has reported as broken.
+      failingAccounts: [
+        ...(isConnected && primaryHealth.syncOk === false ? [currentUser.gmailEmail] : []),
+        ...linkedAccounts.filter((a) => a.syncOk === false).map((a) => a.gmailEmail)
+      ].filter(Boolean)
     });
   } catch (error) {
     logger.error({ err: error.message }, 'getConnectedStatus failed');

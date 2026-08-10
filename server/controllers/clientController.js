@@ -4,7 +4,7 @@ const Email = require('../models/Email');
 const cache = require('../utils/cache');
 const { escapeRegex } = require('../utils/regexHelper');
 const { parseListParams, listResponse, firstString } = require('../utils/paginate');
-const { listClients, CLIENT_SORT_FIELDS } = require('../utils/clientService');
+const { listClients, CLIENT_SORT_FIELDS, getUnattributedCounts } = require('../utils/clientService');
 const { logActivity } = require('../utils/activityLogger');
 const { log } = require('../utils/logger');
 
@@ -28,17 +28,33 @@ const getClients = async (req, res) => {
 
     // Counters are scoped to the caller (audit D5): a Head sees the counts for
     // the mail/tasks THEY can open, not workspace-wide volumes.
-    const { data, pagination } = await listClients(params, { user: req.user });
+    const [{ data, pagination }, unattributed] = await Promise.all([
+      listClients(params, { user: req.user }),
+      getUnattributedCounts(req.user)
+    ]);
 
     // Client lists change rarely; let the browser revalidate instead of
     // re-running the aggregation on every dashboard mount.
     res.set('Cache-Control', 'private, max-age=30, stale-while-revalidate=60');
 
+    /*
+     * H-5 — the Clients table's own columns summed to 353 tasks and 1,185
+     * emails against a workspace holding 427 and 1,397. A client LIST must not
+     * grow a fake client row (it would corrupt `pagination.total` and the sort
+     * order), so the residual is reported alongside the page instead, and the
+     * UI can render it as a footer line that makes the columns add up.
+     *
+     *   unattributed: { taskCount, completedTaskCount, openTaskCount,
+     *                   emailCount, totals: {...}, matched: {...},
+     *                   orphanClientNames: [...] }
+     */
     return listResponse(res, {
       params,
       data,
       pagination,
-      // Legacy shape preserved exactly: { success, count, data }.
+      extra: { unattributed },
+      // Legacy shape preserved exactly: { success, count, data } — plus the
+      // additive `unattributed` key.
       legacy: (rows) => ({ success: true, count: rows.length, data: rows })
     });
   } catch (err) {
@@ -209,7 +225,10 @@ const createClient = async (req, res) => {
     });
   } catch (err) {
     logger.error({ err: err.message }, 'createClient failed');
-    res.status(500).json({ success: false, message: err.message || 'Server error creating client' });
+    // H-9: never echo the raw driver/JS message back. It is how
+    // `{"name":[]}` answered 500 "name.trim is not a function"; the shape is
+    // now a 400 from `createClientSchema` and this path is a genuine 500.
+    res.status(500).json({ success: false, message: 'Server error creating client' });
   }
 };
 
@@ -274,7 +293,7 @@ const updateClient = async (req, res) => {
     });
   } catch (err) {
     logger.error({ err: err.message }, 'updateClient failed');
-    res.status(500).json({ success: false, message: err.message || 'Server error updating client' });
+    res.status(500).json({ success: false, message: 'Server error updating client' });
   }
 };
 
