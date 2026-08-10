@@ -205,6 +205,57 @@ Start-ScheduledTask -TaskName 'MailDesk Auto Deploy'       # run it now
 Unregister-ScheduledTask -TaskName 'MailDesk Auto Deploy' -Confirm:$false
 ```
 
+### If the API dies *after* a successful deploy
+
+`deploy-windows.ps1` only guards its own deploy window. If a commit passes its
+health check at 03:31 and then falls over at 11:00 under real traffic, nothing
+above notices. `scripts/watchdog-windows.ps1` covers that.
+
+```powershell
+cd C:\apps\maildesk\scripts
+.\watchdog-windows.ps1 -Install        # elevated; runs every 5 minutes
+```
+
+**What it refuses to do is the point.** An auto-rollback that fires on any
+unhealthy reading is worse than none, because the API also reports unhealthy
+when MongoDB stops — and reverting code cannot restart a database. It would
+churn `node_modules`, destroy the evidence, and leave you debugging the wrong
+build. So:
+
+| What it sees | What it does |
+| --- | --- |
+| API answers, `database: disconnected` | **No rollback.** Dependency failure. Alert, exit 5 |
+| API silent **and** Mongo's port dead | **No rollback.** Machine or database. Alert, exit 5 |
+| API silent, Mongo fine — 1st time | Restart the service. Most failures are transient |
+| API silent, Mongo fine — 2nd time | **Roll back** to last-known-good, verify, exit 3 |
+| Already on last-known-good | Nothing to roll back to. Alert, exit 4 |
+| Already rolled back from this commit | Refuses to loop. Alert, exit 4 |
+| `shuttingDown: true`, or a deploy holds the lock | No-op |
+
+Last-known-good is **earned, not assumed**: a commit is promoted only after it
+has been continuously healthy for `-SoakMinutes` (default 60). So a deploy at
+03:30 that breaks at 03:35 rolls back to the commit *before* it, never to
+itself. It rolls back at most once per commit — a watchdog that flaps a service
+is an outage with extra steps.
+
+When a human is needed it writes `logs\WATCHDOG-NEEDS-ATTENTION.txt` saying
+what happened and what it did not do. Delete that file once you have dealt with
+it; a successful promotion clears it automatically.
+
+Dry run, changes nothing:
+
+```powershell
+.\watchdog-windows.ps1 -WhatIfRollback
+```
+
+The decision table above is covered by 31 assertions in
+`scripts/tests/watchdog-logic.test.ps1`, which run on any machine with
+PowerShell 7 — no Windows required:
+
+```powershell
+pwsh -File scripts/tests/watchdog-logic.test.ps1
+```
+
 ### What it deliberately does not do
 
 - **It does not run the backfill scripts** in `server/scripts/`
