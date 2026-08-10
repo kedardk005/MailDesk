@@ -24,11 +24,52 @@ const nullableDeadlineField = z.preprocess(
   deadlineField.nullable()
 );
 
+/*
+ * L-3 — the password minimum was SIX characters, on an application that holds
+ * a firm's entire client correspondence.
+ *
+ * Twelve is the floor now. The reasoning, in order of weight:
+ *
+ *  - NIST SP 800-63B requires 8 as an absolute minimum and explicitly favours
+ *    length over composition rules; 12 is the length at which an offline
+ *    attack on a bcrypt hash stops being routine, and it is what CIS and the
+ *    UK NCSC's "three random words" guidance land on in practice.
+ *  - There is no composition requirement to go with it, deliberately: forced
+ *    symbol/digit classes push users to `Passw0rd!` (11 characters, minutes to
+ *    guess) while a 12-character passphrase is not guessable at all. Length is
+ *    the only rule here.
+ *  - No maximum was lowered: 128 stays, so a password manager's output fits.
+ *
+ * THIS GOVERNS NEW PASSWORDS ONLY. `loginSchema` keeps `min(1)`, so every
+ * existing account — including any created under the old six-character rule —
+ * still signs in unchanged. The next password they SET must meet the new floor.
+ *
+ * PASSWORD_MIN_LENGTH tunes it for an operator with a stricter policy; it is
+ * clamped to [8, 64] so the variable can only ever be used to tighten past the
+ * defensible minimum, never to reopen the six-character hole.
+ */
+const PASSWORD_MIN_LENGTH = Math.min(
+  64,
+  Math.max(8, Number(process.env.PASSWORD_MIN_LENGTH) || 12)
+);
+const PASSWORD_MAX_LENGTH = 128;
+
+/**
+ * The field every "set a new password" payload uses.
+ * @param {String} label - how the field is named to the user
+ * @returns {import('zod').ZodType}
+ */
+const newPasswordField = (label = 'Password') =>
+  z
+    .string({ error: `${label} must be text.` })
+    .min(PASSWORD_MIN_LENGTH, `${label} must be at least ${PASSWORD_MIN_LENGTH} characters.`)
+    .max(PASSWORD_MAX_LENGTH, `${label} is too long.`);
+
 // Auth Schemas
 const registerSchema = z.object({
   name: z.string().trim().min(1, 'Name is required.').max(120, 'Name is too long.'),
   email: z.string().trim().email('Invalid email address.').max(254),
-  password: z.string().min(6, 'Password must be at least 6 characters.').max(128, 'Password is too long.'),
+  password: newPasswordField(),
   role: z.string().optional()
 });
 
@@ -43,14 +84,14 @@ const forgotPasswordSchema = z.object({
 
 const resetPasswordSchema = z.object({
   token: z.string().trim().min(1, 'Reset token is required.').max(256),
-  password: z.string().min(6, 'Password must be at least 6 characters.').max(128, 'Password is too long.')
+  password: newPasswordField()
 });
 
 // User Schemas
 const createUserSchema = z.object({
   name: z.string().trim().min(1, 'Name is required.').max(120, 'Name is too long.'),
   email: z.string().trim().email('Invalid email address.').max(254),
-  password: z.string().min(6, 'Password must be at least 6 characters.').max(128, 'Password is too long.'),
+  password: newPasswordField(),
   // Zod 4 replaced `errorMap` with the unified `error` param; `errorMap` is
   // silently ignored, which is why these custom messages never appeared.
   role: z.enum(['Head', 'Employee'], { error: 'Invalid role selection. Must be Head or Employee.' })
@@ -76,7 +117,21 @@ const updateUserSchema = z.object({
       z.string().max(5000)
     ])
     .optional()
-});
+})
+  /*
+   * M-13 (related) — every field here is optional, so `PUT /api/users/:id`
+   * with `{}` answered 200 and the unchanged user: a malformed edit was a
+   * silent no-op write that looked like a successful save, and an Admin who
+   * mistyped a key was told the change had been applied. `updateTaskSchema`
+   * and `updateClientSchema` already refuse an empty payload; this one now
+   * matches them.
+   *
+   * Zod strips unknown keys BEFORE this runs, so `{"emial": "x"}` is empty by
+   * the time it gets here and is refused for the same reason.
+   */
+  .refine((data) => Object.keys(data).length > 0, {
+    message: 'No updatable fields were provided.'
+  });
 
 const updateUserProfileSchema = z.object({
   name: z.string().trim().min(1, 'Name cannot be empty.').max(120, 'Name is too long.').optional(),
@@ -86,8 +141,12 @@ const updateUserProfileSchema = z.object({
 });
 
 const changePasswordSchema = z.object({
-  currentPassword: z.string().min(1, 'Current password is required.').max(128),
-  newPassword: z.string().min(6, 'New password must be at least 6 characters.').max(128, 'Password is too long.')
+  // The CURRENT password is only ever compared against a stored hash, so it
+  // must not carry the new minimum: an account created under the old
+  // six-character rule has to be able to type its existing password in order
+  // to replace it (L-3).
+  currentPassword: z.string().min(1, 'Current password is required.').max(PASSWORD_MAX_LENGTH),
+  newPassword: newPasswordField('New password')
 });
 
 // Gmail Schemas
@@ -303,6 +362,7 @@ const updateClientSchema = createClientSchema
   .refine((data) => Object.keys(data).length > 0, { message: 'No updatable fields were provided.' });
 
 module.exports = {
+  PASSWORD_MIN_LENGTH,
   registerSchema,
   loginSchema,
   forgotPasswordSchema,

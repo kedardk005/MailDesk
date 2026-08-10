@@ -11,6 +11,8 @@ const cache = require('../utils/cache');
 const queue = require('../utils/queue');
 const { parseListParams, paginate, listResponse } = require('../utils/paginate');
 const { log } = require('../utils/logger');
+// M-13: one error envelope, `{ message, errors: [{ path, message }] }`.
+const { fieldError } = require('../utils/apiError');
 
 const logger = log('keyword-rules');
 
@@ -92,7 +94,10 @@ exports.createKeywordRule = async (req, res) => {
     const { keyword, assignedTo, autoApprove } = req.body;
 
     if (!keyword || !keyword.trim() || !assignedTo) {
-      return res.status(400).json({ message: 'Keyword and target assigned employee are required.' });
+      return fieldError(res, 400, 'Keyword and target assigned employee are required.', [
+        { path: 'keyword', message: 'A keyword is required.' },
+        { path: 'assignedTo', message: 'Choose who matching mail is assigned to.' }
+      ]);
     }
 
     const cleanKeyword = keyword.trim().toUpperCase();
@@ -106,7 +111,7 @@ exports.createKeywordRule = async (req, res) => {
     // Check if rule for this keyword already exists
     const existingRule = await KeywordRule.findOne({ keyword: cleanKeyword });
     if (existingRule) {
-      return res.status(400).json({ message: `A rule for keyword "${cleanKeyword}" already exists.` });
+      return fieldError(res, 400, `A rule for keyword "${cleanKeyword}" already exists.`, ['keyword']);
     }
 
     const rule = new KeywordRule({
@@ -436,7 +441,7 @@ exports.approveEmailAssignment = async (req, res) => {
     }
 
     if (!assignedUserId) {
-      return res.status(400).json({ message: 'Target assigned user ID is required.' });
+      return fieldError(res, 400, 'Target assigned user ID is required.', ['targetUserId']);
     }
 
     const employee = await User.findOne({ _id: assignedUserId, deletedAt: null }).select('name').lean();
@@ -509,7 +514,7 @@ exports.bulkApproveEmails = async (req, res) => {
     // here). Without it, `POST /bulk-approve {"targetUserId":"<attacker>"}`
     // swept every pending email in the company into the attacker's queue.
     if (!keyword || !keyword.trim()) {
-      return res.status(400).json({ message: 'A keyword is required for bulk approval.' });
+      return fieldError(res, 400, 'A keyword is required for bulk approval.', ['keyword']);
     }
 
     const query = scopeEmailQuery(req.user, {

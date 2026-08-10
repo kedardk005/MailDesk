@@ -2333,9 +2333,29 @@ exports.disconnectLinkedAccount = async (req, res) => {
       return res.status(400).json({ message: 'Either gmailEmail or userId is required.' });
     }
 
-    // Determine target user
+    /*
+     * L-7 — a Head passing another user's `userId` used to get 200.
+     *
+     * The id was silently dropped and the call fell through to the CALLER's own
+     * mailbox, so the response said "…disconnected successfully" about an
+     * account that was never touched — and, worse, about one that WAS: the
+     * caller's. Nothing was leaked and nothing of the target's was changed
+     * (verified in the audit: the other Head's `gmailEmail` and refresh token
+     * were intact), but a success message for a forbidden target is a lie, and
+     * the caller cannot tell which mailbox they just disconnected.
+     *
+     * A non-Admin may name only themselves. 403 — not 404 — because the id is a
+     * User id the caller may already read from `GET /api/users` (Heads are
+     * admitted there by design), so refusing by permission leaks nothing that a
+     * "not found" would hide.
+     */
     let targetUserId = req.user._id;
-    if (userId && req.user.role === 'Admin') {
+    if (userId && String(userId) !== String(req.user._id)) {
+      if (req.user.role !== 'Admin') {
+        return res.status(403).json({
+          message: 'Access denied. You can only disconnect a Gmail account linked to your own profile.'
+        });
+      }
       targetUserId = userId;
     }
 

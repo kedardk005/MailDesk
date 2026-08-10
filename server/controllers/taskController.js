@@ -14,6 +14,8 @@ const cache = require('../utils/cache');
 const { parseListParams, paginate, listResponse, firstString } = require('../utils/paginate');
 const { listClients, CLIENT_SORT_FIELDS } = require('../utils/clientService');
 const { log } = require('../utils/logger');
+// M-13: one error envelope, `{ message, errors: [{ path, message }] }`.
+const { fieldError } = require('../utils/apiError');
 
 const logger = log('tasks');
 
@@ -92,14 +94,19 @@ exports.createTask = async (req, res) => {
 
     // Validate required fields
     if (!title || !assignedTo || !clientName || !deadline) {
-      return res.status(400).json({ message: 'Title, assignedTo, clientName, and deadline are required.' });
+      return fieldError(res, 400, 'Title, assignedTo, clientName, and deadline are required.', [
+        !title && { path: 'title', message: 'A title is required.' },
+        !assignedTo && { path: 'assignedTo', message: 'Choose who this task is for.' },
+        !clientName && { path: 'clientName', message: 'A client name is required.' },
+        !deadline && { path: 'deadline', message: 'A deadline is required.' }
+      ].filter(Boolean));
     }
 
     // Verify the assignee actually exists — an unknown id previously produced a
     // Mongoose CastError -> 500.
     const assignee = await User.findOne({ _id: assignedTo, deletedAt: null }).select('name');
     if (!assignee) {
-      return res.status(400).json({ message: 'Assignee not found.' });
+      return fieldError(res, 400, 'Assignee not found.', ['assignedTo']);
     }
 
     // Object-level authorization on linkedEmail.
@@ -359,10 +366,10 @@ exports.updateTask = async (req, res) => {
       // Employees can only update the status field (specifically from Pending/Late to Completed)
       const { status } = req.body;
       if (!status) {
-        return res.status(400).json({ message: 'Status field is required.' });
+        return fieldError(res, 400, 'Status field is required.', ['status']);
       }
       if (status !== 'Completed') {
-        return res.status(400).json({ message: 'Employees are only allowed to mark a task as Completed.' });
+        return fieldError(res, 400, 'Employees are only allowed to mark a task as Completed.', ['status']);
       }
 
       // Claim the Pending/Late -> Completed transition ATOMICALLY.
@@ -378,7 +385,9 @@ exports.updateTask = async (req, res) => {
       const claimed = await Task.findOneAndUpdate(
         { _id: task._id, status: { $ne: 'Completed' } },
         { $set: { status: 'Completed', completedAt: new Date() } },
-        { new: true }
+        // L-6: deprecated `new` -> `returnDocument`. The claim still returns the
+        // POST-update document, which is what `wasAlreadyCompleted` reads.
+        { returnDocument: 'after' }
       );
       const wasAlreadyCompleted = !claimed;
       task.status = 'Completed';
@@ -634,12 +643,17 @@ exports.bulkTaskAction = async (req, res) => {
     const { action, taskIds, value } = req.body;
 
     if (!action || !taskIds || !Array.isArray(taskIds) || taskIds.length === 0) {
-      return res.status(400).json({ message: 'action and taskIds array are required.' });
+      return fieldError(res, 400, 'action and taskIds array are required.', [
+        !action && { path: 'action', message: 'An action is required.' },
+        (!taskIds || !Array.isArray(taskIds) || taskIds.length === 0) && {
+          path: 'taskIds', message: 'At least one task ID is required.'
+        }
+      ].filter(Boolean));
     }
 
     const validActions = ['delete', 'status', 'reassign'];
     if (!validActions.includes(action)) {
-      return res.status(400).json({ message: `Invalid action. Must be one of: ${validActions.join(', ')}` });
+      return fieldError(res, 400, `Invalid action. Must be one of: ${validActions.join(', ')}`, ['action']);
     }
 
     // ONE query, reused by every branch below. The original ran up to three
@@ -673,37 +687,68 @@ exports.bulkTaskAction = async (req, res) => {
           { $set: { status: 'unassigned', assignedTo: null } }
         );
       }
-      await Task.deleteMany({ _id: { $in: taskIds } });
-      result = { deleted: taskIds.length };
+      /*
+       * M-7 — this used to answer `{ deleted: taskIds.length }`: the number of
+       * ids REQUESTED, never the number of rows removed. Deleting one id that
+       * does not exist returned `{"deleted": 1}` against an unchanged
+       * collection — the API asserting a write it did not perform.
+       *
+       * `deletedCount` comes from the driver's own result. `requested` is kept
+       * alongside it so a caller can still tell "you asked for 5, 3 existed"
+       * without doing arithmetic against a number that used to be a lie.
+       */
+      const deleteResult = await Task.deleteMany({ _id: { $in: taskIds } });
+      const deletedCount = deleteResult?.deletedCount || 0;
+      result = { deleted: deletedCount, requested: taskIds.length };
       // A bulk action has N targets, so there is no single honest `targetId`.
       // The type and a countable label are recorded; inventing one id would be
       // worse than leaving it null.
-      await logActivity(req.user._id, 'Bulk Task Delete', `Bulk deleted ${taskIds.length} tasks`, {
+      await logActivity(req.user._id, 'Bulk Task Delete', `Bulk deleted ${deletedCount} tasks`, {
         req,
         targetType: 'Task',
-        targetLabel: `${taskIds.length} task(s)`
+        targetLabel: `${deletedCount} task(s)`
       });
     }
 
     else if (action === 'status') {
       const allowedStatuses = ['Pending', 'Completed', 'Late'];
       if (!value || !allowedStatuses.includes(value)) {
-        return res.status(400).json({ message: `Invalid status. Must be one of: ${allowedStatuses.join(', ')}` });
+        return fieldError(res, 400, `Invalid status. Must be one of: ${allowedStatuses.join(', ')}`, ['value']);
       }
       // F-2: same transition semantics as the single-task path. Stamping
       // `completedAt` FIRST, restricted to tasks that are not already
       // completed, is what stops a bulk re-apply from resetting the resolution
       // time of tasks that were finished last week.
+      let statusResult;
       if (value === 'Completed') {
         await Task.updateMany(
           { _id: { $in: taskIds }, status: { $ne: 'Completed' } },
           { $set: { completedAt: new Date() } }
         );
-        await Task.updateMany({ _id: { $in: taskIds } }, { $set: { status: 'Completed' } });
+        statusResult = await Task.updateMany({ _id: { $in: taskIds } }, { $set: { status: 'Completed' } });
       } else {
-        await Task.updateMany({ _id: { $in: taskIds } }, { $set: { status: value, completedAt: null } });
+        statusResult = await Task.updateMany(
+          { _id: { $in: taskIds } },
+          { $set: { status: value, completedAt: null } }
+        );
       }
-      result = { updated: taskIds.length, status: value };
+      /*
+       * M-7 — `updated` was `taskIds.length`, the count REQUESTED.
+       *
+       * `updated` is now `matchedCount`: the rows the action was actually
+       * applied to. That is the number a toast should say, and it is 0 for an
+       * id that does not exist. `modified` is the driver's `modifiedCount` —
+       * lower whenever a task already held the target status, which is a real
+       * distinction (re-applying "Completed" to completed work writes nothing)
+       * but not the one a user is being told about.
+       */
+      const matchedCount = statusResult?.matchedCount || 0;
+      result = {
+        updated: matchedCount,
+        modified: statusResult?.modifiedCount || 0,
+        requested: taskIds.length,
+        status: value
+      };
       // Summarised rather than per-task: 500 rows of before/after would blow
       // past the logger's size bound and be discarded wholesale.
       const beforeStatusCounts = tasks.reduce((acc, t) => {
@@ -711,26 +756,33 @@ exports.bulkTaskAction = async (req, res) => {
         acc[key] = (acc[key] || 0) + 1;
         return acc;
       }, {});
-      await logActivity(req.user._id, 'Bulk Task Status', `Bulk set ${taskIds.length} tasks to "${value}"`, {
+      await logActivity(req.user._id, 'Bulk Task Status', `Bulk set ${matchedCount} tasks to "${value}"`, {
         req,
         targetType: 'Task',
-        targetLabel: `${taskIds.length} task(s)`,
+        targetLabel: `${matchedCount} task(s)`,
         before: { statusCounts: beforeStatusCounts },
-        after: { status: value, taskCount: taskIds.length }
+        after: { status: value, taskCount: matchedCount }
       });
     }
 
     else if (action === 'reassign') {
-      if (!value) return res.status(400).json({ message: 'value (userId) is required for reassign action.' });
+      if (!value) return fieldError(res, 400, 'value (userId) is required for reassign action.', ['value']);
       const targetUser = await User.findById(value).select('name').lean();
       if (!targetUser) return res.status(404).json({ message: 'Target user not found.' });
-      await Task.updateMany({ _id: { $in: taskIds } }, { $set: { assignedTo: value } });
+      const reassignResult = await Task.updateMany({ _id: { $in: taskIds } }, { $set: { assignedTo: value } });
       // Sync linked email assignments too, reusing the tasks already loaded.
       const linkedEmailIds = tasks.filter(t => t.linkedEmail).map(t => t.linkedEmail);
       if (linkedEmailIds.length > 0) {
         await Email.updateMany({ _id: { $in: linkedEmailIds } }, { $set: { assignedTo: value, status: 'assigned' } });
       }
-      result = { updated: taskIds.length, assignedTo: targetUser.name };
+      // M-7: matched rows, not requested ids. See the delete branch above.
+      const reassignedCount = reassignResult?.matchedCount || 0;
+      result = {
+        updated: reassignedCount,
+        modified: reassignResult?.modifiedCount || 0,
+        requested: taskIds.length,
+        assignedTo: targetUser.name
+      };
 
       // ONE email for the whole batch. Reassigning 200 tasks must not put 200
       // messages in one inbox, so this uses the digest template above a single
@@ -751,12 +803,12 @@ exports.bulkTaskAction = async (req, res) => {
       const beforeAssignees = [
         ...new Set(tasks.map((t) => (t.assignedTo ? String(t.assignedTo) : 'unassigned')))
       ].slice(0, 20);
-      await logActivity(req.user._id, 'Bulk Task Reassign', `Bulk reassigned ${taskIds.length} tasks to ${targetUser.name}`, {
+      await logActivity(req.user._id, 'Bulk Task Reassign', `Bulk reassigned ${reassignedCount} tasks to ${targetUser.name}`, {
         req,
         targetType: 'Task',
-        targetLabel: `${taskIds.length} task(s)`,
+        targetLabel: `${reassignedCount} task(s)`,
         before: { assignedTo: beforeAssignees },
-        after: { assignedTo: String(value), assignedToName: targetUser.name, taskCount: taskIds.length }
+        after: { assignedTo: String(value), assignedToName: targetUser.name, taskCount: reassignedCount }
       });
     }
 
@@ -776,13 +828,13 @@ exports.createClient = async (req, res) => {
   try {
     const { name, associatedEmails } = req.body;
     if (!name || !name.trim()) {
-      return res.status(400).json({ message: 'Client name is required.' });
+      return fieldError(res, 400, 'Client name is required.', ['name']);
     }
 
     const trimmedName = name.trim();
     const existing = await Client.findOne({ name: { $regex: new RegExp(`^${escapeRegex(trimmedName)}$`, 'i') } });
     if (existing) {
-      return res.status(400).json({ message: 'Client name must be unique. Client already exists.' });
+      return fieldError(res, 400, 'Client name must be unique. Client already exists.', ['name']);
     }
 
     // Process associatedEmails array
@@ -830,7 +882,7 @@ exports.updateClient = async (req, res) => {
     if (name !== undefined) {
       const trimmedName = name.trim();
       if (!trimmedName) {
-        return res.status(400).json({ message: 'Client name cannot be empty.' });
+        return fieldError(res, 400, 'Client name cannot be empty.', ['name']);
       }
 
       // Check if client name matches another client
@@ -839,7 +891,7 @@ exports.updateClient = async (req, res) => {
         _id: { $ne: req.params.id } 
       });
       if (existing) {
-        return res.status(400).json({ message: 'Client name must be unique. Another client exists with this name.' });
+        return fieldError(res, 400, 'Client name must be unique. Another client exists with this name.', ['name']);
       }
       client.name = trimmedName;
     }

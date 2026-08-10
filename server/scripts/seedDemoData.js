@@ -404,7 +404,8 @@ const main = async () => {
     const c = await Client.findOneAndUpdate(
       { name },
       { $addToSet: { associatedEmails: { $each: [`accounts@${dom}`, `sales@${dom}`] } } },
-      { new: true }
+      // L-6: deprecated `new` -> `returnDocument`.
+      { returnDocument: 'after' }
     ).lean();
     if (c) existingClientDocs.push(c);
   }

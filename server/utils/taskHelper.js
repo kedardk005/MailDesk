@@ -149,7 +149,8 @@ const ensureTaskForEmail = async (email, assignedUserId, createdById, matcher = 
     return await Task.findOneAndUpdate(
       { linkedEmail: email._id },
       { $set: set, $setOnInsert: setOnInsert },
-      { upsert: true, new: true, setDefaultsOnInsert: true }
+      // L-6: deprecated `new` -> `returnDocument`.
+      { upsert: true, returnDocument: 'after', setDefaultsOnInsert: true }
     ).lean();
   } catch (err) {
     // A duplicate key means another writer won the upsert race; the task

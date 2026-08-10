@@ -5,6 +5,8 @@ const { logActivity } = require('../utils/activityLogger');
 const cache = require('../utils/cache');
 const { generateToken } = require('../utils/tokenService');
 const { log } = require('../utils/logger');
+// M-13: one error envelope, `{ message, errors: [{ path, message }] }`.
+const { fieldError } = require('../utils/apiError');
 
 const logger = log('auth');
 
@@ -17,7 +19,11 @@ exports.registerUser = async (req, res) => {
 
     // Validate: name, email, password are required
     if (!name || !email || !password) {
-      return res.status(400).json({ message: 'All fields (name, email, password) are required.' });
+      return fieldError(res, 400, 'All fields (name, email, password) are required.', [
+        !name && { path: 'name', message: 'Name is required.' },
+        !email && { path: 'email', message: 'Email address is required.' },
+        !password && { path: 'password', message: 'Password is required.' }
+      ].filter(Boolean));
     }
 
     // Check if email already exists (a soft-deleted account tombstones its
@@ -25,7 +31,8 @@ exports.registerUser = async (req, res) => {
     const emailNormalized = email.toLowerCase().trim();
     const userExists = await User.findOne({ email: emailNormalized, deletedAt: null });
     if (userExists) {
-      return res.status(400).json({ message: 'User with this email already exists.' });
+      // M-13: a duplicate address is a field error on `email`.
+      return fieldError(res, 400, 'User with this email already exists.', ['email']);
     }
 
     // Hash password using bcryptjs (salt rounds: 10)
@@ -44,7 +51,7 @@ exports.registerUser = async (req, res) => {
       finalRole = 'Admin';
       status = 'Approved';
     } else if (role === 'Admin') {
-      return res.status(400).json({ message: 'Registration as Admin is only allowed for the first user.' });
+      return fieldError(res, 400, 'Registration as Admin is only allowed for the first user.', ['role']);
     }
 
     // Save new user to MongoDB
@@ -114,7 +121,10 @@ exports.loginUser = async (req, res) => {
 
     // Validate inputs
     if (!email || !password) {
-      return res.status(400).json({ message: 'Please provide both email and password.' });
+      return fieldError(res, 400, 'Please provide both email and password.', [
+        !email && { path: 'email', message: 'Email address is required.' },
+        !password && { path: 'password', message: 'Password is required.' }
+      ].filter(Boolean));
     }
 
     // Find user by email
@@ -122,13 +132,16 @@ exports.loginUser = async (req, res) => {
     // Soft-deleted accounts must not be able to authenticate.
     const user = await User.findOne({ email: emailNormalized, deletedAt: null }).select('+password');
     if (!user) {
-      return res.status(400).json({ message: 'Invalid credentials. User not found.' });
+      // The path is `email`; the MESSAGE is unchanged, so this discloses
+      // nothing the response did not already say (M-13 is about attaching an
+      // existing error to an input, not about what the error reveals).
+      return fieldError(res, 400, 'Invalid credentials. User not found.', ['email']);
     }
 
     // Compare password
     const isMatch = await bcrypt.compare(password, user.password);
     if (!isMatch) {
-      return res.status(400).json({ message: 'Invalid credentials. Incorrect password.' });
+      return fieldError(res, 400, 'Invalid credentials. Incorrect password.', ['password']);
     }
 
     // Check account status
@@ -210,7 +223,7 @@ exports.forgotPassword = async (req, res) => {
     const { email } = req.body;
 
     if (!email) {
-      return res.status(400).json({ message: 'Please provide email address.' });
+      return fieldError(res, 400, 'Please provide email address.', ['email']);
     }
 
     const emailNormalized = email.toLowerCase().trim();
@@ -266,7 +279,10 @@ exports.resetPassword = async (req, res) => {
     const { token, password } = req.body;
 
     if (!token || !password) {
-      return res.status(400).json({ message: 'Reset token and new password are required.' });
+      return fieldError(res, 400, 'Reset token and new password are required.', [
+        !token && { path: 'token', message: 'Reset token is required.' },
+        !password && { path: 'password', message: 'A new password is required.' }
+      ].filter(Boolean));
     }
 
     // Look the user up BY the token hash, so a token is the only way in.
@@ -277,7 +293,7 @@ exports.resetPassword = async (req, res) => {
     }).select('+password +resetTokenHash +resetTokenExpires');
 
     if (!user) {
-      return res.status(400).json({ message: 'This password reset link is invalid or has expired.' });
+      return fieldError(res, 400, 'This password reset link is invalid or has expired.', ['token']);
     }
 
     const salt = await bcrypt.genSalt(10);

@@ -27,6 +27,30 @@ const CLIENT_SORT_FIELDS = ['name', 'createdAt', 'status', 'contactPerson'];
 
 const CLIENT_FIELDS = 'name associatedEmails contactPerson email phone notes status createdAt';
 
+/*
+ * L-8 — the "Clients" dashboard tile was `Client.estimatedDocumentCount()`.
+ *
+ * That is a collection-metadata read, not a count: it is exact right up until
+ * an unclean shutdown, after which it is restored from the last checkpoint and
+ * can stay wrong until the collection is rebuilt. It also applied NO filter,
+ * unlike every other tile on that dashboard.
+ *
+ * The tile and `listClients` now share this one base filter, so the tile and
+ * `GET /api/clients`'s `pagination.total` cannot drift apart. If a soft-delete
+ * or an archive flag is ever added to Client, adding it HERE fixes both.
+ *
+ * Not role-scoped on purpose: the client list is not role-scoped either (every
+ * role sees all 25 rows; only the per-client counters are narrowed), and a tile
+ * scoped differently from the page it links to is the H-4 defect again.
+ */
+const CLIENT_BASE_FILTER = {};
+
+/**
+ * Exact count of the clients a list request would page through.
+ * @returns {Promise<Number>}
+ */
+const countClients = () => Client.countDocuments(CLIENT_BASE_FILTER);
+
 /**
  * Role scoping for the counters (audit defect D5).
  *
@@ -226,7 +250,7 @@ const unattributedRow = (counts) => ({
 const listClients = async (params, options = {}) => {
   const { withCounts = true, user = null } = options;
 
-  const filter = {};
+  const filter = { ...CLIENT_BASE_FILTER };
   if (params.q) {
     const regex = new RegExp(escapeRegex(params.q), 'i');
     filter.$or = [{ name: regex }, { email: regex }, { contactPerson: regex }, { associatedEmails: regex }];
@@ -264,6 +288,8 @@ const listClients = async (params, options = {}) => {
 
 module.exports = {
   listClients,
+  countClients,
+  CLIENT_BASE_FILTER,
   getTaskCountsByClient,
   getMailCountsByClient,
   getUnattributedCounts,

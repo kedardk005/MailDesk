@@ -103,6 +103,38 @@ Legacy mode is a migration shim. Once every caller sends `page`, delete it.
    what this contract specifies; the client only reads `pagination`, so a later
    swap to cursors is not a client-visible change.
 
+## Error responses — normative (audit M-13)
+
+Every 4xx the API produces carries the same envelope, whether or not the route
+is Zod-validated:
+
+```json
+{
+  "message": "Check these fields: title, client name, assigned to, deadline.",
+  "errors": [
+    { "path": "title",      "message": "Invalid input: expected string, received undefined" },
+    { "path": "clientName", "message": "Invalid input: expected string, received undefined" }
+  ]
+}
+```
+
+- `message` is the headline, and is what a toast should show. For a **single**
+  field error it is that field's own message. For **several** it names the
+  fields ("Check these fields: …") instead of leading with Zod's wire-format
+  complaint, which named none of them.
+- `errors[]` is `{ path, message }` per field, `path` being the dotted body
+  path. It is present on validation failures, on duplicate-key conflicts
+  (`email`, `name`), and on the hand-rolled 400s in the controllers. It may be
+  empty, never absent, on a 4xx that is genuinely not about a field.
+- Endpoints that already sent `success: false` still send it. Nothing was
+  removed from any error body; `errors[]` is additive.
+- 5xx bodies are `{ message }` only, and the message is always generic — a 5xx
+  must never carry a driver or JS error string (audit H-9).
+
+Client contract: attach `errors[i].message` to the input named by
+`errors[i].path`, and fall back to `message` when there is no match.
+`client/src/api/axios.js` already passes a 400 payload through untouched.
+
 ## Endpoints in scope
 
 `/api/gmail/emails` · `/api/tasks` · `/api/clients` · `/api/users` ·
