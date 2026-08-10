@@ -309,12 +309,200 @@ const taskOverdue = ({ recipientName, taskTitle, deadline, overdueBy, clientName
   })
 });
 
+/* ------------------------------------------------------------------------ *
+ * Digests.
+ *
+ * The single-task templates above are the wrong shape for anything that fans
+ * out: 69 overdue tasks would be 69 separate messages, which is unreadable for
+ * the recipient and the fastest way to get the sending domain classified as
+ * spam. A digest is ONE message per person listing everything they need to see.
+ *
+ * Same rules as everything else here — tables, inline styles, a hand-written
+ * plain-text part, and every interpolated value through esc().
+ * ------------------------------------------------------------------------ */
+
+/**
+ * The task list shared by the digest templates.
+ *
+ * One table row per task. The title and its supporting facts are stacked
+ * inside a single cell rather than laid out as columns, because a two-column
+ * row with a long client name wraps badly at 320px and Outlook will not honour
+ * a percentage width on the second cell.
+ *
+ * @param {Array<{title: String, meta: String[], url: String|null}>} rows
+ * @returns {String}
+ */
+const taskRows = (rows) => {
+  if (!rows || rows.length === 0) return '';
+  const cells = rows
+    .map(
+      (row, i) => `
+      <tr>
+        <td style="padding:12px 16px;${i ? `border-top:1px solid ${C.line};` : ''}font-family:${FONT};">
+          <p style="margin:0;font-family:${FONT};font-size:14px;line-height:1.45;font-weight:600;color:${C.ink};">${
+            row.url
+              ? `<a href="${esc(row.url)}" style="color:${C.primary};text-decoration:none;">${esc(row.title)}</a>`
+              : esc(row.title)
+          }</p>
+          <p style="margin:4px 0 0;font-family:${FONT};font-size:12px;line-height:1.5;color:${C.faint};">${(row.meta || [])
+            .filter(Boolean)
+            .map(esc)
+            .join(' &middot; ')}</p>
+        </td>
+      </tr>`
+    )
+    .join('');
+  return `<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0"
+            style="margin:20px 0;border:1px solid ${C.line};border-radius:8px;">${cells}</table>`;
+};
+
+/** "and 12 more" line, or '' when nothing was truncated. */
+const moreLine = (shown, total) =>
+  total > shown ? small(`&hellip; and ${total - shown} more not listed here.`) : '';
+
+/** Plain-text task list: "  1. Title — Client: Acme · was due 05 Aug 2026". */
+const taskTextLines = (rows) =>
+  rows
+    .map((row, i) => {
+      const meta = (row.meta || []).filter(Boolean).join(' | ');
+      return `  ${i + 1}. ${row.title}${meta ? `\n     ${meta}` : ''}`;
+    })
+    .join('\n');
+
+/**
+ * ONE overdue email per person.
+ *
+ * `scope` decides whose tasks these are and therefore how the message reads:
+ *
+ *   'assignee' — the recipient's own overdue tasks.
+ *   'office'   — the office-wide list an Admin/Head receives. A supervisor who
+ *                also owns overdue tasks gets THIS one and not a second
+ *                personal digest, so `ownedCount` calls out how many of the
+ *                listed tasks are theirs.
+ *
+ * @param {Object} o
+ * @param {String} o.recipientName
+ * @param {Array<{title: String, meta: String[], url: String|null}>} o.tasks - already truncated to what should be listed
+ * @param {Number} o.totalCount - how many overdue tasks the digest covers, listed or not
+ * @param {String} [o.scope] - 'assignee' | 'office'
+ * @param {Number} [o.ownedCount] - office scope only: how many are the recipient's own
+ * @param {String} [o.listUrl]
+ * @returns {{subject: String, text: String, html: String}}
+ */
+const taskOverdueDigest = ({
+  recipientName,
+  tasks,
+  totalCount,
+  scope = 'assignee',
+  ownedCount = 0,
+  listUrl
+}) => {
+  const rows = tasks || [];
+  const total = totalCount ?? rows.length;
+  const office = scope === 'office';
+  const one = total === 1;
+  // Agreement is worked out once: "1 of your task is past their deadline" is
+  // the kind of thing that makes a template look machine-written.
+  const noun = one ? 'task' : 'tasks';
+  const verb = one ? 'is' : 'are';
+  const its = one ? 'its' : 'their';
+  const owned = `${ownedCount} of them ${ownedCount === 1 ? 'is' : 'are'} assigned to you.`;
+
+  const subject = office
+    ? `Overdue across the office: ${total} ${noun}`
+    : `Overdue: ${total} of your tasks`;
+
+  const lead = office
+    ? `${total} ${noun} ${verb} past ${its} deadline across the office.` +
+      (ownedCount > 0 ? ` ${owned}` : '')
+    : `${total} of your tasks ${verb} past ${its} deadline and still open.`;
+
+  return {
+    subject,
+    text:
+      `Hello ${recipientName},\n\n` +
+      `${lead}\n\n` +
+      `${taskTextLines(rows)}\n` +
+      (total > rows.length ? `\n  ... and ${total - rows.length} more not listed here.\n` : '') +
+      (listUrl ? `\nOpen the task list: ${listUrl}\n` : '') +
+      `\nThis is a once-a-day summary, not one message per task. You can turn it\n` +
+      `off under Profile > Notifications.\n\n` +
+      `— ${BRAND}\n`,
+    html: layout({
+      preheader: office
+        ? `${total} overdue ${noun} across the office.`
+        : `${total} of your tasks ${verb} overdue.`,
+      title: office ? 'Overdue tasks (office-wide)' : 'Your overdue tasks',
+      content:
+        h1(office ? 'Overdue tasks across the office' : 'Your overdue tasks') +
+        p(`Hello <strong style="color:${C.ink};">${esc(recipientName)}</strong>,`) +
+        p(
+          `<span style="color:${C.dangerText};font-weight:600;">${esc(String(total))}</span> ` +
+            `${office ? esc(noun) : 'of your tasks'} ${esc(verb)} past ${esc(its)} deadline` +
+            `${office ? ' across the office' : ' and still open'}.` +
+            (office && ownedCount > 0
+              ? ` <strong style="color:${C.ink};">${esc(String(ownedCount))}</strong> of them ` +
+                `${ownedCount === 1 ? 'is' : 'are'} assigned to you.`
+              : '')
+        ) +
+        taskRows(rows) +
+        moreLine(rows.length, total) +
+        (listUrl ? button('Open the task list', listUrl) : '') +
+        small('This is a once-a-day summary rather than one message per task. You can turn it off under Profile &rsaquo; Notifications.')
+    })
+  };
+};
+
+/**
+ * ONE email for a batch of tasks handed to the same person at once (the bulk
+ * reassign path). A single assignment uses `taskAssigned` instead.
+ *
+ * @param {Object} o
+ * @param {String} o.recipientName
+ * @param {String} o.assignedBy
+ * @param {Array<{title: String, meta: String[], url: String|null}>} o.tasks
+ * @param {Number} o.totalCount
+ * @param {String} [o.listUrl]
+ * @returns {{subject: String, text: String, html: String}}
+ */
+const taskAssignedDigest = ({ recipientName, assignedBy, tasks, totalCount, listUrl }) => {
+  const rows = tasks || [];
+  const total = totalCount ?? rows.length;
+
+  return {
+    subject: `Assigned to you: ${total} ${total === 1 ? 'task' : 'tasks'}`,
+    text:
+      `Hello ${recipientName},\n\n` +
+      `${assignedBy} assigned you ${total} ${total === 1 ? 'task' : 'tasks'}.\n\n` +
+      `${taskTextLines(rows)}\n` +
+      (total > rows.length ? `\n  ... and ${total - rows.length} more not listed here.\n` : '') +
+      (listUrl ? `\nOpen the task list: ${listUrl}\n` : '') +
+      `\n— ${BRAND}\n`,
+    html: layout({
+      preheader: `${assignedBy} assigned you ${total} ${total === 1 ? 'task' : 'tasks'}.`,
+      title: 'Tasks assigned to you',
+      content:
+        h1(total === 1 ? 'A task was assigned to you' : `${total} tasks were assigned to you`) +
+        p(`Hello <strong style="color:${C.ink};">${esc(recipientName)}</strong>,`) +
+        p(
+          `<strong style="color:${C.ink};">${esc(assignedBy)}</strong> has assigned you ` +
+            `${esc(String(total))} ${total === 1 ? 'task' : 'tasks'}.`
+        ) +
+        taskRows(rows) +
+        moreLine(rows.length, total) +
+        (listUrl ? button('Open the task list', listUrl) : '')
+    })
+  };
+};
+
 module.exports = {
   accountApproved,
   passwordReset,
   taskCompleted,
   taskAssigned,
   taskOverdue,
+  taskOverdueDigest,
+  taskAssignedDigest,
   // exported for tests and previews
   layout,
   esc,

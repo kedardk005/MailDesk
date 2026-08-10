@@ -38,9 +38,18 @@ end`;
 
 /**
  * Try to acquire `name` for `ttlMs`.
+ *
+ * `via` reports which guard actually answered: 'redis' is cluster-wide, 'local'
+ * is this process only. Callers that would rather SKIP than risk running twice
+ * across replicas — the daily overdue digest, whose duplicate is an inbox full
+ * of the same mail — can check it and stand down. Note that a Redis client
+ * created with `enableOfflineQueue: false` rejects commands issued before the
+ * socket is ready, so the first acquisition after a restart can legitimately
+ * come back as 'local' even when Redis is perfectly healthy.
+ *
  * @param {String} name
  * @param {Number} ttlMs
- * @returns {Promise<{acquired: Boolean, release: Function}>}
+ * @returns {Promise<{acquired: Boolean, release: Function, via: String}>}
  */
 const acquire = async (name, ttlMs) => {
   const key = `lock:${name}`;
@@ -55,9 +64,10 @@ const acquire = async (name, ttlMs) => {
           LOCK_OP_TIMEOUT_MS,
           'lock.set'
         );
-        if (result !== 'OK') return { acquired: false, release: async () => {} };
+        if (result !== 'OK') return { acquired: false, release: async () => {}, via: 'redis' };
         return {
           acquired: true,
+          via: 'redis',
           release: async () => {
             try {
               await withTimeout(client.eval(RELEASE_SCRIPT, 1, key, token), LOCK_OP_TIMEOUT_MS, 'lock.release');
@@ -74,10 +84,11 @@ const acquire = async (name, ttlMs) => {
     }
   }
 
-  if (localHeld.has(name)) return { acquired: false, release: async () => {} };
+  if (localHeld.has(name)) return { acquired: false, release: async () => {}, via: 'local' };
   localHeld.add(name);
   return {
     acquired: true,
+    via: 'local',
     release: async () => {
       localHeld.delete(name);
     }

@@ -130,10 +130,63 @@ const parseDeadline = (value) => {
  */
 const isValidDeadline = (value) => parseDeadline(value) !== null;
 
+/**
+ * The calendar day `date` falls on in `timeZone`, as "YYYY-MM-DD".
+ *
+ * Used as the idempotency key for once-a-day scheduled work: "has today's
+ * digest already gone out" is a question about the LOCAL day, not the UTC one.
+ * With APP_TIMEZONE=Asia/Kolkata those disagree for five and a half hours every
+ * night, which is exactly when a restart is most likely to re-run a job.
+ *
+ * `en-CA` is used because its short date format is already ISO-ordered, so no
+ * part reassembly (and no chance of getting the order wrong) is needed.
+ *
+ * @param {Date} [date]
+ * @param {String} [timeZone]
+ * @returns {String}
+ */
+const zonedDayKey = (date = new Date(), timeZone = getAppTimezone()) => {
+  try {
+    return new Intl.DateTimeFormat('en-CA', {
+      timeZone,
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit'
+    }).format(date);
+  } catch {
+    // An invalid APP_TIMEZONE must not take the scheduler down; UTC still gives
+    // a stable, monotonic day key.
+    return date.toISOString().slice(0, 10);
+  }
+};
+
+/**
+ * Hour of the day (0-23) that `date` falls on in `timeZone`.
+ *
+ * @param {Date} [date]
+ * @param {String} [timeZone]
+ * @returns {Number}
+ */
+const zonedHour = (date = new Date(), timeZone = getAppTimezone()) => {
+  try {
+    const value = new Intl.DateTimeFormat('en-US', {
+      timeZone,
+      hour: '2-digit',
+      hour12: false
+    }).format(date);
+    // Some ICU builds render midnight as "24" rather than "00".
+    return Number(value) % 24;
+  } catch {
+    return date.getUTCHours();
+  }
+};
+
 module.exports = {
   DEFAULT_TIMEZONE,
   getAppTimezone,
   parseDeadline,
   isValidDeadline,
-  zonedWallClockToUtc
+  zonedWallClockToUtc,
+  zonedDayKey,
+  zonedHour
 };

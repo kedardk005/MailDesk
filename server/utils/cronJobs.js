@@ -3,6 +3,7 @@ const Task = require('../models/Task');
 const User = require('../models/User');
 const { createNotifications } = require('./notificationHelper');
 const { withLock } = require('./lock');
+const { runOverdueDigestIfDue } = require('./overdueDigest');
 const queue = require('./queue');
 const cache = require('./cache');
 const { log } = require('./logger');
@@ -16,6 +17,12 @@ const scheduled = [];
 const OVERDUE_PATTERN = process.env.CRON_OVERDUE_PATTERN || '*/5 * * * *';
 const SYNC_PATTERN = process.env.CRON_SYNC_PATTERN || '*/10 * * * *';
 const OVERDUE_BATCH = Number(process.env.CRON_OVERDUE_BATCH || 1000);
+// The overdue EMAIL digest is a once-a-day message, but the schedule that
+// drives it ticks hourly: node-cron holds no state across a restart, so a
+// `0 9 * * *` schedule missed by a deploy at 09:05 is lost for the day. The job
+// itself decides whether the local hour has arrived and claims the day exactly
+// once — see utils/overdueDigest.js.
+const OVERDUE_DIGEST_PATTERN = process.env.CRON_OVERDUE_DIGEST_PATTERN || '0 * * * *';
 
 /**
  * Flip newly overdue tasks to Late and notify once.
@@ -172,7 +179,10 @@ const runAutoSyncScan = async () => {
  * @returns {void}
  */
 const startCronJobs = (io) => {
-  logger.info({ overdue: OVERDUE_PATTERN, sync: SYNC_PATTERN }, 'starting cron scheduler');
+  logger.info(
+    { overdue: OVERDUE_PATTERN, sync: SYNC_PATTERN, overdueDigest: OVERDUE_DIGEST_PATTERN },
+    'starting cron scheduler'
+  );
 
   scheduled.push(
     cron.schedule(OVERDUE_PATTERN, async () => {
@@ -195,6 +205,25 @@ const startCronJobs = (io) => {
       }
     })
   );
+
+  scheduled.push(
+    cron.schedule(OVERDUE_DIGEST_PATTERN, async () => {
+      try {
+        // No withLock() here on purpose: the job's own once-a-day claim is the
+        // lock, and it is held for the rest of the day rather than the length
+        // of one tick, so it also prevents a slow run overlapping the next.
+        const result = await runOverdueDigestIfDue();
+        if (result && result.queued > 0) {
+          logger.info(
+            { recipients: result.recipients, tasks: result.tasks, queued: result.queued },
+            'overdue digest queued'
+          );
+        }
+      } catch (error) {
+        logger.error({ err: error.message, stack: error.stack }, 'overdue email digest failed');
+      }
+    })
+  );
 };
 
 /**
@@ -209,4 +238,12 @@ const stopCronJobs = () => {
   scheduled.length = 0;
 };
 
-module.exports = { startCronJobs, stopCronJobs, runOverdueScan, runAutoSyncScan };
+module.exports = {
+  startCronJobs,
+  stopCronJobs,
+  runOverdueScan,
+  runAutoSyncScan,
+  // Re-exported so the daily digest is reachable from the same module as the
+  // scan it deliberately does NOT live inside.
+  runOverdueDigestIfDue
+};

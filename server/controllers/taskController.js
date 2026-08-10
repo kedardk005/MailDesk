@@ -5,6 +5,7 @@ const User = require('../models/User');
 const { logActivity } = require('../utils/activityLogger');
 const { createNotification } = require('../utils/notificationHelper');
 const { sendEmail } = require('../utils/emailHelper');
+const { sendTaskAssignedEmail, sendTasksAssignedEmail } = require('../utils/taskMailer');
 const { escapeRegex } = require('../utils/regexHelper');
 const { parseDeadline, getAppTimezone } = require('../utils/dateHelper');
 const { sanitizeTaskLinkedEmail } = require('../utils/sanitizeEmailHtml');
@@ -177,6 +178,23 @@ exports.createTask = async (req, res) => {
       'task_assigned'
     );
 
+    // The matching email. `task_assigned` had an email toggle on the Profile
+    // page and no sender behind it, so the switch controlled nothing.
+    // Self-assignment is skipped inside the mailer — for an Admin writing down
+    // their own work that is every task they create.
+    try {
+      await sendTaskAssignedEmail({
+        task: populatedTask,
+        assigneeId: assignedTo,
+        actorId: req.user._id,
+        actorName: req.user.name
+      });
+    } catch (err) {
+      // Belt and braces: the mailer already swallows its own failures. A task
+      // must never fail to be created because mail is down.
+      logger.error({ err: err.message, taskId: String(populatedTask._id) }, 'failed to queue task assignment email');
+    }
+
     await cache.invalidateStats();
 
     return res.status(201).json(populatedTask);
@@ -300,6 +318,10 @@ exports.updateTask = async (req, res) => {
     const beforeState = taskSnapshot(task);
 
     let shouldSpawnRecurrence = false;
+    // Set only when the assignee actually changes to a real user, and read only
+    // AFTER the save — mail for a reassignment that failed to persist would be
+    // worse than no mail. Holds the NEW assignee; the outgoing one is not told.
+    let reassignedTo = null;
 
     // Role checks
     if (req.user.role === 'Employee') {
@@ -450,6 +472,9 @@ exports.updateTask = async (req, res) => {
       // Handle changes to task assignee
       if (assignedTo !== undefined && assignedTo !== task.assignedTo?.toString()) {
         task.assignedTo = assignedTo || null;
+        // Unassigning tells nobody: `assignedTo: null` means the task lost an
+        // owner, not that someone gained one.
+        if (assignedTo) reassignedTo = String(assignedTo);
         // If there's a linked email, keep the email's assignee in sync
         if (task.linkedEmail) {
           await Email.findByIdAndUpdate(task.linkedEmail, {
@@ -476,6 +501,21 @@ exports.updateTask = async (req, res) => {
       .populate('assignedTo', 'name email')
       .populate('linkedEmail', LINKED_EMAIL_DETAIL_FIELDS)
       .populate('createdBy', 'name');
+
+    // Tell the NEW assignee, and only after the write is durable. An Admin who
+    // reassigns a task to themselves gets nothing (handled in the mailer).
+    if (reassignedTo) {
+      try {
+        await sendTaskAssignedEmail({
+          task: populatedTask,
+          assigneeId: reassignedTo,
+          actorId: req.user._id,
+          actorName: req.user.name
+        });
+      } catch (err) {
+        logger.error({ err: err.message, taskId: String(populatedTask._id) }, 'failed to queue reassignment email');
+      }
+    }
 
     await logActivity(req.user._id, 'Task Update', `Updated task "${populatedTask.title}" (Status: ${populatedTask.status}, Assigned to: ${populatedTask.assignedTo?.name || 'N/A'})`, {
       req,
@@ -583,8 +623,11 @@ exports.bulkTaskAction = async (req, res) => {
     // hydrating up to 500 full documents.
     // `status` and `assignedTo` are selected purely so the audit entry can
     // record the state the bulk write replaced. Still one lean query.
+    // `title`/`clientName`/`deadline`/`priority` ride along so the reassign
+    // branch can compose its email without a second read; none of them are
+    // touched by a bulk action, so the pre-update values are still correct.
     const tasks = await Task.find({ _id: { $in: taskIds } })
-      .select('_id createdBy linkedEmail status assignedTo')
+      .select('_id createdBy linkedEmail status assignedTo title clientName deadline priority')
       .lean();
 
     // For Head role, make sure they created all tasks they are trying to perform bulk action on
@@ -664,6 +707,23 @@ exports.bulkTaskAction = async (req, res) => {
         await Email.updateMany({ _id: { $in: linkedEmailIds } }, { $set: { assignedTo: value, status: 'assigned' } });
       }
       result = { updated: taskIds.length, assignedTo: targetUser.name };
+
+      // ONE email for the whole batch. Reassigning 200 tasks must not put 200
+      // messages in one inbox, so this uses the digest template above a single
+      // task. Tasks the person already owned are excluded — being told you were
+      // assigned something you already had is noise.
+      try {
+        const newlyAssigned = tasks.filter((t) => String(t.assignedTo || '') !== String(value));
+        await sendTasksAssignedEmail({
+          tasks: newlyAssigned,
+          assigneeId: value,
+          actorId: req.user._id,
+          actorName: req.user.name
+        });
+      } catch (err) {
+        logger.error({ err: err.message, count: taskIds.length }, 'failed to queue bulk reassignment email');
+      }
+
       const beforeAssignees = [
         ...new Set(tasks.map((t) => (t.assignedTo ? String(t.assignedTo) : 'unassigned')))
       ].slice(0, 20);
