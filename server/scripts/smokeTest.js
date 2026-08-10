@@ -543,6 +543,239 @@ const main = async () => {
   const afterUnmuted = await countNotifications();
   check('un-muting takes effect immediately (cache invalidated)', afterUnmuted === afterMuted + 1, `${afterMuted} -> ${afterUnmuted}`);
 
+  // =====================================================================
+  // Task assignment mail, and the DAILY overdue digest.
+  //
+  // `taskAssigned` and `taskOverdue` existed as templates with no caller,
+  // while the Profile page carried email toggles for both — the third
+  // dead-switch in this codebase. These assertions exist so the switches
+  // cannot quietly go dead again.
+  //
+  // Run IN PROCESS rather than over HTTP. The server is a separate process, so
+  // an HTTP call cannot observe what it handed to the mail queue; requiring
+  // the controller here and substituting the transport can. Everything else
+  // (database, models, preference resolution) is the real thing.
+  // =====================================================================
+  console.log('\ntask assignment email is wired to every assignment path');
+
+  const emailHelper = require('../utils/emailHelper');
+  const realSendEmail = emailHelper.sendEmail;
+  const outbox = [];
+  // The mailer resolves sendEmail at CALL time, so replacing the export here
+  // intercepts the real call sites without touching them.
+  emailHelper.sendEmail = async (to, subject, body, html, options = {}) => {
+    outbox.push({ to, subject, body, html, ...options });
+    return { id: `smoke-stub-${outbox.length}` };
+  };
+
+  const MAIL_CLIENT = 'Smoke Mail Client';
+  const TaskModel = require('../models/Task');
+  await TaskModel.deleteMany({ clientName: MAIL_CLIENT });
+
+  /** Minimal express double: enough for the controllers, no HTTP. */
+  const callController = async (handler, { user, body = {}, params = {} }) => {
+    const res = { statusCode: 0, body: null };
+    res.status = (code) => {
+      res.statusCode = code;
+      return res;
+    };
+    res.json = (payload) => {
+      res.body = payload;
+      return res;
+    };
+    await handler(
+      {
+        body,
+        params,
+        query: {},
+        user,
+        headers: { 'user-agent': 'MailDeskSmokeTest-Mail/1.0' },
+        ip: '127.0.0.1',
+        // No socket server in this process; createNotification tolerates null.
+        app: { get: () => null }
+      },
+      res
+    );
+    return res;
+  };
+
+  const taskController = require('../controllers/taskController');
+  const adminActor = { _id: adminUser._id, name: adminUser.name, role: 'Admin' };
+  const futureDeadline = new Date(Date.now() + 7 * 86400000).toISOString();
+  const newMail = (from) => outbox.slice(from);
+
+  // 1. An assignment to somebody else MUST queue mail.
+  let mark = outbox.length;
+  const assignRes = await callController(taskController.createTask, {
+    user: adminActor,
+    body: {
+      title: 'Mail probe: assigned to the employee',
+      clientName: MAIL_CLIENT,
+      assignedTo: String(empUser._id),
+      deadline: futureDeadline
+    }
+  });
+  check('assignment probe: task created', assignRes.statusCode === 201, `got ${assignRes.statusCode} ${JSON.stringify(assignRes.body)}`);
+  let queued = newMail(mark);
+  check('assignment queues exactly one email', queued.length === 1, `queued ${queued.length}`);
+  check('  ... addressed to the assignee', queued[0]?.to === employeeEmail, `to=${queued[0]?.to}`);
+  check(
+    "  ... tagged event 'task_assigned' so preferences govern it",
+    queued[0]?.event === 'task_assigned',
+    `event=${queued[0]?.event}`
+  );
+  check('  ... carries the recipient id', queued[0]?.userId === String(empUser._id), `userId=${queued[0]?.userId}`);
+  check('  ... names the task in the subject', String(queued[0]?.subject).includes('Mail probe: assigned to the employee'), queued[0]?.subject);
+  check('  ... has both a text and an HTML part', Boolean(queued[0]?.body) && Boolean(queued[0]?.html));
+
+  // 2. A SELF-assignment must queue nothing. For an Admin writing down their
+  //    own work this is the common case, and it is pure noise.
+  mark = outbox.length;
+  const selfRes = await callController(taskController.createTask, {
+    user: adminActor,
+    body: {
+      title: 'Mail probe: assigned to myself',
+      clientName: MAIL_CLIENT,
+      assignedTo: String(adminUser._id),
+      deadline: futureDeadline
+    }
+  });
+  check('self-assignment probe: task created', selfRes.statusCode === 201, `got ${selfRes.statusCode}`);
+  check('self-assignment queues NO email', newMail(mark).length === 0, `queued ${newMail(mark).length}`);
+
+  // 3. A reassignment notifies the NEW assignee, and nobody else.
+  mark = outbox.length;
+  const reassignRes = await callController(taskController.updateTask, {
+    user: adminActor,
+    params: { id: String(assignRes.body._id) },
+    body: { assignedTo: String(headUser._id) }
+  });
+  check('reassignment probe: task updated', reassignRes.statusCode === 200, `got ${reassignRes.statusCode}`);
+  queued = newMail(mark);
+  check('reassignment queues exactly one email', queued.length === 1, `queued ${queued.length}`);
+  check('  ... goes to the NEW assignee', queued[0]?.to === headEmail, `to=${queued[0]?.to}`);
+  check('  ... and NOT to the previous one', !queued.some((m) => m.to === employeeEmail));
+
+  // 4. An edit that does not move the assignee queues nothing.
+  mark = outbox.length;
+  await callController(taskController.updateTask, {
+    user: adminActor,
+    params: { id: String(assignRes.body._id) },
+    body: { priority: 'High' }
+  });
+  check('a non-assignment edit queues NO email', newMail(mark).length === 0, `queued ${newMail(mark).length}`);
+
+  // 5. A bulk reassign of N tasks is ONE email, not N.
+  const bulkTasks = await TaskModel.create([
+    { title: 'Bulk mail probe 1', clientName: MAIL_CLIENT, assignedTo: empUser._id, createdBy: adminUser._id, deadline: new Date(Date.now() + 86400000), status: 'Pending' },
+    { title: 'Bulk mail probe 2', clientName: MAIL_CLIENT, assignedTo: empUser._id, createdBy: adminUser._id, deadline: new Date(Date.now() + 86400000), status: 'Pending' },
+    { title: 'Bulk mail probe 3', clientName: MAIL_CLIENT, assignedTo: empUser._id, createdBy: adminUser._id, deadline: new Date(Date.now() + 86400000), status: 'Pending' }
+  ]);
+  mark = outbox.length;
+  const bulkRes = await callController(taskController.bulkTaskAction, {
+    user: adminActor,
+    body: { action: 'reassign', taskIds: bulkTasks.map((t) => String(t._id)), value: String(headUser._id) }
+  });
+  check('bulk reassign probe: 200', bulkRes.statusCode === 200, `got ${bulkRes.statusCode} ${JSON.stringify(bulkRes.body)}`);
+  queued = newMail(mark);
+  check('a bulk reassign of 3 tasks is ONE email, not three', queued.length === 1, `queued ${queued.length}`);
+  check('  ... to the new assignee', queued[0]?.to === headEmail, `to=${queued[0]?.to}`);
+  check('  ... listing all three tasks', ['1', '2', '3'].every((n) => String(queued[0]?.body).includes(`Bulk mail probe ${n}`)), queued[0]?.subject);
+
+  // =====================================================================
+  // The overdue digest groups PER PERSON, not per task.
+  //
+  // The whole point of the daily digest: a real backlog is three figures of
+  // overdue tasks, and one message per task would be unreadable and would get
+  // the sending domain classified as spam.
+  // =====================================================================
+  console.log('\noverdue email digest: one message per person, not per task');
+
+  const { buildOverdueDigests, runOverdueDigest } = require('../utils/overdueDigest');
+
+  // Pure grouping, exact numbers. No database, no clock.
+  const fixtureUser = (id, role, extra = {}) => [
+    id,
+    { _id: id, name: id, email: `${id}@example.test`, role, status: 'Approved', deletedAt: null, ...extra }
+  ];
+  const fixtureUsers = new Map([
+    fixtureUser('admin', 'Admin'),
+    fixtureUser('head', 'Head'),
+    fixtureUser('emp1', 'Employee'),
+    fixtureUser('emp2', 'Employee'),
+    fixtureUser('gone', 'Employee', { deletedAt: new Date() })
+  ]);
+  const fixtureTask = (id, who) => ({ _id: id, title: `Fixture ${id}`, assignedTo: who, deadline: new Date(0) });
+  const fixtureTasks = [
+    fixtureTask(1, 'emp1'), fixtureTask(2, 'emp1'), fixtureTask(3, 'emp1'),
+    fixtureTask(4, 'emp2'),
+    fixtureTask(5, 'head'), fixtureTask(6, 'head'),
+    fixtureTask(7, 'gone'),
+    fixtureTask(8, null)
+  ];
+  const digestGroups = buildOverdueDigests(fixtureTasks, fixtureUsers, ['admin', 'head']);
+  check('8 overdue tasks produce 4 digests, not 8', digestGroups.length === 4, `${digestGroups.length} digests`);
+  check(
+    'every recipient appears exactly once',
+    new Set(digestGroups.map((d) => d.userId)).size === digestGroups.length,
+    JSON.stringify(digestGroups.map((d) => d.userId))
+  );
+  const empDigest = digestGroups.find((d) => d.userId === 'emp1');
+  check("an assignee's digest holds only their own tasks", empDigest?.scope === 'assignee' && empDigest?.totalCount === 3, JSON.stringify(empDigest?.totalCount));
+  const adminDigest = digestGroups.find((d) => d.userId === 'admin');
+  check('a supervisor gets the office-wide list', adminDigest?.scope === 'office' && adminDigest?.totalCount === 8, JSON.stringify(adminDigest?.totalCount));
+  const bothDigest = digestGroups.filter((d) => d.userId === 'head');
+  check('someone who is BOTH supervisor and assignee gets ONE email', bothDigest.length === 1, `${bothDigest.length} digests`);
+  check('  ... and it is the office-wide one, flagging their own share', bothDigest[0]?.scope === 'office' && bothDigest[0]?.ownedCount === 2, JSON.stringify(bothDigest[0]));
+  check('a deleted assignee is never mailed', !digestGroups.some((d) => d.userId === 'gone'));
+  check('nothing overdue means NOBODY is mailed (no empty digest)', buildOverdueDigests([], fixtureUsers, ['admin', 'head']).length === 0);
+  check('every digest carries at least one task', digestGroups.every((d) => d.tasks.length > 0));
+
+  // The same rule against real rows, through the real query.
+  const overdueFixtures = [];
+  for (let i = 0; i < 5; i += 1) overdueFixtures.push({ title: `Overdue emp ${i}`, clientName: MAIL_CLIENT, assignedTo: empUser._id, createdBy: adminUser._id, deadline: new Date(Date.now() - (i + 2) * 86400000), status: 'Late' });
+  for (let i = 0; i < 3; i += 1) overdueFixtures.push({ title: `Overdue head ${i}`, clientName: MAIL_CLIENT, assignedTo: headUser._id, createdBy: adminUser._id, deadline: new Date(Date.now() - (i + 2) * 86400000), status: 'Pending' });
+  await TaskModel.create(overdueFixtures);
+
+  const overdueTotal = await TaskModel.countDocuments({
+    status: { $in: ['Pending', 'Late'] },
+    deadline: { $ne: null, $lt: new Date() }
+  });
+  mark = outbox.length;
+  const digestRun = await runOverdueDigest();
+  const digestMail = newMail(mark);
+  check('digest run reads the overdue tasks', digestRun.tasks >= 8, `${digestRun.tasks} tasks`);
+  check('one email per recipient', digestMail.length === digestRun.recipients, `${digestMail.length} emails, ${digestRun.recipients} recipients`);
+  check(
+    'no recipient is mailed twice',
+    new Set(digestMail.map((m) => m.to)).size === digestMail.length,
+    JSON.stringify(digestMail.map((m) => m.to))
+  );
+  check(
+    `${overdueTotal} overdue tasks produce far fewer emails`,
+    digestMail.length < overdueTotal,
+    `${digestMail.length} emails for ${overdueTotal} tasks`
+  );
+  check(
+    "every digest is tagged 'task_overdue' with a recipient id",
+    digestMail.every((m) => m.event === 'task_overdue' && m.userId),
+    JSON.stringify(digestMail.map((m) => m.event))
+  );
+  check(
+    'no digest is empty',
+    digestMail.every((m) => /^ {2}1\. /m.test(String(m.body))),
+    'a digest listed no tasks'
+  );
+  const empMail = digestMail.filter((m) => m.to === employeeEmail);
+  check('the employee receives exactly one digest', empMail.length === 1, `${empMail.length} emails`);
+  check('  ... covering their own 5 overdue tasks', String(empMail[0]?.subject) === 'Overdue: 5 of your tasks', empMail[0]?.subject);
+  const headMail = digestMail.filter((m) => m.to === headEmail);
+  check('the Head, who is also an assignee, receives exactly one digest', headMail.length === 1, `${headMail.length} emails`);
+  check('  ... the office-wide one', String(headMail[0]?.subject).startsWith('Overdue across the office'), headMail[0]?.subject);
+
+  emailHelper.sendEmail = realSendEmail;
+  await TaskModel.deleteMany({ clientName: MAIL_CLIENT });
+
   console.log('\nS-16: email read/unread');
   const Email = require('../models/Email');
   await Email.deleteMany({ messageId: /^smoke-/ });

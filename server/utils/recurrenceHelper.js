@@ -84,6 +84,23 @@ const spawnNextRecurrence = async (completedTask, io) => {
         saved._id,
         'task_assigned'
       );
+
+      // The email half of the same event. A renewal really is a new task with a
+      // new deadline, and the in-app row above is already typed `task_assigned`,
+      // so mailing here is what keeps the Profile toggle honest across both
+      // channels. There is no acting user on an automatic renewal, so the
+      // task's CREATOR is the assigner — which also means someone who set up a
+      // recurring task for themselves is never mailed about it.
+      try {
+        const { sendTaskAssignedEmail } = require('./taskMailer');
+        await sendTaskAssignedEmail({
+          task: saved,
+          assigneeId: completedTask.assignedTo,
+          actorId: completedTask.createdBy
+        });
+      } catch (err) {
+        logger.error({ err: err.message, taskId: String(saved._id) }, 'failed to queue recurrence assignment email');
+      }
     }
 
     return saved;
