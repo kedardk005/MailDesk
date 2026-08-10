@@ -308,11 +308,23 @@ function ChartPanel({
 }) {
   return (
     <Card className="print:break-inside-avoid">
+      {/*
+       * `flex-wrap` on the header is load-bearing on the narrow panels.
+       * CardHeader is `flex justify-between` with a `min-w-0` title column and a
+       * `shrink-0` actions column, so the legend always wins the width fight.
+       * In the 314px "Task status" card at 1280px the three-swatch legend took
+       * 207 of the 280px content box and left the heading 61px against a 77px
+       * scrollWidth — it rendered as "Task s…" with its one-line description
+       * reflowed into a three-line column. Wrapping drops the legend onto its
+       * own row instead of squeezing the words the panel is named after; wide
+       * panels still fit on one line and are untouched.
+       */}
       <CardHeader
+        className="flex-wrap"
         title={title}
         description={description}
         actions={
-          <div className="flex items-center gap-3">
+          <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
             {legend ? <ChartLegend items={legend} /> : null}
             {actions}
           </div>

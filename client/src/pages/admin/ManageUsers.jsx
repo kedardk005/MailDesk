@@ -51,6 +51,7 @@ import {
   toast,
   useConfirm,
 } from '../../components/ui'
+import { PASSWORD_MIN_LENGTH, isLongEnough } from '../../lib/passwordPolicy'
 import { formatNumber, timeAgo } from '../../lib/utils'
 
 /* ---------------------------------------------------------------------------
@@ -200,7 +201,8 @@ function validateUserForm(values, { requirePassword }) {
   if (requirePassword) {
     const password = values.password || ''
     if (!password) errors.password = 'Password is required.'
-    else if (password.length < 6) errors.password = 'Password must be at least 6 characters.'
+    else if (!isLongEnough(password))
+      errors.password = `Password must be at least ${PASSWORD_MIN_LENGTH} characters.`
     else if (password.length > 128) errors.password = 'Password is too long (128 characters maximum).'
   }
 
@@ -1148,7 +1150,7 @@ function CreateUserDialog({ open, onOpenChange, onCreated }) {
           <FormField
             label="Temporary password"
             required
-            hint="At least 6 characters. Ask the user to change it after their first sign-in."
+            hint={`At least ${PASSWORD_MIN_LENGTH} characters. Ask the user to change it after their first sign-in.`}
             error={errors.password}
           >
             {(field) => (

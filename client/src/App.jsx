@@ -191,7 +191,7 @@ function App() {
                       // that branch could never run. The page hides the Admin-only
                       // employee-performance tab for Head on its own.
                       element={
-                        <AdminRoute roles={['Admin', 'Head']}>
+                        <AdminRoute roles={['Admin', 'Head']} title="Reports">
                           <RouteShell>
                             <Reports />
                           </RouteShell>
@@ -201,7 +201,7 @@ function App() {
                     <Route
                       path="/admin/users"
                       element={
-                        <AdminRoute>
+                        <AdminRoute title="Users & approvals">
                           <RouteShell>
                             <ManageUsers />
                           </RouteShell>
@@ -211,7 +211,7 @@ function App() {
                     <Route
                       path="/admin/activities"
                       element={
-                        <AdminRoute>
+                        <AdminRoute title="Activity log">
                           <RouteShell>
                             <ActivityLog />
                           </RouteShell>
