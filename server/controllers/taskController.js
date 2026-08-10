@@ -6,7 +6,7 @@ const { logActivity } = require('../utils/activityLogger');
 const { createNotification } = require('../utils/notificationHelper');
 const { sendEmail } = require('../utils/emailHelper');
 const { escapeRegex } = require('../utils/regexHelper');
-const { parseDeadline } = require('../utils/dateHelper');
+const { parseDeadline, getAppTimezone } = require('../utils/dateHelper');
 const { sanitizeTaskLinkedEmail } = require('../utils/sanitizeEmailHtml');
 const cache = require('../utils/cache');
 const { parseListParams, paginate, listResponse, firstString } = require('../utils/paginate');
@@ -340,7 +340,7 @@ exports.updateTask = async (req, res) => {
       if (!wasAlreadyCompleted) {
         // Send completion notification & email alert to task creator (Admin/Head)
         try {
-          const creator = await User.findById(task.createdBy).select('email').lean();
+          const creator = await User.findById(task.createdBy).select('email name').lean();
           if (creator) {
             // 1. App Notification
             await createNotification(
@@ -353,13 +353,25 @@ exports.updateTask = async (req, res) => {
             // 2. Email alert — QUEUED, so completing a task no longer waits on
             //    an SMTP round-trip to Gmail. Tagged with an `event`, so the
             //    creator's notification preferences actually govern it.
-            await sendEmail(
-              creator.email,
-              `Task Completed: ${task.title}`,
-              `Employee ${req.user.name} has marked the task "${task.title}" as completed on ${new Date().toLocaleString()}.`,
-              null,
-              { event: 'task_completed', userId: task.createdBy }
-            );
+            // Was plain text with no HTML at all — the only email of the three
+            // that arrived unformatted.
+            const { taskCompleted: completedTemplate } = require('../utils/emailTemplates');
+            const mail = completedTemplate({
+              recipientName: creator.name || 'there',
+              taskTitle: task.title,
+              completedBy: req.user.name,
+              completedAt: new Date().toLocaleString('en-GB', {
+                timeZone: getAppTimezone(),
+                dateStyle: 'medium',
+                timeStyle: 'short'
+              }),
+              clientName: task.clientName,
+              taskUrl: `${(process.env.FRONTEND_URL || 'http://localhost:5173').replace(/\/+$/, '')}/tasks?task=${task._id}`
+            });
+            await sendEmail(creator.email, mail.subject, mail.text, mail.html, {
+              event: 'task_completed',
+              userId: task.createdBy
+            });
           }
         } catch (err) {
           logger.error({ err: err.message, taskId: String(task._id) }, 'failed to queue task completion alerts');

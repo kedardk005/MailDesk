@@ -271,31 +271,13 @@ exports.updateUser = async (req, res) => {
       if (wasPending && status === 'Approved') {
         try {
           const { sendEmail } = require('../utils/emailHelper');
-          const emailSubject = 'Your K M KOTHARI Account has been Approved!';
-          
-          // Plain text fallback
-          const emailBody = `Hello ${user.name},\n\nGreat news! Your request to join K M KOTHARI as an Administrator has been approved. You can now log in to the workspace at your convenience using your email address.\n\nBest regards,\nThe K M KOTHARI Team`;
-          
-          // Rich HTML well-formatted email
-          const emailHtml = `
-            <div style="font-family: 'Helvetica Neue', Helvetica, Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px; border: 1px solid #e2e8f0; border-radius: 12px; background-color: #ffffff;">
-              <div style="text-align: center; padding-bottom: 20px; border-bottom: 1px solid #f1f5f9;">
-                <h1 style="color: #4f46e5; margin: 0; font-size: 24px; font-weight: 800;">K M KOTHARI</h1>
-              </div>
-              <div style="padding: 20px 0;">
-                <p style="font-size: 16px; line-height: 1.6; color: #334155;">Hello <strong>${user.name}</strong>,</p>
-                <p style="font-size: 16px; line-height: 1.6; color: #334155;">Great news! Your request to join the workspace as an <strong>Administrator</strong> has been reviewed and <strong>approved</strong> by an existing administrator.</p>
-                <div style="margin: 24px 0; text-align: center;">
-                  <a href="${process.env.FRONTEND_URL || 'http://localhost:5173'}/login" style="background-color: #4f46e5; color: #ffffff; text-decoration: none; padding: 12px 24px; font-size: 14px; font-weight: 700; border-radius: 8px; display: inline-block;">Log In to K M KOTHARI</a>
-                </div>
-                <p style="font-size: 14px; line-height: 1.6; color: #64748b;">You can log in using your registered email: <strong>${user.email}</strong></p>
-              </div>
-              <div style="padding-top: 20px; border-top: 1px solid #f1f5f9; text-align: center; font-size: 12px; color: #94a3b8;">
-                <p style="margin: 0;">This is an automated workspace notification sent from K M KOTHARI.</p>
-              </div>
-            </div>
-          `;
-          await sendEmail(user.email, emailSubject, emailBody, emailHtml);
+          const { accountApproved } = require('../utils/emailTemplates');
+          // The old copy hard-coded "as an Administrator" regardless of the
+          // role actually granted, so an approved Employee was told they were
+          // an Admin.
+          const mail = accountApproved({ name: user.name, email: user.email, role: user.role });
+
+          await sendEmail(user.email, mail.subject, mail.text, mail.html);
         } catch (emailErr) {
           logger.error({ err: emailErr.message }, 'failed to queue approval email');
         }
