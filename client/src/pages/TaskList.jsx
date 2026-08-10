@@ -77,6 +77,7 @@ import {
   toast,
   useConfirm,
 } from '../components/ui'
+import { fetchCalendarTasks, fetchStatusTotals } from '../lib/taskCalendar'
 import { searchAssignees, searchClients, searchLinkableEmails } from '../lib/pickers'
 import { cn, formatNumber, timeAgo } from '../lib/utils'
 import { ExtractActionsPanel } from '../components/ActionExtraction'
@@ -102,7 +103,7 @@ const VIEW_OPTIONS = [
   { value: 'calendar', label: 'Calendar', icon: <CalendarDays /> },
 ]
 
-/** Board/calendar load one page of this size — the contract caps `limit` at 100. */
+/** The board loads one page of this size — the contract caps `limit` at 100. */
 const WIDE_VIEW_LIMIT = 100
 
 const QUERY_DEFAULTS = {
@@ -259,6 +260,33 @@ function buildMonthGrid(anchor) {
   return cells
 }
 
+/**
+ * How many rows `POST /api/tasks/bulk` says it actually touched.
+ * @returns {number|null} null when the server did not report a count.
+ */
+function countBulkResult(result, action) {
+  const raw = action === 'delete' ? result?.deleted : result?.updated
+  return Number.isFinite(raw) ? raw : null
+}
+
+/**
+ * The confirmation for a bulk action. `counted` is the server's own figure;
+ * when it is missing the requested count stands in, and when it disagrees with
+ * what was requested the message says both rather than picking the flattering
+ * one.
+ */
+function bulkMessage(action, value, requested, counted) {
+  const n = counted === null ? requested : counted
+  const verb =
+    action === 'delete' ? 'deleted' : action === 'status' ? `set to ${value}` : 'reassigned'
+  const noun = n === 1 ? 'task' : 'tasks'
+  if (n === 0) return `No tasks were ${action === 'delete' ? 'deleted' : 'changed'}`
+  if (counted !== null && counted !== requested) {
+    return `${formatNumber(counted)} of ${formatNumber(requested)} ${noun} ${verb}`
+  }
+  return `${formatNumber(n)} ${noun} ${verb}`
+}
+
 /** 401/403/429 are already surfaced by the axios interceptor. */
 function reportError(err, fallback) {
   if (isCanceled(err)) return
@@ -346,8 +374,9 @@ function useQueryState() {
  * request at all. Any task mutation, and any task-shaped notification arriving
  * over the socket, drops the entry and this refetches.
  */
-function useTaskQuery(params) {
+function useTaskQuery(params, enabled = true) {
   const { data, error, loading, refetch, patch } = useCachedQuery('/tasks', params, {
+    enabled,
     failureMessage: 'Could not load tasks.',
   })
 
@@ -372,6 +401,58 @@ function useTaskQuery(params) {
   )
 
   return { rows, total, loading, error, reload: refetch, patchRow }
+}
+
+/**
+ * The calendar's own read: every task due inside the 42 cells on screen.
+ *
+ * Keyed on the month, so changing month is a cache key change and therefore a
+ * refetch — the defect this replaces was that the month lived in local
+ * component state and never reached the query at all. The `/tasks/calendar`
+ * tag is not an endpoint; it names the cache entry, and because it sits under
+ * `/tasks` every task mutation and every task-shaped socket event drops it.
+ */
+function useCalendarQuery(anchor, filters, enabled) {
+  const monthKey = `${anchor.getFullYear()}-${anchor.getMonth()}`
+  const params = useMemo(() => ({ ...filters, month: monthKey }), [filters, monthKey])
+
+  const { data, error, loading, refetch, patch } = useCachedQuery('/tasks/calendar', params, {
+    enabled,
+    failureMessage: 'Could not load tasks.',
+    fetcher: (signal) => fetchCalendarTasks({ anchor, filters, signal }),
+  })
+
+  const patchRow = useCallback(
+    (taskId, partial) => {
+      patch((payload) =>
+        payload?.rows
+          ? { ...payload, rows: payload.rows.map((t) => (t._id === taskId ? { ...t, ...partial } : t)) }
+          : payload
+      )
+    },
+    [patch]
+  )
+
+  return {
+    rows: data?.rows || [],
+    truncated: Boolean(data?.truncated),
+    loading,
+    error,
+    reload: refetch,
+    patchRow,
+  }
+}
+
+/**
+ * True per-status totals for the board column chips. Three one-row requests,
+ * cached and invalidated exactly like the list itself.
+ */
+function useBoardTotals(filters, enabled) {
+  const { data } = useCachedQuery('/tasks/status-totals', filters, {
+    enabled,
+    fetcher: (signal) => fetchStatusTotals({ statuses: STATUSES, filters, signal }),
+  })
+  return data || null
 }
 
 /**
@@ -569,7 +650,15 @@ function TaskFilters({ query, setQuery, options, canAssign, hasFilters, onClear 
                 ariaLabel="Filter by creator"
                 value={query.creator || ANY}
                 className="w-[165px]"
-                options={peopleOptions('All creators')}
+                /* Only Admins and Heads can create a task (`canCreate`), so an
+                 * Employee in this list is an option that can only ever return
+                 * nothing. The assignee list above is deliberately everyone. */
+                options={[
+                  { value: ANY, label: 'All creators' },
+                  ...options.users
+                    .filter((u) => u.role === 'Admin' || u.role === 'Head')
+                    .map((u) => ({ value: u._id, label: u.name })),
+                ]}
                 onValueChange={(v) => setQuery({ creator: v === ANY ? null : v, page: 1 })}
               />
               <SelectMenu
@@ -719,7 +808,16 @@ function BoardCard({ task, dragging, draggable, onOpen, onDragStart, onDragEnd }
   )
 }
 
-function TaskBoard({ tasks, onOpen, onMove, canMoveTo }) {
+/**
+ * @param {Record<string, number|null>} [totals] true per-status counts over the
+ *   current filters. The board only ever loads 100 cards, so the chip on a
+ *   column header — where every kanban board puts a workspace total — was
+ *   describing the newest 100 rows and nothing more: "Pending 14" next to a
+ *   database holding 77. When a real total is known and the column is
+ *   truncated the chip says so outright ("14 of 77") instead of picking one of
+ *   the two numbers and hoping.
+ */
+function TaskBoard({ tasks, totals, onOpen, onMove, canMoveTo }) {
   const [dragId, setDragId] = useState(null)
   const [overColumn, setOverColumn] = useState(null)
 
@@ -736,6 +834,9 @@ function TaskBoard({ tasks, onOpen, onMove, canMoveTo }) {
       {STATUSES.map((status) => {
         const allowed = !dragged || canMoveTo(dragged, status)
         const isOver = overColumn === status && allowed
+        const loaded = grouped[status].length
+        const columnTotal = totals?.[status]
+        const partial = Number.isFinite(columnTotal) && columnTotal > loaded
         return (
           <section
             key={status}
@@ -761,8 +862,18 @@ function TaskBoard({ tasks, onOpen, onMove, canMoveTo }) {
           >
             <header className="flex h-10 shrink-0 items-center gap-2 border-b border-line px-3">
               <span className="text-sm font-medium text-fg">{status}</span>
-              <Badge size="sm" variant="neutral">
-                {formatNumber(grouped[status].length)}
+              <Badge
+                size="sm"
+                variant="neutral"
+                title={
+                  partial
+                    ? `${formatNumber(loaded)} of ${formatNumber(columnTotal)} ${status.toLowerCase()} tasks are loaded`
+                    : undefined
+                }
+              >
+                {partial
+                  ? `${formatNumber(loaded)} of ${formatNumber(columnTotal)}`
+                  : formatNumber(Number.isFinite(columnTotal) ? columnTotal : loaded)}
               </Badge>
             </header>
             <div className="custom-scrollbar flex max-h-[64vh] flex-col gap-2 overflow-y-auto p-2">
@@ -862,9 +973,18 @@ function TaskCalendar({ anchor, tasks, now, onOpen, onMonthChange, onPickDay }) 
   return (
     <div className="rounded-lg border border-line bg-surface">
       <div className="flex items-center justify-between gap-2 border-b border-line px-3 py-2">
-        <h2 className="text-sm font-medium text-fg">
-          {anchor.toLocaleString(undefined, { month: 'long', year: 'numeric' })}
-        </h2>
+        <div className="flex min-w-0 items-baseline gap-2">
+          <h2 className="text-sm font-medium text-fg">
+            {anchor.toLocaleString(undefined, { month: 'long', year: 'numeric' })}
+          </h2>
+          {/* Says which of the two empties this is: "we looked and there is
+            * nothing", rather than a grid the user has to interpret. */}
+          <span className="truncate text-xs text-fg-3">
+            {tasks.length === 0
+              ? 'Nothing due this month'
+              : `${formatNumber(tasks.length)} due`}
+          </span>
+        </div>
         <div className="flex items-center gap-1">
           <Button size="sm" iconOnly aria-label="Previous month" onClick={() => onMonthChange(-1)}>
             <ChevronLeft className="h-4 w-4" />
@@ -1492,16 +1612,29 @@ function EmailOptionRow({ option }) {
  */
 function TaskFormDialog({ open, mode, initial, saving, onSubmit, onOpenChange }) {
   const [form, setForm] = useState(() => ({ ...EMPTY_FORM, ...initial }))
-  const [errors, setErrors] = useState({})
+  /* Errors are DERIVED, not stored.
+   *
+   * They used to be a `useState` written once on submit and never again, so
+   * the four inline messages and the four red borders survived the user fixing
+   * every field: a dialog with a valid title, client, assignee and deadline
+   * still read "A title is required." under the filled title box, and a
+   * cautious person will not press a button on a form that says it is broken.
+   * Recomputing from `form` means each message disappears the moment its own
+   * field becomes valid — and, equally, that nothing is red before the first
+   * submit attempt. */
+  const [submitted, setSubmitted] = useState(false)
+  const errors = useMemo(
+    () => (submitted ? validateForm(form, mode) : {}),
+    [submitted, form, mode]
+  )
   const formId = `task-form-${mode}`
 
   const set = (key) => (value) => setForm((prev) => ({ ...prev, [key]: value }))
 
   const handleSubmit = (event) => {
     event.preventDefault()
-    const found = validateForm(form, mode)
-    setErrors(found)
-    if (Object.keys(found).length > 0) return
+    setSubmitted(true)
+    if (Object.keys(validateForm(form, mode)).length > 0) return
     onSubmit(form)
   }
 
@@ -1740,23 +1873,63 @@ export default function TaskList() {
 
   const options = useTaskOptions(canAssign)
 
-  const wideView = query.view !== 'list'
-  const requestParams = useMemo(
+  const monthAnchor = useMemo(() => {
+    const parsed = /^(\d{4})-(\d{2})$/.exec(query.month || '')
+    if (!parsed) return new Date(new Date().getFullYear(), new Date().getMonth(), 1)
+    return new Date(Number(parsed[1]), Number(parsed[2]) - 1, 1)
+  }, [query.month])
+
+  /* Every filter the SERVER can honour, in its wire form. Shared by all three
+   * views so a filter applied on the list is still applied on the board and
+   * the calendar. */
+  const filterParams = useMemo(
     () => ({
-      page: wideView ? 1 : query.page,
-      limit: wideView ? WIDE_VIEW_LIMIT : query.limit,
-      sort: query.sort,
       ...(query.status ? { status: query.status } : {}),
       ...(query.priority ? { priority: query.priority } : {}),
       ...(query.assignee ? { assignedTo: query.assignee } : {}),
+      /* `createdBy` is the name `getAllTasks` reads. It ignored the parameter
+       * entirely until the pre-deploy server fix, which is why choosing
+       * "Priya Nair" used to raise a chip and a Clear-filters button over all
+       * 430 tasks in the workspace — she created 48. */
       ...(query.creator ? { createdBy: query.creator } : {}),
       ...(query.client ? { clientName: query.client } : {}),
       ...(query.q ? { q: query.q } : {}),
     }),
-    [wideView, query.page, query.limit, query.sort, query.status, query.priority, query.assignee, query.creator, query.client, query.q]
+    [query.status, query.priority, query.assignee, query.creator, query.client, query.q]
   )
 
-  const { rows, total, loading, error, reload, patchRow } = useTaskQuery(requestParams)
+  const isCalendar = query.view === 'calendar'
+  const isBoard = query.view === 'board'
+
+  const requestParams = useMemo(
+    () => ({
+      page: isBoard ? 1 : query.page,
+      limit: isBoard ? WIDE_VIEW_LIMIT : query.limit,
+      sort: query.sort,
+      ...filterParams,
+    }),
+    [isBoard, query.page, query.limit, query.sort, filterParams]
+  )
+
+  /* The list and the board share `GET /tasks`; the calendar has its own read
+   * because a month window is not something that endpoint can express. Only
+   * the view on screen fetches. */
+  const listQuery = useTaskQuery(requestParams, !isCalendar)
+  const calendarQuery = useCalendarQuery(monthAnchor, filterParams, isCalendar)
+  const boardTotals = useBoardTotals(filterParams, isBoard)
+
+  const active = isCalendar ? calendarQuery : listQuery
+  const { rows, loading, error, patchRow } = active
+  const total = isCalendar ? calendarQuery.rows.length : listQuery.total
+
+  /* A mutation can happen from any view, and the drawer/board/list all share
+   * these callbacks — so a reload has to reach whichever read is mounted. */
+  const listReload = listQuery.reload
+  const calendarReload = calendarQuery.reload
+  const reload = useCallback(() => {
+    listReload()
+    calendarReload()
+  }, [listReload, calendarReload])
 
   /* ---- permissions, mirrored from taskController.js ---- */
   const perms = useMemo(() => {
@@ -1869,14 +2042,19 @@ export default function TaskList() {
       }
       setBulkBusy(true)
       try {
-        await api.post('/tasks/bulk', { taskIds: selectedIds, action, ...(value ? { value } : {}) })
-        toast.success(
-          action === 'delete'
-            ? `${selectedIds.length} tasks deleted`
-            : action === 'status'
-              ? `${selectedIds.length} tasks set to ${value}`
-              : `${selectedIds.length} tasks reassigned`
-        )
+        const res = await api.post('/tasks/bulk', {
+          taskIds: selectedIds,
+          action,
+          ...(value ? { value } : {}),
+        })
+        /* Report what the SERVER says it did, not what we asked for.
+         * `POST /api/tasks/bulk` currently answers `{deleted: taskIds.length}`
+         * — the requested count, not the matched one — so a batch that
+         * deleted nothing still reported a success (audit M-7). That is a
+         * server-side defect and is fixed there; this side stops amplifying
+         * it, and says so plainly when the two numbers disagree. */
+        const counted = countBulkResult(res.data?.result, action)
+        toast.success(bulkMessage(action, value, selectedIds.length, counted))
         setSelection({})
         reload()
         options.reload()
@@ -2135,12 +2313,6 @@ export default function TaskList() {
     [perms.canCreate, startCompose, setQuery, showMyOverdue, clearFilters]
   )
 
-  const monthAnchor = useMemo(() => {
-    const parsed = /^(\d{4})-(\d{2})$/.exec(query.month || '')
-    if (!parsed) return new Date(new Date().getFullYear(), new Date().getMonth(), 1)
-    return new Date(Number(parsed[1]), Number(parsed[2]) - 1, 1)
-  }, [query.month])
-
   const shiftMonth = (delta) => {
     const base = delta === 0 ? new Date() : new Date(monthAnchor.getFullYear(), monthAnchor.getMonth() + delta, 1)
     setQuery({ month: `${base.getFullYear()}-${String(base.getMonth() + 1).padStart(2, '0')}` })
@@ -2161,7 +2333,10 @@ export default function TaskList() {
           : 'Work assigned to you will appear here.',
       }
 
-  const truncatedWideView = wideView && total > rows.length
+  /* The board still loads exactly one page of cards. The calendar no longer
+   * truncates by page — it walks its own month window — so it only warns when
+   * that walk hit its hard ceiling. */
+  const truncatedBoard = isBoard && listQuery.total > listQuery.rows.length
 
   return (
     <>
@@ -2210,10 +2385,21 @@ export default function TaskList() {
           </Alert>
         ) : null}
 
-        {truncatedWideView ? (
+        {truncatedBoard ? (
           <Alert variant="info" title="Showing the first 100 tasks" className="mb-4">
-            {formatNumber(total)} tasks match these filters. Narrow the filters, or switch to the
-            list view to page through all of them.
+            {formatNumber(listQuery.total)} tasks match these filters — the column counts are the
+            real totals, the cards are the first 100. Narrow the filters, or switch to the list
+            view to page through all of them.
+          </Alert>
+        ) : null}
+
+        {isCalendar && calendarQuery.truncated ? (
+          <Alert variant="warning" title="This month may be incomplete" className="mb-4">
+            Too many tasks had to be read to reach {monthAnchor.toLocaleString(undefined, {
+              month: 'long',
+              year: 'numeric',
+            })}
+            . Narrow the filters, or use the list view sorted by deadline.
           </Alert>
         ) : null}
 
@@ -2266,20 +2452,12 @@ export default function TaskList() {
               <Skeleton key={i} className={query.view === 'board' ? 'h-[420px]' : 'h-[640px]'} />
             ))}
           </div>
-        ) : rows.length === 0 ? (
-          <div className="rounded-lg border border-line bg-surface">
-            <EmptyState {...emptyState} />
-          </div>
-        ) : query.view === 'board' ? (
-          <TaskBoard
-            tasks={rows}
-            onOpen={openTask}
-            onMove={moveTask}
-            canMoveTo={(task, status) =>
-              perms.canEdit(task) || (status === 'Completed' && perms.canComplete(task))
-            }
-          />
-        ) : (
+        ) : isCalendar ? (
+          /* The calendar renders even with nothing in the month. It used to
+           * fall through to the shared empty state, which removed the month
+           * header — and with it the only way to page to a month that DOES
+           * have work in it. An empty grid is the honest answer here; a dead
+           * end is not. */
           <TaskCalendar
             anchor={monthAnchor}
             tasks={rows}
@@ -2294,6 +2472,20 @@ export default function TaskList() {
               setDayPrefill(toLocalInput(at))
               setQuery({ compose: '1' })
             }}
+          />
+        ) : rows.length === 0 ? (
+          <div className="rounded-lg border border-line bg-surface">
+            <EmptyState {...emptyState} />
+          </div>
+        ) : (
+          <TaskBoard
+            tasks={rows}
+            totals={boardTotals}
+            onOpen={openTask}
+            onMove={moveTask}
+            canMoveTo={(task, status) =>
+              perms.canEdit(task) || (status === 'Completed' && perms.canComplete(task))
+            }
           />
         )}
       </PageBody>

@@ -21,6 +21,7 @@ import {
 } from 'lucide-react'
 
 import api, { getErrorMessage, isCanceled } from '../api/axios'
+import { describeSyncResult } from '../lib/gmailSync'
 import { fetchTaskOverview } from '../lib/taskOverview'
 import { useCachedQuery } from '../lib/useCachedQuery'
 import { useAuth } from '../components/AuthProvider'
@@ -290,12 +291,26 @@ export default function Dashboard() {
     }
   }, [sla])
 
+  /* Mailboxes whose most recent sync was refused. `failingAccounts` is the
+   * server's own list; the per-account `syncOk` flags are the fallback for a
+   * server that has not been upgraded yet. */
+  const failingMailboxes = useMemo(() => {
+    if (Array.isArray(gmail.failingAccounts)) return gmail.failingAccounts.filter(Boolean)
+    return (gmail.linkedAccounts || [])
+      .filter((a) => a?.syncOk === false)
+      .map((a) => a.gmailEmail)
+      .filter(Boolean)
+  }, [gmail])
+
   /* --- actions ----------------------------------------------------------- */
   const handleSync = useCallback(async () => {
     setSyncing(true)
     try {
       const res = await api.post('/gmail/fetch')
-      toast.success(`Sync complete — ${formatNumber(res.data?.count ?? 0)} new emails`)
+      /* `count ?? 0` turned "we do not know" into "0 new emails, all good"
+       * (audit H-1). The server reports the outcome; this reports the server. */
+      const outcome = describeSyncResult(res.data)
+      toast[outcome.tone](outcome.title, outcome.description ? { description: outcome.description } : undefined)
       refresh()
     } catch (err) {
       if (!isCanceled(err)) {
@@ -520,9 +535,15 @@ export default function Dashboard() {
           </div>
         )}
 
+        {/* `min-w-0` on both tracks is load-bearing, not decoration. A grid item
+          * defaults to `min-width: auto`, i.e. its MIN-CONTENT width — so the
+          * 480px-wide "Needs attention" table inside pushed each card to 482px
+          * in a 375px viewport and <main> became the horizontal scroller. With
+          * `min-w-0` the card is free to be narrower than its content and the
+          * table's own `overflow-x-auto` wrapper does the scrolling instead. */}
         <div className="grid gap-5 xl:grid-cols-3">
           {/* --- main column --- */}
-          <div className="space-y-5 xl:col-span-2">
+          <div className="min-w-0 space-y-5 xl:col-span-2">
             <Card>
               <CardHeader
                 title="Needs attention"
@@ -675,7 +696,7 @@ export default function Dashboard() {
           </div>
 
           {/* --- side column --- */}
-          <div className="space-y-5">
+          <div className="min-w-0 space-y-5">
             {canManageMail ? (
               <Card>
                 <CardHeader
@@ -758,13 +779,19 @@ export default function Dashboard() {
                 {gmail.connected ? (
                   <>
                     <ul className="divide-y divide-line">
+                      {/* `GET /api/gmail/status` reports per-account health.
+                          A mailbox whose last sync failed must not sit under a
+                          green badge — that was the second half of H-1: the
+                          syncs were failing and the connection card still read
+                          "Connected". `syncOk` is null when nothing has been
+                          attempted yet, which is not a failure. */}
                       <li className="flex items-center gap-2 px-4 py-2.5">
                         <Mail aria-hidden="true" className="h-4 w-4 shrink-0 text-fg-3" />
                         <span className="min-w-0 flex-1 truncate font-mono text-xs text-fg-2">
                           {gmail.gmailEmail || 'Primary account'}
                         </span>
-                        <Badge variant="success" size="sm">
-                          Primary
+                        <Badge variant={gmail.syncOk === false ? 'danger' : 'success'} size="sm">
+                          {gmail.syncOk === false ? 'Not syncing' : 'Primary'}
                         </Badge>
                       </li>
                       {(gmail.linkedAccounts || []).map((account) => (
@@ -773,14 +800,38 @@ export default function Dashboard() {
                           <span className="min-w-0 flex-1 truncate font-mono text-xs text-fg-2">
                             {account.gmailEmail}
                           </span>
-                          <Badge variant="neutral" size="sm">
-                            {account.ownerName && account.ownerName !== 'Me'
-                              ? account.ownerName
-                              : 'Linked'}
+                          <Badge
+                            variant={account.syncOk === false ? 'danger' : 'neutral'}
+                            size="sm"
+                          >
+                            {account.syncOk === false
+                              ? 'Not syncing'
+                              : account.ownerName && account.ownerName !== 'Me'
+                                ? account.ownerName
+                                : 'Linked'}
                           </Badge>
                         </li>
                       ))}
                     </ul>
+                    {failingMailboxes.length > 0 ? (
+                      <Alert
+                        variant="danger"
+                        title={
+                          failingMailboxes.length === 1
+                            ? 'A mailbox has stopped receiving mail'
+                            : `${failingMailboxes.length} mailboxes have stopped receiving mail`
+                        }
+                        className="mx-4 mb-3"
+                        action={
+                          <Button size="sm" onClick={handleConnect}>
+                            Reconnect
+                          </Button>
+                        }
+                      >
+                        {failingMailboxes.join(', ')} — Google refused the last sync. New mail
+                        will not arrive until the account is reconnected.
+                      </Alert>
+                    ) : null}
                     <CardFooter className="justify-between">
                       <span className="text-xs text-fg-3 tabular">
                         {formatNumber(accountCount)} connected

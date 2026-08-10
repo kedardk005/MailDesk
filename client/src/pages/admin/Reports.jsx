@@ -670,8 +670,24 @@ export default function Reports() {
   const employeeSort = searchParams.get('esort') || '-totalAssigned'
   const clientSort = searchParams.get('csort') || '-emailCount'
 
-  /* The employee endpoint only understands a 7-day or a 30-day window. */
+  /* `GET /api/reports/employee` takes `filter=weekly|monthly` and nothing else
+   * — `getEmployeeReport` maps anything that is not exactly "weekly" to a
+   * 30-day window. So the seven-option range control silently collapsed
+   * 14/30/60/90/180/365 into one answer: five of the seven choices returned
+   * byte-identical data while the control claimed a different period and the
+   * chart subtitle kept saying "last 30 days". The control now offers only the
+   * two windows this endpoint can actually honour. Add the rest here when the
+   * endpoint learns to take a day count. */
   const employeeFilter = days <= 7 ? 'weekly' : 'monthly'
+  const employeeDays = employeeFilter === 'weekly' ? 7 : 30
+
+  /* Every other tab honours the full range: `/reports/email-timeline` takes
+   * `?days=`, and the SLA endpoints take the ISO window derived from it. */
+  const rangeOptions =
+    tab === 'employees'
+      ? RANGE_OPTIONS.filter((o) => o.value === '7' || o.value === '30')
+      : RANGE_OPTIONS
+  const selectedRange = tab === 'employees' ? employeeDays : days
 
   const setParam = useCallback(
     (patch) => {
@@ -701,7 +717,7 @@ export default function Reports() {
         onSelect: () => setParam({ tab: 'sla' }),
       },
       ...(rangeApplies
-        ? RANGE_OPTIONS.map((option) => ({
+        ? rangeOptions.map((option) => ({
             id: `reports-range-${option.value}`,
             label: `Report range: ${option.label}`,
             group: 'Reports',
@@ -711,7 +727,7 @@ export default function Reports() {
           }))
         : []),
     ],
-    [rangeApplies, setParam]
+    [rangeApplies, rangeOptions, setParam]
   )
 
   /* --- data -------------------------------------------------------------- */
@@ -719,6 +735,14 @@ export default function Reports() {
   const [taskTimeline, setTaskTimeline] = useState([])
   const [clientStats, setClientStats] = useState([])
   const [employees, setEmployees] = useState([])
+  /* Approved accounts only. `GET /api/reports/overall` counts every non-deleted
+   * User row, and `GET /api/reports/employee` lists every Employee/Head row —
+   * neither looks at `status`. So three Pending registrations and one REJECTED
+   * account were being reported as staff: the People tile read 15 against 11
+   * approved people, and the performance log listed five names at "0 assigned
+   * / 0%", one of whom had been refused access. This is the approved set, used
+   * for the tile, the scope picker and the log. */
+  const [staff, setStaff] = useState({ ids: null, count: null })
   const [coreLoading, setCoreLoading] = useState(true)
   const [coreError, setCoreError] = useState(null)
 
@@ -753,10 +777,11 @@ export default function Reports() {
       api.get('/reports/overall', { signal }),
       api.get('/reports/timeline', { signal }),
       api.get('/reports/client-stats', { signal }),
+      /* Paginated on purpose: `pagination.total` is a `countDocuments` over
+         `status: Approved`, which is the headcount the People tile should show
+         however many rows come back. /users admits Admin and Head. */
+      api.get('/users', { params: { page: 1, limit: 100, status: 'Approved', sort: 'name' }, signal }),
     ]
-    // /users is Admin+Head, but the employee scope picker only drives the
-    // Admin-only performance report.
-    if (isAdmin) requests.push(api.get('/users', { signal }))
 
     Promise.allSettled(requests).then((results) => {
       if (signal.aborted || results.some((r) => r.status === 'rejected' && isCanceled(r.reason))) {
@@ -771,13 +796,21 @@ export default function Reports() {
       if (timelineRes.status === 'fulfilled') setTaskTimeline(toList(timelineRes.value.data))
       if (clientRes.status === 'fulfilled') setClientStats(toList(clientRes.value.data))
       if (usersRes?.status === 'fulfilled') {
-        setEmployees(toList(usersRes.value.data).filter((u) => u.role !== 'Admin'))
+        const list = toList(usersRes.value.data)
+        const count = usersRes.value.data?.pagination?.total
+        setEmployees(list.filter((u) => u.role !== 'Admin'))
+        setStaff({
+          // Only a COMPLETE page can be used to filter rows — dropping a real
+          // employee because they sat on page two would be its own wrong number.
+          ids: Number.isFinite(count) && count > list.length ? null : new Set(list.map((u) => String(u._id))),
+          count: Number.isFinite(count) ? count : null,
+        })
       }
       setCoreLoading(false)
     })
 
     return () => ctrl.abort()
-  }, [canView, isAdmin, reloadKey])
+  }, [canView, reloadKey])
 
   useEffect(() => {
     if (!canView) return undefined
@@ -907,9 +940,19 @@ export default function Reports() {
     ].filter((d) => d.value > 0)
   }, [stats])
 
+  /* `GET /api/reports/employee` returns every Employee/Head row regardless of
+   * account status, so Pending registrations and the one Rejected account
+   * appeared in the chart and the log as staff doing nothing. Filtered only
+   * when the approved set is known to be complete — see `staff.ids`. */
+  const visibleEmployeeRows = useMemo(
+    () =>
+      staff.ids ? employeeRows.filter((r) => staff.ids.has(String(r.employeeId))) : employeeRows,
+    [employeeRows, staff]
+  )
+
   const workloadData = useMemo(
     () =>
-      applySort(employeeRows, '-totalAssigned')
+      applySort(visibleEmployeeRows, '-totalAssigned')
         .slice(0, 12)
         .map((row) => ({
           label: row.employeeName,
@@ -922,12 +965,23 @@ export default function Reports() {
             [SERIES.late.label]: SERIES.late.swatch,
           },
         })),
-    [employeeRows]
+    [visibleEmployeeRows]
+  )
+
+  /* `GET /api/reports/client-stats` now returns one synthetic row —
+   * `_id: '__unattributed__'`, `isUnattributed: true` — carrying the tasks and
+   * emails that belong to no client, so the table's columns reconcile with the
+   * tiles above them (they used to be short by 17% of tasks and 15% of email).
+   * It belongs in the TABLE, where the arithmetic has to add up, and not in a
+   * chart of "top clients", where it is not one. */
+  const realClients = useMemo(
+    () => clientStats.filter((c) => !c.isUnattributed),
+    [clientStats]
   )
 
   const clientChartData = useMemo(
     () =>
-      applySort(clientStats, '-emailCount')
+      applySort(realClients, '-emailCount')
         .slice(0, 12)
         .map((c) => ({
           label: c.name,
@@ -938,7 +992,7 @@ export default function Reports() {
             [SERIES.clientTasks.label]: SERIES.clientTasks.swatch,
           },
         })),
-    [clientStats]
+    [realClients]
   )
 
   /* Zero-filled daily buckets. An empty day reports `null` medians and `0`
@@ -1000,8 +1054,8 @@ export default function Reports() {
   )
 
   const sortedEmployees = useMemo(
-    () => applySort(employeeRows, employeeSort),
-    [employeeRows, employeeSort]
+    () => applySort(visibleEmployeeRows, employeeSort),
+    [visibleEmployeeRows, employeeSort]
   )
   const sortedClients = useMemo(() => applySort(clientStats, clientSort), [clientStats, clientSort])
 
@@ -1063,7 +1117,9 @@ export default function Reports() {
     )
   }
 
-  const rangeLabel = RANGE_OPTIONS.find((o) => o.value === String(days))?.label || `Last ${days} days`
+  const rangeLabel =
+    RANGE_OPTIONS.find((o) => o.value === String(selectedRange))?.label ||
+    `Last ${selectedRange} days`
 
   return (
     <>
@@ -1119,9 +1175,9 @@ export default function Reports() {
                     id="report-range"
                     size="sm"
                     className="w-[150px]"
-                    value={String(days)}
+                    value={String(selectedRange)}
                     onChange={(e) => setParam({ days: clampDays(e.target.value) })}
-                    options={RANGE_OPTIONS}
+                    options={rangeOptions}
                   />
                 </>
               ) : null}
@@ -1167,7 +1223,11 @@ export default function Reports() {
             <SkeletonTiles count={6} className="grid-cols-2 lg:grid-cols-3 xl:grid-cols-6" />
           ) : (
             <div className="grid grid-cols-2 gap-4 lg:grid-cols-3 xl:grid-cols-6 print:grid-cols-6">
-              <StatTile label="People" value={formatNumber(stats?.totalUsers ?? 0)} />
+              <StatTile
+                label="People"
+                value={formatNumber(staff.count ?? stats?.totalUsers ?? 0)}
+                hint="approved accounts"
+              />
               <StatTile label="Clients" value={formatNumber(stats?.totalClients ?? 0)} />
               <StatTile
                 label="Emails"
@@ -1321,6 +1381,9 @@ export default function Reports() {
                     tick={{ fill: 'currentColor', fontSize: 11 }}
                     tickLine={false}
                     width={140}
+                    /* Same reason as the workload chart: a bar with no name on
+                       it belongs to nobody. */
+                    interval={0}
                   />
                   <RechartsTooltip
                     content={<ChartTooltip />}
@@ -1821,6 +1884,11 @@ export default function Reports() {
                     tick={{ fill: 'currentColor', fontSize: 11 }}
                     tickLine={false}
                     width={140}
+                    /* Recharts skips ticks when it thinks they will collide, so
+                       eleven bars came back with six names and five bars that
+                       could not be attributed to anyone. Every bar in this
+                       chart is a person; a row with no name is not a chart. */
+                    interval={0}
                   />
                   <RechartsTooltip
                     content={<ChartTooltip />}
@@ -2047,10 +2115,17 @@ export default function Reports() {
                     <TBody>
                       {sortedClients.map((client) => (
                         <TR key={client._id}>
-                          <TD primary>
+                          {/* The Unattributed row is a reconciliation total, not
+                              a record: no drill-down, no linked addresses, and
+                              it says what it is rather than looking like a
+                              client nobody has heard of. */}
+                          <TD primary={!client.isUnattributed}>
                             {client.name}
                             <span className="block truncate text-xs font-normal text-fg-3">
-                              {(client.associatedEmails || []).join(', ') || 'No linked addresses'}
+                              {client.isUnattributed
+                                ? 'Work and mail that matches no client on file'
+                                : (client.associatedEmails || []).join(', ') ||
+                                  'No linked addresses'}
                             </span>
                           </TD>
                           <TD numeric>{formatNumber(client.emailCount)}</TD>

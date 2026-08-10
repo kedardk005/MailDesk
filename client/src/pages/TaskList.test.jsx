@@ -19,6 +19,7 @@ import { useLocation } from 'react-router-dom'
 import { beforeEach, describe, expect, it } from 'vitest'
 
 import { API, TEST_USER, listResponse } from '../test/handlers'
+import { monthGridRange } from '../lib/taskCalendar'
 import { server } from '../test/server'
 import { captureConsoleErrors, renderWithProviders, seedSession } from '../test/utils'
 
@@ -166,6 +167,184 @@ describe('TaskList — filters do not crash the page', () => {
     await waitFor(() => expect(seen.length).toBeGreaterThan(before))
     expect(seen.at(-1).sort).toBeTruthy()
     await waitFor(() => expect(queryString()).toContain('sort='))
+  })
+})
+
+describe('TaskList — the creator filter (H-6)', () => {
+  /* `?creator=<id>` used to raise a "Priya Nair" chip and a Clear-filters
+   * button and then return all 430 tasks in the workspace — she created 48 —
+   * because the parameter never reached the server under a name it read. The
+   * wire name is `createdBy`; asserting the rendered chip alone would still
+   * pass on the broken build, so the request itself is what is checked. */
+
+  const USERS = [
+    { _id: 'u-admin', name: 'Asha Rao', role: 'Admin', status: 'Approved' },
+    { _id: 'u-head', name: 'Priya Nair', role: 'Head', status: 'Approved' },
+    { _id: 'u-emp', name: 'Ravi Kumar', role: 'Employee', status: 'Approved' },
+  ]
+
+  const withUsers = () =>
+    server.use(http.get(`${API}/users`, () => HttpResponse.json(listResponse(USERS))))
+
+  it('sends createdBy — the name the endpoint actually reads', async () => {
+    const seen = recordTaskRequests(TASKS, 48)
+    withUsers()
+    renderTasks('/tasks?creator=u-head')
+
+    await screen.findByText('Q3 GST filing')
+    await waitFor(() => expect(seen.length).toBeGreaterThan(0))
+
+    expect(seen.at(-1)).toMatchObject({ createdBy: 'u-head' })
+    /* Not the old spelling, which the server ignored. */
+    expect(seen.at(-1).creator).toBeUndefined()
+  })
+
+  it('picking a creator narrows the request and the reported total', async () => {
+    server.use(
+      http.get(`${API}/tasks`, ({ request }) => {
+        const createdBy = new URL(request.url).searchParams.get('createdBy')
+        return HttpResponse.json(
+          createdBy ? listResponse([TASKS[0]], { total: 48 }) : listResponse(TASKS, { total: 430 })
+        )
+      })
+    )
+    withUsers()
+    const { user } = renderTasks()
+
+    expect(await screen.findByText(/of 430 tasks/)).toBeInTheDocument()
+
+    await user.click(screen.getByLabelText('Filter by creator'))
+    await user.click(await screen.findByRole('option', { name: 'Priya Nair' }))
+
+    await waitFor(() => expect(queryString()).toContain('creator=u-head'))
+    expect(await screen.findByText(/of 48 tasks/)).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /clear filters/i })).toBeInTheDocument()
+  })
+
+  it('offers only people who can create a task', async () => {
+    recordTaskRequests()
+    withUsers()
+    const { user } = renderTasks()
+    await screen.findByText('Q3 GST filing')
+
+    await user.click(screen.getByLabelText('Filter by creator'))
+
+    expect(await screen.findByRole('option', { name: 'Priya Nair' })).toBeInTheDocument()
+    expect(screen.getByRole('option', { name: 'Asha Rao' })).toBeInTheDocument()
+    /* An Employee has never created a task and never can — offering them is a
+     * filter that can only return nothing. */
+    expect(screen.queryByRole('option', { name: 'Ravi Kumar' })).toBeNull()
+  })
+})
+
+describe('TaskList — the calendar month (H-7)', () => {
+  it('fetches the month on screen, in deadline order', async () => {
+    const seen = recordTaskRequests([], 0)
+    renderTasks('/tasks?view=calendar&month=2026-07')
+
+    await screen.findByRole('heading', { name: 'July 2026' })
+    await waitFor(() => expect(seen.length).toBeGreaterThan(0))
+
+    const { from, to } = monthGridRange(new Date(2026, 6, 1))
+    expect(seen.at(-1)).toMatchObject({
+      sort: 'deadline',
+      deadlineFrom: from.toISOString(),
+      deadlineTo: to.toISOString(),
+    })
+    /* The defect was a single `sort=-createdAt` load for the whole calendar. */
+    expect(seen.at(-1).sort).not.toBe('-createdAt')
+  })
+
+  it('changing month issues a new request for the new window', async () => {
+    const seen = recordTaskRequests([], 0)
+    const { user } = renderTasks('/tasks?view=calendar&month=2026-08')
+    await screen.findByRole('heading', { name: 'August 2026' })
+    await waitFor(() => expect(seen.length).toBeGreaterThan(0))
+    const august = seen.at(-1).deadlineFrom
+
+    await user.click(screen.getByRole('button', { name: 'Previous month' }))
+
+    await screen.findByRole('heading', { name: 'July 2026' })
+    await waitFor(() => expect(seen.at(-1).deadlineFrom).not.toBe(august))
+    expect(seen.at(-1).deadlineFrom).toBe(
+      monthGridRange(new Date(2026, 6, 1)).from.toISOString()
+    )
+  })
+
+  it('renders a task due in the visible month that no creation-ordered page would have held', async () => {
+    /* The exact H-7 shape: the row is due in July and is nowhere near the
+     * newest 100 by createdAt, so the old calendar showed an empty grid. */
+    const july = {
+      _id: 'j1',
+      title: 'July audit visit',
+      clientName: 'Northline Logistics',
+      status: 'Pending',
+      priority: 'High',
+      deadline: new Date(2026, 6, 15, 10, 0, 0).toISOString(),
+      createdAt: new Date(2024, 0, 1).toISOString(),
+      assignedTo: { _id: 'u2', name: 'Ravi Kumar' },
+    }
+    recordTaskRequests([july], 1)
+    renderTasks('/tasks?view=calendar&month=2026-07')
+
+    expect(await screen.findByText('July audit visit')).toBeInTheDocument()
+  })
+})
+
+describe('TaskList — board column counts (M-2)', () => {
+  it('shows the real per-status total next to the loaded count', async () => {
+    const totals = { Pending: 77, Completed: 224, Late: 126 }
+    server.use(
+      http.get(`${API}/tasks`, ({ request }) => {
+        const params = new URL(request.url).searchParams
+        const status = params.get('status')
+        if (status) return HttpResponse.json(listResponse([], { total: totals[status] }))
+        return HttpResponse.json(listResponse([TASKS[0]], { total: 427 }))
+      })
+    )
+
+    renderTasks('/tasks?view=board')
+
+    /* One Pending card is loaded; 77 exist. The chip must not say just "1",
+     * and the two empty columns must not read as empty statuses. */
+    expect(await screen.findByText('1 of 77')).toBeInTheDocument()
+    expect(await screen.findByText('0 of 224')).toBeInTheDocument()
+    expect(await screen.findByText('0 of 126')).toBeInTheDocument()
+  })
+})
+
+describe('TaskList — new-task validation (M-1)', () => {
+  it('clears each error as its own field is fixed', async () => {
+    recordTaskRequests()
+    const { user } = renderTasks()
+    await screen.findByText('Q3 GST filing')
+
+    await user.click(screen.getByRole('button', { name: 'New task' }))
+    await user.click(await screen.findByRole('button', { name: 'Create task' }))
+
+    /* All four fire on an empty submit — that part always worked. */
+    expect(await screen.findByText('A title is required.')).toBeInTheDocument()
+    expect(screen.getByText('A deadline is required.')).toBeInTheDocument()
+
+    /* The defect: errors were stored on submit and never recomputed, so the
+     * dialog stayed red with every field filled. */
+    await user.type(screen.getByLabelText(/^Title/), 'File Q3 GST return')
+
+    await waitFor(() => expect(screen.queryByText('A title is required.')).toBeNull())
+    /* Only the fixed field clears; the others still need attention. */
+    expect(screen.getByText('A deadline is required.')).toBeInTheDocument()
+  })
+
+  it('shows nothing red before the first submit attempt', async () => {
+    recordTaskRequests()
+    const { user } = renderTasks()
+    await screen.findByText('Q3 GST filing')
+
+    await user.click(screen.getByRole('button', { name: 'New task' }))
+    await screen.findByRole('button', { name: 'Create task' })
+
+    expect(screen.queryByText('A title is required.')).toBeNull()
+    expect(screen.queryByText('A deadline is required.')).toBeNull()
   })
 })
 
