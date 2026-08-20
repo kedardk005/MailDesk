@@ -282,11 +282,18 @@ function Get-HeadSha {
 
 function Get-CiState {
     <#
-        Asks GitHub whether this exact commit's checks passed. Returns the
-        string 'green', 'red', or 'unknown' (no token on a private repo, GitHub
-        down, checks still running, no checks configured). 'unknown' is treated
-        as do-not-deploy, because "I could not verify" and "it is fine" are not
-        the same claim.
+        Asks GitHub whether this exact commit's checks passed. Returns:
+
+          'green'   every check completed successfully
+          'red'     at least one check failed
+          'pending' checks exist but have not finished yet
+          'unknown' could not be established (no token on a private repo,
+                    GitHub unreachable, no checks configured at all)
+
+        Everything except 'green' refuses to deploy, because "I could not
+        verify" and "it is fine" are not the same claim. 'pending' and
+        'unknown' are kept apart so the operator is told the right thing to do:
+        wait, versus investigate.
 
         This returns a string rather than a bool deliberately, and the caller
         tests `-ne 'green'`. An earlier version returned $true/$false/$null,
@@ -329,7 +336,13 @@ function Get-CiState {
     $incomplete = @($resp.check_runs | Where-Object { $_.status -ne 'completed' })
     if ($incomplete.Count -gt 0) {
         Write-Log "CI still running ($($incomplete.Count) of $($resp.check_runs.Count) incomplete)" 'WARN'
-        return 'unknown'
+        # 'pending', not 'unknown'. Both refuse to deploy, but they need
+        # completely different things from the operator: pending just needs a
+        # minute, whereas unknown may need credentials. Reporting both as
+        # "could not confirm - set GITHUB_TOKEN" sent a real operator off to
+        # create a token they did not need, on a public repo where the API call
+        # had in fact worked perfectly.
+        return 'pending'
     }
 
     # 'neutral' and 'skipped' are not failures; anything else is.
@@ -413,10 +426,18 @@ try {
         if ($ciState -ne 'green') {
             if ($ciState -eq 'red') {
                 Write-Log "CI is RED for $($targetSha.Substring(0,7)) - refusing to deploy" 'FAIL'
+                Write-Log 'fix main; the running version has been left alone' 'INFO'
+            }
+            elseif ($ciState -eq 'pending') {
+                Write-Log "CI has not finished for $($targetSha.Substring(0,7)) - not deploying yet" 'WARN'
+                Write-Log 'this is normal shortly after a push. Re-run in a few minutes.' 'INFO'
+                Write-Log 'no token is needed for a public repository.' 'INFO'
             }
             else {
                 Write-Log "could not confirm CI status (got '$ciState') - refusing to deploy" 'FAIL'
-                Write-Log 'set GITHUB_TOKEN, or pass -SkipCiCheck to accept the risk' 'INFO'
+                Write-Log 'if the repository is PRIVATE, set GITHUB_TOKEN (repo scope).' 'INFO'
+                Write-Log 'otherwise check network access to api.github.com.' 'INFO'
+                Write-Log '-SkipCiCheck deploys without verifying. Understand the risk.' 'INFO'
             }
             exit 2
         }
