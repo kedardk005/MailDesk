@@ -140,7 +140,39 @@ const generalLimiter = rateLimit({
 
 // Apply Middlewares
 app.use(helmet());
-app.use(cors({ origin: process.env.FRONTEND_URL || 'http://localhost:5173' }));
+/**
+ * Browser origins allowed to call this API.
+ *
+ * FRONTEND_URL used to be handed straight to `cors({ origin })` as a single
+ * string, so a deployment with more than one front door — a custom domain and
+ * the *.vercel.app address, say — could only ever admit one of them. Setting
+ * it to a comma-separated list did not help either: the entire string became
+ * ONE literal origin and matched nothing, so both front doors broke at once
+ * and the error message named an origin nobody had configured.
+ *
+ * It now accepts a comma-separated list. A single value behaves exactly as it
+ * did before. Trailing slashes are stripped because an Origin header never
+ * carries a path, and `https://app.example.com/` quietly matching nothing was
+ * an easy thing to stare at for an hour.
+ */
+const allowedOrigins = (process.env.FRONTEND_URL || 'http://localhost:5173')
+  .split(',')
+  .map((o) => o.trim().replace(/\/+$/, ''))
+  .filter(Boolean);
+
+// `callback(null, false)` rather than an Error: an unknown origin should just
+// not receive the header and let the browser refuse it. Passing an Error makes
+// Express answer 500, which turns a routine cross-origin rejection into a
+// server fault in the logs and hides real 500s among the noise.
+const corsOriginCheck = (origin, callback) => {
+  // No Origin header at all: same-origin navigation, curl, health probes,
+  // server-to-server. Those are not cross-origin requests and must not be
+  // blocked, or the funnel's own health check starts failing.
+  if (!origin) return callback(null, true);
+  return callback(null, allowedOrigins.includes(origin));
+};
+
+app.use(cors({ origin: corsOriginCheck }));
 
 // Request-scoped structured logging with a request id, replacing the ~80
 // `console.*` calls. `console.log` to a pipe (Docker/PM2) is a SYNCHRONOUS
@@ -324,7 +356,10 @@ const server = http.createServer(app);
 // Initialize Socket.io on the HTTP server
 const io = new Server(server, {
   cors: {
-    origin: process.env.FRONTEND_URL || 'http://localhost:5173',
+    // Socket.io accepts an array directly. Kept in step with the REST list
+    // above: a login that works while live updates silently do not is a
+    // miserable thing to debug.
+    origin: allowedOrigins,
     methods: ["GET", "POST"]
   }
 });

@@ -334,6 +334,62 @@ const main = async () => {
     `admin=${adminSla.json?.scope} head=${headSla.json?.scope}`
   );
 
+  // CORS: FRONTEND_URL is a comma-separated allowlist.
+  //
+  // It used to be one string handed to `cors({ origin })`, so a deployment
+  // with two front doors (a custom domain and the *.vercel.app address) could
+  // admit only one. Setting it to "a,b" made things worse, not better: the
+  // whole string became a single literal origin, matched nothing, and the
+  // browser reported an allowed origin nobody had configured.
+  //
+  // FRONTEND_URL is not set in CI, so this exercises the parsing path with the
+  // default single value. The multi-value case is covered by the same code
+  // path: split -> trim -> strip trailing slash -> includes().
+  console.log('\nCORS allowlist');
+  {
+    const allowed = (process.env.FRONTEND_URL || 'http://localhost:5173')
+      .split(',')[0].trim().replace(/\/+$/, '');
+
+    const good = await fetch(`${BASE}/api/health`, { headers: { Origin: allowed } });
+    check(
+      'a configured origin is echoed back',
+      good.headers.get('access-control-allow-origin') === allowed,
+      `got ${good.headers.get('access-control-allow-origin')} for ${allowed}`
+    );
+
+    // The browser only trusts an exact match, so an unknown origin must NOT
+    // receive a header naming some other site.
+    const bad = await fetch(`${BASE}/api/health`, {
+      headers: { Origin: 'https://not-configured.example.com' }
+    });
+    check(
+      'an unknown origin is not granted access',
+      bad.headers.get('access-control-allow-origin') !== 'https://not-configured.example.com',
+      `got ${bad.headers.get('access-control-allow-origin')}`
+    );
+
+    // The preflight is what actually broke in the browser: the POST to
+    // /api/auth/login never fired because OPTIONS was refused first.
+    const pre = await fetch(`${BASE}/api/auth/login`, {
+      method: 'OPTIONS',
+      headers: {
+        Origin: allowed,
+        'Access-Control-Request-Method': 'POST',
+        'Access-Control-Request-Headers': 'content-type'
+      }
+    });
+    check(
+      'preflight OPTIONS on /api/auth/login is granted',
+      pre.headers.get('access-control-allow-origin') === allowed,
+      `status=${pre.status} acao=${pre.headers.get('access-control-allow-origin')}`
+    );
+
+    // A request with no Origin at all (curl, the funnel's health probe,
+    // server-to-server) must not be blocked.
+    const none = await fetch(`${BASE}/api/health`);
+    check('a request with no Origin header still succeeds', none.status === 200, `status=${none.status}`);
+  }
+
   console.log('\nnosql key guard');
   const injected = await api('/api/auth/login', {
     method: 'POST',
