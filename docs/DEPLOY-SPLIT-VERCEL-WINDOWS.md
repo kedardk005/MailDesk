@@ -1,5 +1,9 @@
 # Split deployment — client on Vercel, API on the Windows PC
 
+> **Already deployed and just need a command?** See
+> [RUNBOOK-WINDOWS.md](RUNBOOK-WINDOWS.md) — day-to-day operations,
+> logs, deploys, backups and the problems this deployment actually hit.
+
 This is the deployment shape you asked for: Vercel serves the React app, the
 office Windows machine runs the API, Mongo and Redis, and a scheduled task
 pulls `main` once a day and redeploys the backend.
