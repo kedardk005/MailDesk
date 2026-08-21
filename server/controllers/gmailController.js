@@ -574,7 +574,9 @@ exports.handleOAuthCallback = async (req, res) => {
     // sweep is now an explicit Admin action (POST /api/gmail/deduplicate).
 
     // Redirect to inbox so user sees the new account immediately
-    const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:5173';
+    // primaryAppUrl(), not the raw env: FRONTEND_URL may be an allowlist, and
+    // redirecting to "https://a.com,https://b.com/inbox" lands nowhere.
+    const frontendUrl = require('../utils/frontendUrl').primaryAppUrl();
     return res.redirect(`${frontendUrl}/inbox?gmail=connected`);
   } catch (error) {
     logger.error({ err: error.message }, 'OAuth callback exchange failed');

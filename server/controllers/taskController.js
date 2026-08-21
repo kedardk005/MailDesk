@@ -421,7 +421,7 @@ exports.updateTask = async (req, res) => {
                 timeStyle: 'short'
               }),
               clientName: task.clientName,
-              taskUrl: `${(process.env.FRONTEND_URL || 'http://localhost:5173').replace(/\/+$/, '')}/tasks?task=${task._id}`
+              taskUrl: `${require('../utils/frontendUrl').primaryAppUrl()}/tasks?task=${task._id}`
             });
             await sendEmail(creator.email, mail.subject, mail.text, mail.html, {
               event: 'task_completed',
