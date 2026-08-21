@@ -54,7 +54,10 @@ const esc = (v) =>
     .replace(/"/g, '&quot;')
     .replace(/'/g, '&#39;');
 
-const appUrl = () => (process.env.FRONTEND_URL || 'http://localhost:5173').replace(/\/+$/, '');
+const { primaryAppUrl } = require('./frontendUrl');
+
+// FRONTEND_URL may list several allowed origins; a link needs exactly one.
+const appUrl = () => primaryAppUrl();
 
 /**
  * Bulletproof CTA button. The MSO conditional draws a VML rectangle because

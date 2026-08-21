@@ -155,10 +155,8 @@ app.use(helmet());
  * carries a path, and `https://app.example.com/` quietly matching nothing was
  * an easy thing to stare at for an hour.
  */
-const allowedOrigins = (process.env.FRONTEND_URL || 'http://localhost:5173')
-  .split(',')
-  .map((o) => o.trim().replace(/\/+$/, ''))
-  .filter(Boolean);
+const { allowedOrigins: parseAllowedOrigins } = require('./utils/frontendUrl');
+const allowedOrigins = parseAllowedOrigins();
 
 // `callback(null, false)` rather than an Error: an unknown origin should just
 // not receive the header and let the browser refuse it. Passing an Error makes

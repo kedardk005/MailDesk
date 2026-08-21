@@ -245,7 +245,9 @@ exports.forgotPassword = async (req, res) => {
     user.resetTokenExpires = new Date(Date.now() + RESET_TOKEN_TTL_MS);
     await user.save();
 
-    const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:5173';
+    // primaryAppUrl(), not the raw env: FRONTEND_URL may be an allowlist, and
+    // a reset link built from the whole list 404s for the user.
+    const frontendUrl = require('../utils/frontendUrl').primaryAppUrl();
     const resetLink = `${frontendUrl}/reset-password?token=${rawToken}`;
 
     const { sendEmail } = require('../utils/emailHelper');

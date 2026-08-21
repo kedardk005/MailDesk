@@ -31,7 +31,10 @@ const logger = log('task-mail');
 // How many tasks one batch-assignment email lists before it says "and N more".
 const MAX_ROWS = Number(process.env.ASSIGNED_DIGEST_MAX_ROWS || 25);
 
-const appUrl = () => (process.env.FRONTEND_URL || 'http://localhost:5173').replace(/\/+$/, '');
+const { primaryAppUrl } = require('./frontendUrl');
+
+// FRONTEND_URL may list several allowed origins; a link needs exactly one.
+const appUrl = () => primaryAppUrl();
 const taskUrl = (id) => `${appUrl()}/tasks?task=${id}`;
 const taskListUrl = () => `${appUrl()}/tasks`;
 
