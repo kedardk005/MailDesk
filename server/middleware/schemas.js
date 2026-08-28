@@ -196,6 +196,22 @@ const importClientsSchema = z.object({
     .max(500, 'Import at most 500 rows per request.')
 });
 
+/* Bulk status change driven by the imported status code.
+ *
+ * The sheet's codes (01/03/05/08/14) are the practice's own business rules, so
+ * the import stores them verbatim and marks everything Active rather than
+ * guessing which mean "closed". This is how that guess gets made LATER, once,
+ * by someone who actually knows — instead of clicking through 165 clients.
+ */
+const bulkClientStatusSchema = z.object({
+  sourceStatus: z
+    .string()
+    .trim()
+    .min(1, 'A status code is required.')
+    .max(20, 'That status code is too long.'),
+  status: z.enum(['Active', 'Inactive'], { error: 'Status must be Active or Inactive.' })
+});
+
 const disconnectLinkedAccountSchema = z
   .object({
     gmailEmail: z.string().trim().email('Invalid email address.').optional(),
@@ -410,6 +426,7 @@ module.exports = {
   replyToEmailSchema,
   bulkAssignEmailsSchema,
   importClientsSchema,
+  bulkClientStatusSchema,
   disconnectLinkedAccountSchema,
   createTaskSchema,
   updateTaskSchema,

@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import { useSearchParams } from 'react-router-dom'
-import { Building2, Pencil, Plus, Search, Trash2, Upload, X } from 'lucide-react'
+import { Building2, Pencil, Plus, Search, Tags, Trash2, Upload, X } from 'lucide-react'
 
 import api, { getErrorMessage, isCanceled } from '../api/axios'
 import { useAuth } from '../components/AuthProvider'
@@ -26,6 +26,7 @@ import {
   useConfirm,
 } from '../components/ui'
 import { ImportClientsDialog } from '../components/ImportClientsDialog'
+import { ClientStatusCodesDialog } from '../components/ClientStatusCodesDialog'
 import { formatNumber } from '../lib/utils'
 import { useCachedQuery } from '../lib/useCachedQuery'
 
@@ -146,6 +147,7 @@ export default function ClientList() {
 
   const canEdit = isAdmin || isHead
   const [importOpen, setImportOpen] = useState(false)
+  const [codesOpen, setCodesOpen] = useState(false)
   const canDelete = isAdmin
 
   /* -- URL state --------------------------------------------------------- */
@@ -599,6 +601,13 @@ export default function ClientList() {
         actions={
           canEdit ? (
             <div className="flex flex-wrap items-center gap-2">
+              <Button
+                variant="secondary"
+                leftIcon={<Tags className="h-4 w-4" />}
+                onClick={() => setCodesOpen(true)}
+              >
+                Status codes
+              </Button>
               <Button
                 variant="secondary"
                 leftIcon={<Upload className="h-4 w-4" />}
@@ -1068,6 +1077,12 @@ export default function ClientList() {
         open={importOpen}
         onOpenChange={setImportOpen}
         onImported={reload}
+      />
+
+      <ClientStatusCodesDialog
+        open={codesOpen}
+        onOpenChange={setCodesOpen}
+        onChanged={reload}
       />
     </>
   )

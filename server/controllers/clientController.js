@@ -514,11 +514,107 @@ const importClients = async (req, res) => {
   }
 };
 
+
+/**
+ * GET /api/clients/status-codes — the imported status codes, with counts.
+ *
+ * The spreadsheet's own codes ("01", "05", …) are preserved on import because
+ * their meaning is the practice's business rule, not ours; everything lands as
+ * Active rather than guessing which of them mean "closed". This endpoint is
+ * what makes that decision possible afterwards: it shows each code, how many
+ * clients carry it, and how they are split today, so somebody who knows what
+ * the codes mean can act on real numbers rather than from memory.
+ */
+const getClientStatusCodes = async (req, res) => {
+  try {
+    const rows = await Client.aggregate([
+      { $match: { sourceStatus: { $type: 'string', $gt: '' } } },
+      {
+        $group: {
+          _id: '$sourceStatus',
+          total: { $sum: 1 },
+          active: { $sum: { $cond: [{ $eq: ['$status', 'Active'] }, 1, 0] } }
+        }
+      },
+      { $sort: { _id: 1 } }
+    ]);
+
+    res.json({
+      success: true,
+      data: rows.map((r) => ({
+        sourceStatus: r._id,
+        total: r.total,
+        active: r.active,
+        inactive: r.total - r.active
+      }))
+    });
+  } catch (err) {
+    logger.error({ err: err.message }, 'getClientStatusCodes failed');
+    res.status(500).json({ success: false, message: 'Server error reading status codes' });
+  }
+};
+
+/**
+ * PUT /api/clients/bulk-status — set Active/Inactive for every client carrying
+ * one imported status code.
+ *
+ * Deliberately keyed on the CODE rather than on a list of ids: the whole point
+ * is to act on "every client the practice marked 05" without first selecting
+ * 165 rows by hand, and the code is the only durable way to name that group.
+ *
+ * Nothing else on the client is touched, and the code itself is preserved — so
+ * this is reversible by running it again with the other status.
+ */
+const bulkUpdateClientStatus = async (req, res) => {
+  try {
+    const { sourceStatus, status } = req.body;
+    const code = sourceStatus.trim();
+
+    const filter = { sourceStatus: code };
+    const matched = await Client.countDocuments(filter);
+    if (matched === 0) {
+      return fieldError(res, 400, `No clients carry the status code "${code}".`, ['sourceStatus'], {
+        success: false
+      });
+    }
+
+    const result = await Client.updateMany(filter, { $set: { status } });
+    await cache.invalidateClients();
+
+    await logActivity(
+      req.user._id,
+      'Client Bulk Status',
+      `Set ${result.modifiedCount} client(s) with code "${code}" to ${status}`,
+      {
+        req,
+        targetType: 'Client',
+        targetId: null,
+        targetLabel: `code ${code}`,
+        after: { sourceStatus: code, status, matched, modified: result.modifiedCount }
+      }
+    );
+
+    res.json({
+      success: true,
+      message: `${result.modifiedCount} client(s) set to ${status}`,
+      // `matched` and `modified` differ when some already had that status.
+      // Reporting both stops "0 changed" reading as a failure when it means
+      // "they were already like that".
+      data: { sourceStatus: code, status, matched, modified: result.modifiedCount }
+    });
+  } catch (err) {
+    logger.error({ err: err.message }, 'bulkUpdateClientStatus failed');
+    res.status(500).json({ success: false, message: 'Server error updating client status' });
+  }
+};
+
 module.exports = {
   getClients,
   getClientTimeline,
   createClient,
   importClients,
+  getClientStatusCodes,
+  bulkUpdateClientStatus,
   updateClient,
   deleteClient
 };

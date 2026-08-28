@@ -2984,6 +2984,61 @@ const main = async () => {
   check('two clients with no code can both exist', noCodeA.status === 201 && noCodeB.status === 201, `${noCodeA.status}/${noCodeB.status}`);
 
   await Client.deleteMany({ name: { $regex: `Smoke (Hand|Clash|NoCode)` } });
+  // Bulk status by imported code.
+  //
+  // Everything imports as Active because the sheet's codes (01/03/05/08/14) are
+  // the practice's business rules, not ours, and guessing which mean "closed"
+  // would silently hide live clients. This is how that decision gets made
+  // afterwards — once, by someone who knows — instead of opening 165 clients
+  // one at a time. Keyed on the CODE because that is the only durable way to
+  // name the group without selecting every row by hand.
+  const codesRes = await api('/api/clients/status-codes', { token: adminToken });
+  check('GET /api/clients/status-codes: 200', codesRes.status === 200, `got ${codesRes.status}`);
+  const codeRow = (codesRes.json?.data || []).find((r) => r.sourceStatus === '01');
+  check('the imported codes are reported with counts', Boolean(codeRow), JSON.stringify(codesRes.json?.data || []).slice(0, 140));
+  check('  ... and everything imported is Active to begin with', codeRow?.active === codeRow?.total, `active=${codeRow?.active} total=${codeRow?.total}`);
+
+  const bulk = await api('/api/clients/bulk-status', {
+    token: adminToken, method: 'PUT', body: { sourceStatus: '01', status: 'Inactive' }
+  });
+  check('PUT /api/clients/bulk-status: 200', bulk.status === 200, `got ${bulk.status} ${JSON.stringify(bulk.json).slice(0, 140)}`);
+  check('  ... reports how many it changed', bulk.json?.data?.modified >= 1, `modified=${bulk.json?.data?.modified}`);
+  check('  ... and every client on that code moved', (await Client.countDocuments({ sourceStatus: '01', status: 'Active' })) === 0);
+  check('  ... while a DIFFERENT code is untouched', (await Client.countDocuments({ sourceStatus: '05', status: 'Active' })) >= 1);
+
+  // Reversible: the code itself is never rewritten, so running it back works.
+  const back = await api('/api/clients/bulk-status', {
+    token: adminToken, method: 'PUT', body: { sourceStatus: '01', status: 'Active' }
+  });
+  check('running it back restores them', back.status === 200 && (await Client.countDocuments({ sourceStatus: '01', status: 'Inactive' })) === 0);
+
+  // Re-applying the same status is not an error, and says so honestly.
+  const again = await api('/api/clients/bulk-status', {
+    token: adminToken, method: 'PUT', body: { sourceStatus: '01', status: 'Active' }
+  });
+  check('re-applying the same status is 200, not a failure', again.status === 200, `got ${again.status}`);
+  check('  ... matched is reported even when modified is 0', again.json?.data?.matched >= 1 && again.json?.data?.modified === 0, `matched=${again.json?.data?.matched} modified=${again.json?.data?.modified}`);
+
+  const unknownCode = await api('/api/clients/bulk-status', {
+    token: adminToken, method: 'PUT', body: { sourceStatus: 'NOPE', status: 'Inactive' }
+  });
+  check('an unknown code is 400, not a silent no-op', unknownCode.status === 400, `got ${unknownCode.status}`);
+  const badStatus = await api('/api/clients/bulk-status', {
+    token: adminToken, method: 'PUT', body: { sourceStatus: '01', status: 'Archived' }
+  });
+  check('an invalid status is 400', badStatus.status === 400, `got ${badStatus.status}`);
+  const headCodeBulk = await api('/api/clients/bulk-status', {
+    token: headToken, method: 'PUT', body: { sourceStatus: '01', status: 'Active' }
+  });
+  check('a Head may do it, as they may edit one by hand', headCodeBulk.status === 200, `got ${headCodeBulk.status}`);
+  const empCodeBulk = await api('/api/clients/bulk-status', {
+    token: empToken, method: 'PUT', body: { sourceStatus: '01', status: 'Inactive' }
+  });
+  check('an Employee cannot', empCodeBulk.status === 403, `got ${empCodeBulk.status}`);
+
+  // The literal paths must never be swallowed by the '/:id' routes.
+  check('"bulk-status" is not read as a client id', bulk.status !== 400 || !JSON.stringify(bulk.json).includes('Invalid'), 'route ordering');
+
   // Searching by CODE is the point of importing codes. The client search
   // matched name/email/contactPerson/associatedEmails only, so a practice that
   // identifies clients by code could not find a single imported record by the
