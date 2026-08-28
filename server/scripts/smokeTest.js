@@ -134,9 +134,13 @@ const check = (name, ok, detail = '') => {
   }
 };
 
-const api = async (path, { token, method = 'GET', body, headers = {} } = {}) => {
+const api = async (path, { token, method = 'GET', body, headers = {}, redirect } = {}) => {
   const res = await fetch(`${BASE}${path}`, {
     method,
+    // `redirect: 'manual'` lets a caller assert on a 3xx and its Location
+    // rather than silently following it, which is the only way to test that an
+    // endpoint redirects somewhere specific.
+    ...(redirect ? { redirect } : {}),
     headers: {
       'Content-Type': 'application/json',
       ...(token ? { Authorization: `Bearer ${token}` } : {}),
@@ -170,7 +174,7 @@ const api = async (path, { token, method = 'GET', body, headers = {} } = {}) => 
     process.exit(2);
   }
 
-  return { status: res.status, json };
+  return { status: res.status, json, location: res.headers.get('location') };
 };
 
 /**
@@ -2806,6 +2810,28 @@ const main = async () => {
   check('an Employee is refused on both create URLs', (await api('/api/clients', { token: empToken, method: 'POST', body: { name: 'nope' } })).status === 403);
   check('  ... and on the duplicate URL', (await api('/api/tasks/clients', { token: empToken, method: 'POST', body: { name: 'nope' } })).status === 403);
   await Client.deleteMany({ name: { $in: [m12A, m12B] } });
+
+  console.log('\nGmail OAuth callback returns the user to the app, never a blank page');
+
+  /*
+   * All nine failure exits used to answer res.send(plain text): the person
+   * ended up on a bare white page of server prose, outside the application,
+   * with no link back — and the UI could not react, because nothing came back
+   * to it. The likeliest failure is a Head whose address an Admin has not
+   * allow-listed, which is a configuration step rather than a fault, and it
+   * read as "connecting Gmail is broken".
+   *
+   * The reason is a stable CODE and the client owns the wording, so nothing
+   * user-controlled is reflected into the page.
+   */
+  const cbNoCode = await api('/api/gmail/oauth/callback', { redirect: 'manual' });
+  check('the callback redirects instead of printing text', cbNoCode.status === 302, `got ${cbNoCode.status}`);
+  check('  ... and names a machine-readable reason', String(cbNoCode.location || '').includes('gmail=error&reason=missing_code'), `location=${cbNoCode.location}`);
+
+  const cbBadState = await api('/api/gmail/oauth/callback?code=x&state=garbage', { redirect: 'manual' });
+  check('an expired or forged state also redirects', cbBadState.status === 302, `got ${cbBadState.status}`);
+  check('  ... with its own reason, not a generic one', String(cbBadState.location || '').includes('reason=bad_state'), `location=${cbBadState.location}`);
+  check('  ... and lands back on the inbox', String(cbBadState.location || '').includes('/inbox?'), `location=${cbBadState.location}`);
 
   console.log('\nClient import: a spreadsheet becomes clients, idempotently');
 
