@@ -188,7 +188,7 @@ const importClientsSchema = z.object({
         code: z.string().trim().max(50, 'That client code is too long.').optional(),
         name: z.string().trim().min(1, 'A client name is required.').max(200, 'That client name is too long.'),
         address: z.string().trim().max(500, 'That address is too long.').optional(),
-        phone: z.string().trim().max(60, 'That phone number is too long.').optional(),
+        phone: z.string().trim().max(40, 'That phone number is too long.').optional(),
         sourceStatus: z.string().trim().max(20, 'That status code is too long.').optional()
       })
     )
@@ -385,6 +385,10 @@ const createClientSchema = z.object({
   contactPerson: z.string().trim().max(200, 'Contact person is too long.').optional(),
   email: z.union([z.literal(''), z.string().trim().email('Invalid email address.').max(254)]).optional(),
   phone: z.string().trim().max(40, 'Phone number is too long.').optional(),
+  /* The practice's own client code. Optional everywhere: clients added by hand
+   * need not have one, and the unique index only covers non-empty values. */
+  code: z.string().trim().max(50, 'Client code is too long.').optional(),
+  address: z.string().trim().max(500, 'Address is too long.').optional(),
   notes: z.string().max(20000, 'Notes are too long.').optional(),
   status: z.enum(['Active', 'Inactive'], { error: 'Status must be Active or Inactive.' }).optional()
 });

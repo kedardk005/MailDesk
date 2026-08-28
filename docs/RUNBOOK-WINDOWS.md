@@ -210,6 +210,34 @@ cd C:\apps\maildesk; git log --oneline -1
 
 ---
 
+### After a release that adds a database index
+
+**Indexes are NOT built automatically, and this fails silently.** In production
+`autoIndex` is off (`config/db.js`) because letting every boot build indexes is
+a production hazard, and the deploy step runs `syncIndexes.js` in
+**report-only** mode — deliberately, since `syncIndexes()` also *drops* indexes
+no longer declared, and doing that unattended would let a bad schema change
+delete a live one.
+
+The consequence: an index added in a release does not exist in production until
+somebody builds it. Nothing breaks loudly — queries just get slower, and a
+*unique* index meant to prevent duplicates silently does not.
+
+```powershell
+# 1. See what is declared but missing. Read this before applying it.
+cd C:\apps\maildesk\server; node scripts/syncIndexes.js
+```
+
+```powershell
+# 2. Build them - only after reading the report, because this also DROPS
+#    indexes that are no longer declared in the schema.
+cd C:\apps\maildesk\server; node scripts/syncIndexes.js --apply
+```
+
+Do this after any release whose notes mention a new index. The client-code
+uniqueness added for the spreadsheet importer is one: without it two clients can
+share a code, and a re-import can duplicate rather than update.
+
 ## 7. Watchdog
 
 Checks every 5 minutes. If the API stops responding it restarts it, and if that

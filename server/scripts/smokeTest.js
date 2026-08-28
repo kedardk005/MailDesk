@@ -2880,6 +2880,39 @@ const main = async () => {
   const impEmp = await api('/api/clients/import', { token: empToken, method: 'POST', body: { rows: [{ name: 'nope' }] } });
   check('an Employee cannot import', impEmp.status === 403, `got ${impEmp.status}`);
 
+  // An imported client must be editable by hand afterwards. Adding the fields
+  // to the model without adding them to create/update would leave every
+  // imported code and address permanently read-only in the UI.
+  const hand = await api('/api/clients', {
+    token: adminToken, method: 'POST',
+    body: { name: `Smoke Hand ${impCode}`, code: `${impCode}HAND`, address: '9 Hand Lane' }
+  });
+  check('a client created by hand accepts a code and address', hand.status === 201, `got ${hand.status}`);
+  const handDoc = await Client.findOne({ code: `${impCode}HAND` }).lean();
+  check('  ... and both are stored', handDoc?.address === '9 Hand Lane', `address=${handDoc?.address}`);
+  const handPut = await api(`/api/clients/${handDoc?._id}`, {
+    token: adminToken, method: 'PUT', body: { code: `${impCode}EDIT`, address: '10 Edited Way' }
+  });
+  check('an existing client\'s code can be corrected', handPut.status === 200, `got ${handPut.status}`);
+  const handAfter = await Client.findOne({ _id: handDoc?._id }).lean();
+  check('  ... the new code is stored', handAfter?.code === `${impCode}EDIT`, `code=${handAfter?.code}`);
+  check('  ... and the new address too', handAfter?.address === '10 Edited Way', `address=${handAfter?.address}`);
+
+  // Two clients must not be able to share a code.
+  const clash = await api('/api/clients', {
+    token: adminToken, method: 'POST',
+    body: { name: `Smoke Clash ${impCode}`, code: `${impCode}EDIT` }
+  });
+  check('a duplicate client code is refused', clash.status === 400, `got ${clash.status}`);
+  check('  ... blamed on the code field', JSON.stringify(clash.json?.errors || []).includes('code'), JSON.stringify(clash.json?.errors || []).slice(0, 120));
+
+  // ...but many clients WITHOUT a code must still coexist: the index is
+  // partial, and a plain unique index would reject all but the first.
+  const noCodeA = await api('/api/clients', { token: adminToken, method: 'POST', body: { name: `Smoke NoCode A ${impCode}` } });
+  const noCodeB = await api('/api/clients', { token: adminToken, method: 'POST', body: { name: `Smoke NoCode B ${impCode}` } });
+  check('two clients with no code can both exist', noCodeA.status === 201 && noCodeB.status === 201, `${noCodeA.status}/${noCodeB.status}`);
+
+  await Client.deleteMany({ name: { $regex: `Smoke (Hand|Clash|NoCode)` } });
   await Client.deleteMany({ code: { $regex: `^${impCode}` } });
 
   console.log('\nAssign-as-task: an explicit client and a handover note');

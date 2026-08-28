@@ -45,6 +45,8 @@ const STATUS_OPTIONS = [
 
 const EMPTY_FORM = {
   name: '',
+  code: '',
+  address: '',
   contactPerson: '',
   email: '',
   phone: '',
@@ -343,6 +345,8 @@ export default function ClientList() {
     setEditing(client)
     setForm({
       name: typeof client?.name === 'string' ? client.name : '',
+      code: client?.code || '',
+      address: client?.address || '',
       contactPerson: client?.contactPerson || '',
       email: client?.email || '',
       phone: client?.phone || '',
@@ -388,6 +392,8 @@ export default function ClientList() {
 
     const body = {
       name: form.name.trim(),
+      code: form.code.trim(),
+      address: form.address.trim(),
       contactPerson: form.contactPerson.trim(),
       email: form.email.trim(),
       phone: form.phone.trim(),
@@ -464,6 +470,17 @@ export default function ClientList() {
             </div>
           )
         },
+      },
+      {
+        accessorKey: 'code',
+        header: 'Code',
+        /* The practice identifies clients by code, so it earns a column — and
+         * it is what the importer matches on, which makes a wrong or missing
+         * one worth being able to see. Narrow: codes are a few characters. */
+        meta: { width: '96px' },
+        cell: ({ row }) => (
+          <span className="font-mono text-xs text-fg-2">{row.original?.code || '—'}</span>
+        ),
       },
       {
         accessorKey: 'email',
@@ -951,6 +968,35 @@ export default function ClientList() {
                     placeholder="+91 98765 43210"
                     value={form.phone}
                     onChange={(e) => setForm((p) => ({ ...p, phone: e.target.value }))}
+                  />
+                )}
+              </FormField>
+            </div>
+
+            <div className="grid gap-4 sm:grid-cols-2">
+              <FormField
+                label="Client code"
+                optionalText="(optional)"
+                error={formErrors.code}
+                hint="Your own reference. Spreadsheet imports match on this."
+              >
+                {(field) => (
+                  <Input
+                    {...field}
+                    placeholder="e.g. 138B"
+                    value={form.code}
+                    onChange={(e) => setForm((p) => ({ ...p, code: e.target.value }))}
+                  />
+                )}
+              </FormField>
+
+              <FormField label="Address" optionalText="(optional)" error={formErrors.address}>
+                {(field) => (
+                  <Input
+                    {...field}
+                    placeholder="Street, town, postcode"
+                    value={form.address}
+                    onChange={(e) => setForm((p) => ({ ...p, address: e.target.value }))}
                   />
                 )}
               </FormField>

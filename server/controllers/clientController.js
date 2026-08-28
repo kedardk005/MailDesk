@@ -198,7 +198,7 @@ const getClientTimeline = async (req, res) => {
 // @access  Private (Admin, Head)
 const createClient = async (req, res) => {
   try {
-    const { name, associatedEmails, contactPerson, email, phone, notes, status } = req.body;
+    const { name, associatedEmails, contactPerson, email, phone, notes, status, code, address } = req.body;
 
     if (!name) {
       // M-13: `success: false` is preserved — this endpoint has always sent it
@@ -224,7 +224,9 @@ const createClient = async (req, res) => {
       email: email || '',
       phone: phone || '',
       notes: notes || '',
-      status: status || 'Active'
+      status: status || 'Active',
+      code: (code || '').trim(),
+      address: (address || '').trim()
     });
 
     await newClient.save();
@@ -284,7 +286,7 @@ const createClient = async (req, res) => {
 const updateClient = async (req, res) => {
   try {
     const { id } = req.params;
-    const { name, associatedEmails, contactPerson, email, phone, notes, status } = req.body;
+    const { name, associatedEmails, contactPerson, email, phone, notes, status, code, address } = req.body;
 
     const client = await Client.findById(id);
     if (!client) {
@@ -319,6 +321,11 @@ const updateClient = async (req, res) => {
     if (phone !== undefined) client.phone = phone;
     if (notes !== undefined) client.notes = notes;
     if (status !== undefined) client.status = status;
+    // Editable by hand so an imported client's code can be corrected. An empty
+    // string clears it, which the unique index tolerates — it only covers
+    // non-empty values.
+    if (code !== undefined) client.code = code.trim();
+    if (address !== undefined) client.address = address.trim();
 
     await client.save();
     await cache.invalidateClients();
