@@ -114,16 +114,20 @@ import { useCachedQuery } from '../lib/useCachedQuery'
 import { cn, formatDurationMinutes, formatNumber, timeAgo } from '../lib/utils'
 import { ExtractActionsPanel } from '../components/ActionExtraction'
 
-/* The email body renders in an auto-sizing iframe. It used to be capped at
- * 560px in the thread view and 900px in the detail view, so any real email
- * taller than that got its OWN scrollbar inside a drawer that already
- * scrolls — a nested scroller, which reads as "only half the mail is here".
+/* Ceiling for the auto-sizing email iframe.
  *
- * Drawer.jsx already gives the panel `overflow-y-auto`, so letting the frame
- * grow to its natural height simply makes the drawer scroll, which is what a
- * reader expects. The ceiling stays only as a runaway guard: a hostile or
- * broken message cannot turn itself into a 100,000px frame. No genuine email
- * comes close to it. */
+ * The "only half the email shows" bug was NOT this cap — it was the iframe
+ * sandbox denying the parent access to contentDocument, so the auto-height
+ * measurement silently failed and every message stayed at minHeight (see
+ * EmailBody.jsx). With measurement working, the old caps of 560/900 would
+ * bite for real, giving a long email its own scrollbar inside a drawer that
+ * already scrolls.
+ *
+ * Drawer.jsx gives the panel `overflow-y-auto`, so letting the frame grow to
+ * its natural height simply makes the drawer scroll, which is what a reader
+ * expects. The ceiling remains only as a runaway guard: a hostile or broken
+ * message cannot turn itself into a 100,000px frame. No genuine email is
+ * anywhere near it. */
 const EMAIL_BODY_MAX_HEIGHT = 20000
 
 /* The Gmail OAuth callback returns here with ?gmail=connected, or
