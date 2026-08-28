@@ -161,7 +161,39 @@ const bulkAssignEmailsSchema = z.object({
     .max(200, 'Cannot assign more than 200 emails at once.'),
   assignedTo: objectId('Assigned user ID'),
   deadline: deadlineField.optional(),
-  priority: z.enum(['Low', 'Medium', 'High', 'Urgent'], { error: 'Invalid priority.' }).optional()
+  priority: z.enum(['Low', 'Medium', 'High', 'Urgent'], { error: 'Invalid priority.' }).optional(),
+  // Optional explicit client. Without it the server keeps resolving the client
+  // from the sender address, exactly as the sync path does. Bounded to the
+  // same 200 the Tasks form enforces on clientName.
+  clientName: z.string().trim().max(200, 'That client name is too long.').optional(),
+  // Optional instruction from the Admin/Head who is handing the work over.
+  // Bounded to the same 20,000 as Task.notes in the Tasks form.
+  note: z.string().trim().max(20000, 'That note is too long.').optional()
+});
+
+/* Bulk client import (Excel).
+ *
+ * The browser parses the workbook and posts plain rows, so the server never
+ * needs multipart handling or a spreadsheet parser — but it also means these
+ * rows are untrusted input like any other body, and every field is bounded
+ * here rather than being believed.
+ *
+ * Batched: 1,000+ clients would otherwise be one request against a 1mb body
+ * limit, with no progress and nothing to retry if it failed halfway.
+ */
+const importClientsSchema = z.object({
+  rows: z
+    .array(
+      z.object({
+        code: z.string().trim().max(50, 'That client code is too long.').optional(),
+        name: z.string().trim().min(1, 'A client name is required.').max(200, 'That client name is too long.'),
+        address: z.string().trim().max(500, 'That address is too long.').optional(),
+        phone: z.string().trim().max(60, 'That phone number is too long.').optional(),
+        sourceStatus: z.string().trim().max(20, 'That status code is too long.').optional()
+      })
+    )
+    .min(1, 'At least one row is required.')
+    .max(500, 'Import at most 500 rows per request.')
 });
 
 const disconnectLinkedAccountSchema = z
@@ -373,6 +405,7 @@ module.exports = {
   changePasswordSchema,
   replyToEmailSchema,
   bulkAssignEmailsSchema,
+  importClientsSchema,
   disconnectLinkedAccountSchema,
   createTaskSchema,
   updateTaskSchema,

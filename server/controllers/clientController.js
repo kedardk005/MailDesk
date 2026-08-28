@@ -373,10 +373,145 @@ const deleteClient = async (req, res) => {
   }
 };
 
+
+/**
+ * POST /api/clients/import — bulk create/update clients from a spreadsheet.
+ *
+ * The browser parses the workbook and posts rows, so nothing here handles
+ * multipart or trusts a file. Rows are validated by `importClientsSchema`
+ * before arriving.
+ *
+ * Matching, in order:
+ *   1. `code` — the practice's own client code, and the natural key. Re-running
+ *      the same sheet UPDATES those clients instead of creating duplicates.
+ *   2. `name`, case-insensitively, when a row has no code.
+ *
+ * That ordering matters: names in the source sheet carry trailing spaces and
+ * inconsistent casing, so name-matching alone would create near-duplicates on
+ * the second run. Matching on code makes the import idempotent.
+ *
+ * `status` is always Active. The sheet's own status codes ("01", "05", …) are
+ * the practice's business rules, not ours, so the original is preserved in
+ * `sourceStatus` rather than being guessed into Active/Inactive — a wrong
+ * guess would silently hide live clients from every picker.
+ *
+ * Never destructive: a field absent from the sheet is left as it is, so an
+ * import cannot wipe an email address or note added by hand in the UI.
+ */
+const importClients = async (req, res) => {
+  try {
+    const { rows } = req.body;
+
+    const summary = { received: rows.length, created: 0, updated: 0, skipped: 0, errors: [] };
+
+    // One query for everything this batch might touch, rather than 2 lookups
+    // per row. 500 rows would otherwise be 1,000 sequential round-trips.
+    const codes = rows.map((r) => (r.code || '').trim()).filter(Boolean);
+    const names = rows.map((r) => r.name.trim()).filter(Boolean);
+
+    const existing = await Client.find({
+      $or: [
+        ...(codes.length ? [{ code: { $in: codes } }] : []),
+        ...(names.length ? [{ name: { $in: names } }] : [])
+      ]
+    })
+      .select('_id name code')
+      .lean();
+
+    const byCode = new Map(existing.filter((c) => c.code).map((c) => [c.code.toLowerCase(), c]));
+    const byName = new Map(existing.map((c) => [c.name.trim().toLowerCase(), c]));
+
+    const ops = [];
+    // Guards against a sheet that repeats a code or name within one batch:
+    // two upserts on the same key in a single bulkWrite is a duplicate-key
+    // error, and the whole batch would fail for one bad pair of rows.
+    const seenCode = new Set();
+    const seenName = new Set();
+
+    for (const row of rows) {
+      const code = (row.code || '').trim();
+      const name = row.name.trim();
+      const key = code ? `c:${code.toLowerCase()}` : `n:${name.toLowerCase()}`;
+      const seen = code ? seenCode : seenName;
+
+      if (seen.has(key)) {
+        summary.skipped += 1;
+        summary.errors.push({ name, code, reason: 'Repeated in this file' });
+        continue;
+      }
+      seen.add(key);
+
+      const match = code ? byCode.get(code.toLowerCase()) : byName.get(name.toLowerCase());
+
+      // Only fields the sheet actually carries are written.
+      const fields = { name, code };
+      if (row.address !== undefined) fields.address = row.address.trim();
+      if (row.phone !== undefined) fields.phone = row.phone.trim();
+      if (row.sourceStatus !== undefined) fields.sourceStatus = row.sourceStatus.trim();
+
+      if (match) {
+        summary.updated += 1;
+        ops.push({ updateOne: { filter: { _id: match._id }, update: { $set: fields } } });
+      } else {
+        summary.created += 1;
+        ops.push({
+          insertOne: {
+            document: { ...fields, status: 'Active', associatedEmails: [], createdAt: new Date() }
+          }
+        });
+      }
+    }
+
+    if (ops.length) {
+      try {
+        await Client.bulkWrite(ops, { ordered: false });
+      } catch (bulkErr) {
+        // `ordered: false` means the good rows still landed. Report the ones
+        // that did not instead of failing the whole batch, so a single bad row
+        // in a 1,000-row sheet does not cost the other 999.
+        const writeErrors = bulkErr?.writeErrors || bulkErr?.result?.writeErrors || [];
+        for (const we of writeErrors) {
+          const doc = we?.err?.op?.document || we?.op?.document || {};
+          summary.errors.push({
+            name: doc.name || '(unknown)',
+            code: doc.code || '',
+            reason: we?.err?.code === 11000 || we?.code === 11000 ? 'Already exists' : 'Could not be saved'
+          });
+        }
+        const failed = writeErrors.length;
+        summary.skipped += failed;
+        // The created/updated counters were optimistic; correct them.
+        summary.created = Math.max(0, summary.created - failed);
+      }
+    }
+
+    await cache.invalidateClients();
+
+    await logActivity(
+      req.user._id,
+      'Client Import',
+      `Imported ${summary.created} new and updated ${summary.updated} clients from a spreadsheet`,
+      {
+        req,
+        targetType: 'Client',
+        targetId: null,
+        targetLabel: `${summary.received} row(s)`,
+        after: { created: summary.created, updated: summary.updated, skipped: summary.skipped }
+      }
+    );
+
+    res.json({ success: true, message: 'Import complete', data: summary });
+  } catch (err) {
+    logger.error({ err: err.message }, 'importClients failed');
+    res.status(500).json({ success: false, message: 'Server error importing clients' });
+  }
+};
+
 module.exports = {
   getClients,
   getClientTimeline,
   createClient,
+  importClients,
   updateClient,
   deleteClient
 };

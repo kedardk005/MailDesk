@@ -419,12 +419,39 @@ exports.getAuthUrl = async (req, res) => {
 // @desc    Handle Google OAuth callback
 // @route   GET /api/gmail/oauth/callback
 // @access  Public
+/**
+ * Send the browser back into the app after an OAuth attempt.
+ *
+ * Every failure path here used to `res.send()` plain text, which drops the
+ * person on a bare white page, outside the application, with no link back and
+ * nothing the UI can react to. A Head hitting the allow-list restriction — the
+ * single most likely failure, because an Admin has to authorise their address
+ * first — just saw a wall of text and reported "connecting is broken".
+ *
+ * `reason` is a stable machine code the client maps to its own wording; the
+ * human sentence is NOT passed through the URL, so nothing user-controlled is
+ * reflected into the page. `detail` carries only values we generated
+ * ourselves (an address we just read from Google, a numeric limit).
+ *
+ * @param {import('express').Response} res
+ * @param {String} reason - stable code, e.g. 'not_allow_listed'
+ * @param {String} [detail] - safe extra context for the message
+ * @returns {void}
+ */
+const redirectToApp = (res, reason, detail) => {
+  const base = require('../utils/frontendUrl').primaryAppUrl();
+  const params = new URLSearchParams({ gmail: reason === 'connected' ? 'connected' : 'error' });
+  if (reason !== 'connected') params.set('reason', reason);
+  if (detail) params.set('detail', String(detail).slice(0, 200));
+  return res.redirect(`${base}/inbox?${params.toString()}`);
+};
+
 exports.handleOAuthCallback = async (req, res) => {
   try {
     const { code, state } = req.query;
 
     if (!code || !state) {
-      return res.status(400).send('Authorization code or state parameter is missing.');
+      return redirectToApp(res, 'missing_code');
     }
 
     // Decode and verify state JWT
@@ -437,7 +464,7 @@ exports.handleOAuthCallback = async (req, res) => {
       mode = decoded.mode;
     } catch (err) {
       logger.warn({ err: err.message }, 'OAuth callback state validation failed');
-      return res.status(400).send('Authorization failed. Invalid or expired state parameter.');
+      return redirectToApp(res, 'bad_state');
     }
 
     let isExtra = mode === 'extra';
@@ -452,12 +479,12 @@ exports.handleOAuthCallback = async (req, res) => {
     // Find user using Mongoose ID passed via OAuth 'state'
     const user = await User.findById(userId).select('+gmailAccessToken +gmailRefreshToken +linkedGmailAccounts');
     if (!user) {
-      return res.status(404).send('User associated with OAuth session not found.');
+      return redirectToApp(res, 'user_not_found');
     }
 
     // Admins and Heads can connect Gmail accounts
     if (user.role !== 'Admin' && user.role !== 'Head') {
-      return res.status(403).send('Access denied. Only Admin and Head users are authorized to connect Gmail accounts.');
+      return redirectToApp(res, 'role_not_permitted');
     }
 
     // Force primary mode for Head role
@@ -479,14 +506,14 @@ exports.handleOAuthCallback = async (req, res) => {
     }
 
     if (!gmailAddress) {
-      return res.status(400).send('Failed to fetch Gmail profile email address. Please make sure Gmail access is enabled.');
+      return redirectToApp(res, 'profile_unavailable');
     }
 
     // Check Head role access restrictions
     if (user.role === 'Head') {
       const allowedList = (user.allowedGmailAccounts || []).map(e => e.toLowerCase().trim()).filter(Boolean);
       if (allowedList.length > 0 && !allowedList.includes(gmailAddress.toLowerCase().trim())) {
-        return res.status(403).send(`Access denied. Admin has not authorized the Gmail account (${gmailAddress}) for your Head user profile.`);
+        return redirectToApp(res, 'not_allow_listed', gmailAddress);
       }
 
       const isExistingAccount = user.gmailEmail === gmailAddress || (user.linkedGmailAccounts || []).some(a => a.gmailEmail === gmailAddress);
@@ -494,7 +521,7 @@ exports.handleOAuthCallback = async (req, res) => {
       const maxLimit = user.maxConnectedAccounts !== undefined ? user.maxConnectedAccounts : 5;
 
       if (!isExistingAccount && currentAccountCount >= maxLimit) {
-        return res.status(403).send(`Account limit reached. Admin has restricted your Head account to a maximum of ${maxLimit} connected Gmail account(s).`);
+        return redirectToApp(res, 'account_limit', maxLimit);
       }
     }
 
@@ -508,12 +535,7 @@ exports.handleOAuthCallback = async (req, res) => {
     }).select('name email');
 
     if (claimedByOther) {
-      return res
-        .status(409)
-        .send(
-          `This Gmail account (${gmailAddress}) is already connected by another user (${claimedByOther.name}). ` +
-            `Ask an administrator to disconnect it there first.`
-        );
+      return redirectToApp(res, 'claimed_by_other', claimedByOther.name);
     }
 
     if (isExtra) {
@@ -573,14 +595,11 @@ exports.handleOAuthCallback = async (req, res) => {
     // prevents the duplicate from being created in the first place, and the
     // sweep is now an explicit Admin action (POST /api/gmail/deduplicate).
 
-    // Redirect to inbox so user sees the new account immediately
-    // primaryAppUrl(), not the raw env: FRONTEND_URL may be an allowlist, and
-    // redirecting to "https://a.com,https://b.com/inbox" lands nowhere.
-    const frontendUrl = require('../utils/frontendUrl').primaryAppUrl();
-    return res.redirect(`${frontendUrl}/inbox?gmail=connected`);
+    // Back to the inbox so the new mailbox is visible straight away.
+    return redirectToApp(res, 'connected');
   } catch (error) {
     logger.error({ err: error.message }, 'OAuth callback exchange failed');
-    return res.status(500).send('Failed to complete Google authentication. Please try again.');
+    return redirectToApp(res, 'unexpected');
   }
 };
 
@@ -2940,7 +2959,7 @@ exports.replyToEmail = async (req, res) => {
 // @access  Private (Admin, Head only)
 exports.bulkAssignEmails = async (req, res) => {
   try {
-    const { emailIds, assignedTo, deadline, priority } = req.body;
+    const { emailIds, assignedTo, deadline, priority, clientName: clientNameOverride, note } = req.body;
 
     if (!emailIds || !Array.isArray(emailIds) || emailIds.length === 0) {
       return res.status(400).json({ message: 'emailIds array is required.' });
@@ -2998,10 +3017,19 @@ exports.bulkAssignEmails = async (req, res) => {
     // This used to store the raw From header ("Name <addr@example>") verbatim,
     // which escaped every per-client counter (they group by client name) and
     // rendered a mangled header in the Tasks UI client column.
-    const clientMatcher = await getClientMatcher();
+    //
+    // An explicit client chosen in the assign dialog wins over the sender
+    // match: the person doing the assigning can see the message and knows
+    // which client it belongs to, which the From address often cannot tell you
+    // (shared mailboxes, agents, portals all send on a client's behalf).
+    const explicitClient = (clientNameOverride || '').trim();
+    const clientMatcher = explicitClient ? null : await getClientMatcher();
+    const assignmentNote = (note || '').trim();
     const operations = [];
     for (const email of emails) {
-      const { clientName } = await resolveClientForSender(email.from, clientMatcher);
+      const clientName = explicitClient
+        ? explicitClient
+        : (await resolveClientForSender(email.from, clientMatcher)).clientName;
       operations.push({
         updateOne: {
           filter: { linkedEmail: email._id },
@@ -3013,6 +3041,14 @@ exports.bulkAssignEmails = async (req, res) => {
               // task links to the email; the body is served only through an
               // authorized email read path.
               description: '',
+              // The handover note goes to Task.notes ("Internal notes"), which
+              // the Tasks drawer already renders and the Tasks form already
+              // edits — so it is visible to the assignee without new UI.
+              //
+              // setOnInsert, not set: re-assigning an email whose task already
+              // exists must not silently overwrite notes somebody has since
+              // written on it.
+              notes: assignmentNote,
               linkedEmail: email._id,
               clientName,
               createdBy: req.user._id,

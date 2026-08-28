@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import { useSearchParams } from 'react-router-dom'
-import { Building2, Pencil, Plus, Search, Trash2, X } from 'lucide-react'
+import { Building2, Pencil, Plus, Search, Trash2, Upload, X } from 'lucide-react'
 
 import api, { getErrorMessage, isCanceled } from '../api/axios'
 import { useAuth } from '../components/AuthProvider'
@@ -25,6 +25,7 @@ import {
   toast,
   useConfirm,
 } from '../components/ui'
+import { ImportClientsDialog } from '../components/ImportClientsDialog'
 import { formatNumber } from '../lib/utils'
 import { useCachedQuery } from '../lib/useCachedQuery'
 
@@ -142,6 +143,7 @@ export default function ClientList() {
   const [searchParams, setSearchParams] = useSearchParams()
 
   const canEdit = isAdmin || isHead
+  const [importOpen, setImportOpen] = useState(false)
   const canDelete = isAdmin
 
   /* -- URL state --------------------------------------------------------- */
@@ -579,9 +581,18 @@ export default function ClientList() {
         description="Client records, their email routing addresses and the work booked against them."
         actions={
           canEdit ? (
-            <Button variant="primary" leftIcon={<Plus className="h-4 w-4" />} onClick={openCreate}>
-              New client
-            </Button>
+            <div className="flex flex-wrap items-center gap-2">
+              <Button
+                variant="secondary"
+                leftIcon={<Upload className="h-4 w-4" />}
+                onClick={() => setImportOpen(true)}
+              >
+                Import
+              </Button>
+              <Button variant="primary" leftIcon={<Plus className="h-4 w-4" />} onClick={openCreate}>
+                New client
+              </Button>
+            </div>
           ) : null
         }
       />
@@ -1006,6 +1017,12 @@ export default function ClientList() {
           </form>
         </DialogContent>
       </Dialog>
+
+      <ImportClientsDialog
+        open={importOpen}
+        onOpenChange={setImportOpen}
+        onImported={reload}
+      />
     </>
   )
 }

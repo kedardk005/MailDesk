@@ -2807,6 +2807,132 @@ const main = async () => {
   check('  ... and on the duplicate URL', (await api('/api/tasks/clients', { token: empToken, method: 'POST', body: { name: 'nope' } })).status === 403);
   await Client.deleteMany({ name: { $in: [m12A, m12B] } });
 
+  console.log('\nClient import: a spreadsheet becomes clients, idempotently');
+
+  /*
+   * The office keeps ~1,000 clients in their practice software and exported
+   * them as a legacy .xls. Adding those by hand was the single biggest
+   * complaint. The browser parses the workbook and posts rows; this endpoint
+   * is what receives them, so it is validated like any other untrusted body.
+   *
+   * The property that matters most is IDEMPOTENCE: the same sheet imported
+   * twice must not produce two of every client. Names in the real export carry
+   * trailing spaces and inconsistent casing, so matching on name alone would
+   * do exactly that. Matching on the practice's own client CODE is what makes
+   * a re-run safe.
+   */
+  const impCode = `SMK${Date.now()}`;
+  const impRows = [
+    { code: `${impCode}A`, name: `Smoke Import Alpha ${impCode}`, address: '1 High Street', phone: '9825041814', sourceStatus: '01' },
+    { code: `${impCode}B`, name: `Smoke Import Beta ${impCode}`, address: '2 Low Street', phone: '9824045289', sourceStatus: '05' }
+  ];
+
+  const imp1 = await api('/api/clients/import', { token: adminToken, method: 'POST', body: { rows: impRows } });
+  check('POST /api/clients/import is 200', imp1.status === 200, `got ${imp1.status} ${JSON.stringify(imp1.json).slice(0, 160)}`);
+  check('  ... and reports what it created', imp1.json?.data?.created === 2, `created=${imp1.json?.data?.created}`);
+
+  const impA = await Client.findOne({ code: `${impCode}A` }).lean();
+  check('the client exists with its code', Boolean(impA), `code=${impCode}A`);
+  check('  ... keeps the address from the sheet', impA?.address === '1 High Street', `address=${impA?.address}`);
+  check('  ... keeps the phone from the sheet', impA?.phone === '9825041814', `phone=${impA?.phone}`);
+  check('  ... is Active regardless of the sheet status code', impA?.status === 'Active', `status=${impA?.status}`);
+  check('  ... preserves the ORIGINAL status code rather than guessing', impA?.sourceStatus === '01', `sourceStatus=${impA?.sourceStatus}`);
+
+  const impBeta = await Client.findOne({ code: `${impCode}B` }).lean();
+  check('a second status code is preserved too, not collapsed', impBeta?.sourceStatus === '05', `sourceStatus=${impBeta?.sourceStatus}`);
+
+  // Re-importing the SAME sheet must update, never duplicate.
+  const imp2 = await api('/api/clients/import', { token: adminToken, method: 'POST', body: { rows: impRows } });
+  check('re-importing the same rows is 200', imp2.status === 200, `got ${imp2.status}`);
+  check('  ... creates NOTHING the second time', imp2.json?.data?.created === 0, `created=${imp2.json?.data?.created}`);
+  check('  ... and reports them as updated', imp2.json?.data?.updated === 2, `updated=${imp2.json?.data?.updated}`);
+  check('the database still holds exactly one of each', (await Client.countDocuments({ code: { $in: [`${impCode}A`, `${impCode}B`] } })) === 2);
+
+  // A changed cell must reach the existing record.
+  const imp3 = await api('/api/clients/import', {
+    token: adminToken,
+    method: 'POST',
+    body: { rows: [{ ...impRows[0], phone: '9999999999' }] }
+  });
+  check('an edited row updates the existing client', imp3.status === 200 && imp3.json?.data?.updated === 1, `updated=${imp3.json?.data?.updated}`);
+  check('  ... and the new value is stored', (await Client.findOne({ code: `${impCode}A` }).lean())?.phone === '9999999999');
+
+  // A sheet that repeats a code within ONE batch must not fail the batch.
+  const dupBatch = await api('/api/clients/import', {
+    token: adminToken,
+    method: 'POST',
+    body: { rows: [
+      { code: `${impCode}C`, name: `Smoke Import Gamma ${impCode}` },
+      { code: `${impCode}C`, name: `Smoke Import Gamma Again ${impCode}` }
+    ] }
+  });
+  check('a code repeated inside one file does not fail the batch', dupBatch.status === 200, `got ${dupBatch.status}`);
+  check('  ... the repeat is skipped and reported', dupBatch.json?.data?.skipped === 1, `skipped=${dupBatch.json?.data?.skipped}`);
+
+  // Validation and permissions.
+  const impBad = await api('/api/clients/import', { token: adminToken, method: 'POST', body: { rows: [{ name: '' }] } });
+  check('a row with no name is 400', impBad.status === 400, `got ${impBad.status}`);
+  check('  ... with field-level detail', Array.isArray(impBad.json?.errors) && impBad.json.errors.length > 0);
+  const impEmpty = await api('/api/clients/import', { token: adminToken, method: 'POST', body: { rows: [] } });
+  check('an empty import is 400, not a silent success', impEmpty.status === 400, `got ${impEmpty.status}`);
+  const impHead = await api('/api/clients/import', { token: headToken, method: 'POST', body: { rows: [{ code: `${impCode}H`, name: `Smoke Import Head ${impCode}` }] } });
+  check('a Head may import, exactly as they may create one by hand', impHead.status === 200, `got ${impHead.status}`);
+  const impEmp = await api('/api/clients/import', { token: empToken, method: 'POST', body: { rows: [{ name: 'nope' }] } });
+  check('an Employee cannot import', impEmp.status === 403, `got ${impEmp.status}`);
+
+  await Client.deleteMany({ code: { $regex: `^${impCode}` } });
+
+  console.log('\nAssign-as-task: an explicit client and a handover note');
+
+  /*
+   * The assign dialog only ever asked for an assignee, a deadline and a
+   * priority. Two things were missing in daily use: the client (the sender
+   * address often belongs to a portal or an agent, not the client the work is
+   * for), and somewhere to say WHY this is being handed over.
+   */
+  const asgClient = `Smoke Assign Client ${Date.now()}`;
+  await api('/api/clients', { token: adminToken, method: 'POST', body: { name: asgClient } });
+  const asgEmployee = await User.findOne({ email: employeeEmail }).select('_id').lean();
+  const asgEmail = await Email.findOne({ deletedAt: null, direction: { $ne: 'outbound' } }).select('_id').lean();
+  if (asgEmail && asgEmployee) {
+    await Task.deleteOne({ linkedEmail: asgEmail._id });
+    const asg = await api('/api/gmail/emails/bulk-assign', {
+      token: adminToken,
+      method: 'POST',
+      body: {
+        emailIds: [String(asgEmail._id)],
+        assignedTo: String(asgEmployee._id),
+        clientName: asgClient,
+        note: 'Client rang about this - needs the revised figures before Friday.'
+      }
+    });
+    check('bulk-assign accepts a client and a note', asg.status === 200, `got ${asg.status} ${JSON.stringify(asg.json).slice(0, 160)}`);
+
+    const asgTask = await Task.findOne({ linkedEmail: asgEmail._id }).lean();
+    check('  ... the chosen client wins over the sender match', asgTask?.clientName === asgClient, `clientName=${asgTask?.clientName}`);
+    check('  ... the note is stored where the Tasks drawer already shows it', asgTask?.notes?.includes('revised figures'), `notes=${String(asgTask?.notes).slice(0, 60)}`);
+
+    // Without an explicit client the sender match must still apply.
+    await Task.deleteOne({ linkedEmail: asgEmail._id });
+    const asgAuto = await api('/api/gmail/emails/bulk-assign', {
+      token: adminToken,
+      method: 'POST',
+      body: { emailIds: [String(asgEmail._id)], assignedTo: String(asgEmployee._id) }
+    });
+    check('omitting the client keeps the sender-matched behaviour', asgAuto.status === 200, `got ${asgAuto.status}`);
+    const autoTask = await Task.findOne({ linkedEmail: asgEmail._id }).lean();
+    check('  ... and clientName is still resolved, not blank', Boolean(autoTask?.clientName), `clientName=${autoTask?.clientName}`);
+    check('  ... with no note when none was given', !autoTask?.notes, `notes=${autoTask?.notes}`);
+
+    const asgLong = await api('/api/gmail/emails/bulk-assign', {
+      token: adminToken,
+      method: 'POST',
+      body: { emailIds: [String(asgEmail._id)], assignedTo: String(asgEmployee._id), note: 'x'.repeat(20001) }
+    });
+    check('an over-long note is 400, not silently truncated', asgLong.status === 400, `got ${asgLong.status}`);
+  }
+  await Client.deleteMany({ name: asgClient });
+
   console.log('\nM-13: every 400 carries field-level detail');
 
   // The headline used to be Zod's raw wire complaint, which names no field.
