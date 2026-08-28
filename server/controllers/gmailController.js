@@ -127,6 +127,20 @@ const GMAIL_TIMEOUT_MS = Number(process.env.GMAIL_TIMEOUT_MS || 20000);
 const GMAIL_MESSAGE_CONCURRENCY = Number(process.env.GMAIL_SYNC_CONCURRENCY || 10);
 const GMAIL_ATTACHMENT_CONCURRENCY = Number(process.env.GMAIL_ATTACHMENT_CONCURRENCY || 5);
 const GMAIL_MAX_RESULTS = Number(process.env.GMAIL_MAX_RESULTS || 150);
+/* Ceiling on ONE sync run, across all pages.
+ *
+ * messages.list was called once with maxResults and no pageToken, so a sync
+ * only ever saw the newest 150 messages and stopped — a mailbox with years of
+ * history was never fully imported, and nothing said so. The list is paginated
+ * now, bounded two ways: this total, and an early exit as soon as a whole page
+ * turns out to be already stored (Gmail returns newest-first, so a fully known
+ * page means we have caught up with history).
+ *
+ * The result: the FIRST sync of a mailbox walks back through history up to
+ * this many messages, while every routine sync afterwards still costs one or
+ * two pages. Raise it to backfill more, at the cost of a slower first run and
+ * more Gmail quota. */
+const GMAIL_SYNC_MAX_MESSAGES = Number(process.env.GMAIL_SYNC_MAX_MESSAGES || 1000);
 
 /**
  * Every outbound Gmail call goes through here: a hard timeout (gaxios has NONE
@@ -419,12 +433,39 @@ exports.getAuthUrl = async (req, res) => {
 // @desc    Handle Google OAuth callback
 // @route   GET /api/gmail/oauth/callback
 // @access  Public
+/**
+ * Send the browser back into the app after an OAuth attempt.
+ *
+ * Every failure path here used to `res.send()` plain text, which drops the
+ * person on a bare white page, outside the application, with no link back and
+ * nothing the UI can react to. A Head hitting the allow-list restriction — the
+ * single most likely failure, because an Admin has to authorise their address
+ * first — just saw a wall of text and reported "connecting is broken".
+ *
+ * `reason` is a stable machine code the client maps to its own wording; the
+ * human sentence is NOT passed through the URL, so nothing user-controlled is
+ * reflected into the page. `detail` carries only values we generated
+ * ourselves (an address we just read from Google, a numeric limit).
+ *
+ * @param {import('express').Response} res
+ * @param {String} reason - stable code, e.g. 'not_allow_listed'
+ * @param {String} [detail] - safe extra context for the message
+ * @returns {void}
+ */
+const redirectToApp = (res, reason, detail) => {
+  const base = require('../utils/frontendUrl').primaryAppUrl();
+  const params = new URLSearchParams({ gmail: reason === 'connected' ? 'connected' : 'error' });
+  if (reason !== 'connected') params.set('reason', reason);
+  if (detail) params.set('detail', String(detail).slice(0, 200));
+  return res.redirect(`${base}/inbox?${params.toString()}`);
+};
+
 exports.handleOAuthCallback = async (req, res) => {
   try {
     const { code, state } = req.query;
 
     if (!code || !state) {
-      return res.status(400).send('Authorization code or state parameter is missing.');
+      return redirectToApp(res, 'missing_code');
     }
 
     // Decode and verify state JWT
@@ -437,7 +478,7 @@ exports.handleOAuthCallback = async (req, res) => {
       mode = decoded.mode;
     } catch (err) {
       logger.warn({ err: err.message }, 'OAuth callback state validation failed');
-      return res.status(400).send('Authorization failed. Invalid or expired state parameter.');
+      return redirectToApp(res, 'bad_state');
     }
 
     let isExtra = mode === 'extra';
@@ -452,12 +493,12 @@ exports.handleOAuthCallback = async (req, res) => {
     // Find user using Mongoose ID passed via OAuth 'state'
     const user = await User.findById(userId).select('+gmailAccessToken +gmailRefreshToken +linkedGmailAccounts');
     if (!user) {
-      return res.status(404).send('User associated with OAuth session not found.');
+      return redirectToApp(res, 'user_not_found');
     }
 
     // Admins and Heads can connect Gmail accounts
     if (user.role !== 'Admin' && user.role !== 'Head') {
-      return res.status(403).send('Access denied. Only Admin and Head users are authorized to connect Gmail accounts.');
+      return redirectToApp(res, 'role_not_permitted');
     }
 
     // Force primary mode for Head role
@@ -479,14 +520,14 @@ exports.handleOAuthCallback = async (req, res) => {
     }
 
     if (!gmailAddress) {
-      return res.status(400).send('Failed to fetch Gmail profile email address. Please make sure Gmail access is enabled.');
+      return redirectToApp(res, 'profile_unavailable');
     }
 
     // Check Head role access restrictions
     if (user.role === 'Head') {
       const allowedList = (user.allowedGmailAccounts || []).map(e => e.toLowerCase().trim()).filter(Boolean);
       if (allowedList.length > 0 && !allowedList.includes(gmailAddress.toLowerCase().trim())) {
-        return res.status(403).send(`Access denied. Admin has not authorized the Gmail account (${gmailAddress}) for your Head user profile.`);
+        return redirectToApp(res, 'not_allow_listed', gmailAddress);
       }
 
       const isExistingAccount = user.gmailEmail === gmailAddress || (user.linkedGmailAccounts || []).some(a => a.gmailEmail === gmailAddress);
@@ -494,7 +535,7 @@ exports.handleOAuthCallback = async (req, res) => {
       const maxLimit = user.maxConnectedAccounts !== undefined ? user.maxConnectedAccounts : 5;
 
       if (!isExistingAccount && currentAccountCount >= maxLimit) {
-        return res.status(403).send(`Account limit reached. Admin has restricted your Head account to a maximum of ${maxLimit} connected Gmail account(s).`);
+        return redirectToApp(res, 'account_limit', maxLimit);
       }
     }
 
@@ -508,12 +549,7 @@ exports.handleOAuthCallback = async (req, res) => {
     }).select('name email');
 
     if (claimedByOther) {
-      return res
-        .status(409)
-        .send(
-          `This Gmail account (${gmailAddress}) is already connected by another user (${claimedByOther.name}). ` +
-            `Ask an administrator to disconnect it there first.`
-        );
+      return redirectToApp(res, 'claimed_by_other', claimedByOther.name);
     }
 
     if (isExtra) {
@@ -573,14 +609,11 @@ exports.handleOAuthCallback = async (req, res) => {
     // prevents the duplicate from being created in the first place, and the
     // sweep is now an explicit Admin action (POST /api/gmail/deduplicate).
 
-    // Redirect to inbox so user sees the new account immediately
-    // primaryAppUrl(), not the raw env: FRONTEND_URL may be an allowlist, and
-    // redirecting to "https://a.com,https://b.com/inbox" lands nowhere.
-    const frontendUrl = require('../utils/frontendUrl').primaryAppUrl();
-    return res.redirect(`${frontendUrl}/inbox?gmail=connected`);
+    // Back to the inbox so the new mailbox is visible straight away.
+    return redirectToApp(res, 'connected');
   } catch (error) {
     logger.error({ err: error.message }, 'OAuth callback exchange failed');
-    return res.status(500).send('Failed to complete Google authentication. Please try again.');
+    return redirectToApp(res, 'unexpected');
   }
 };
 
@@ -803,20 +836,27 @@ const buildEmailDocument = async ({ gmail, message, inboxEmail, userId, rules, c
  * @param {Object} params
  * @returns {Promise<{inbox: String, newCount: Number, failed: Number, scanned: Number}>}
  */
-const syncAccountEmails = async ({ userId, accessToken, refreshToken, inboxEmail, isPrimary, onProgress }) => {
+const syncAccountPage = async ({ userId, accessToken, refreshToken, inboxEmail, isPrimary, onProgress, pageToken }) => {
   const { gmail } = buildGmailClient({ userId, accessToken, refreshToken, inboxEmail, isPrimary });
 
   const listRes = await gmailCall(
     () =>
       gmail.users.messages.list(
-        { userId: 'me', maxResults: GMAIL_MAX_RESULTS, includeSpamTrash: true },
+        {
+          userId: 'me',
+          maxResults: GMAIL_MAX_RESULTS,
+          includeSpamTrash: true,
+          ...(pageToken ? { pageToken } : {})
+        },
         GMAIL_REQUEST_OPTIONS
       ),
     'messages.list'
   );
 
+  const nextPageToken = listRes.data.nextPageToken || null;
+
   const messages = listRes.data.messages || [];
-  if (messages.length === 0) return { inbox: inboxEmail, newCount: 0, failed: 0, scanned: 0 };
+  if (messages.length === 0) return { inbox: inboxEmail, newCount: 0, failed: 0, scanned: 0, pageNew: 0, nextPageToken };
 
   // One indexed query instead of a per-message existence check.
   const messageIds = messages.map((m) => m.id);
@@ -824,7 +864,7 @@ const syncAccountEmails = async ({ userId, accessToken, refreshToken, inboxEmail
   const pending = messages.filter((m) => !existingIds.has(m.id));
 
   logger.info({ inbox: inboxEmail, listed: messages.length, new: pending.length }, 'gmail sync starting');
-  if (pending.length === 0) return { inbox: inboxEmail, newCount: 0, failed: 0, scanned: messages.length };
+  if (pending.length === 0) return { inbox: inboxEmail, newCount: 0, failed: 0, scanned: messages.length, pageNew: 0, nextPageToken };
 
   const [rules, clientMatcher] = await Promise.all([getActiveKeywordRules(), getClientMatcher()]);
 
@@ -864,7 +904,7 @@ const syncAccountEmails = async ({ userId, accessToken, refreshToken, inboxEmail
   );
 
   const docs = settled.filter(Boolean);
-  if (docs.length === 0) return { inbox: inboxEmail, newCount: 0, failed, scanned: messages.length };
+  if (docs.length === 0) return { inbox: inboxEmail, newCount: 0, failed, scanned: messages.length, pageNew: pending.length, nextPageToken };
 
   // `ordered: false` makes a duplicate messageId (two syncs racing, or two
   // replicas on the same cron tick) SKIP rather than abort the whole batch.
@@ -904,7 +944,89 @@ const syncAccountEmails = async ({ userId, accessToken, refreshToken, inboxEmail
   }
 
   logger.info({ inbox: inboxEmail, inserted, failed }, 'gmail sync finished');
-  return { inbox: inboxEmail, newCount: inserted, failed, scanned: messages.length };
+  return { inbox: inboxEmail, newCount: inserted, failed, scanned: messages.length, pageNew: pending.length, nextPageToken };
+};
+
+/**
+ * Should the sync stop after this page?
+ *
+ * Extracted and exported so the stopping rules are directly testable: a bug in
+ * this loop either abandons mail silently or walks a mailbox forever burning
+ * Gmail quota, and neither is visible from an HTTP-level test.
+ *
+ * @param {Object} p
+ * @param {String|null} p.nextPageToken  what Gmail says comes next
+ * @param {Number} p.pageScanned         messages listed on this page
+ * @param {Number} p.pageNew             of those, how many we had not stored
+ * @param {Number} p.scannedTotal        messages listed this run, all pages
+ * @param {Number} p.ceiling             GMAIL_SYNC_MAX_MESSAGES
+ * @returns {{stop: Boolean, reason: String}}
+ */
+exports.shouldStopPaging = ({ nextPageToken, pageScanned, pageNew, scannedTotal, ceiling }) => {
+  if (!nextPageToken) return { stop: true, reason: 'no_more_pages' };
+  // Gmail lists newest-first, so a page with nothing new means we have reached
+  // history we already hold — and everything older is held too.
+  if (pageScanned > 0 && pageNew === 0) return { stop: true, reason: 'caught_up' };
+  if (scannedTotal >= ceiling) return { stop: true, reason: 'ceiling' };
+  return { stop: false, reason: 'continue' };
+};
+
+/**
+ * Sync one mailbox, walking back through history a page at a time.
+ *
+ * Gmail returns messages newest-first. The loop stops at whichever comes
+ * first:
+ *
+ *   - Gmail reports no further page;
+ *   - a whole page contained nothing new, which means we have reached
+ *     already-stored history and everything older is stored too;
+ *   - GMAIL_SYNC_MAX_MESSAGES have been scanned.
+ *
+ * The middle condition is what keeps this cheap. A first sync walks back to
+ * the ceiling; every routine sync afterwards finds the handful of new messages
+ * on page one, sees page two is entirely known, and stops — so the common case
+ * costs one extra list call, not a full re-scan.
+ *
+ * The signature and return shape are unchanged for callers.
+ *
+ * @param {Object} params
+ * @returns {Promise<{inbox: String, newCount: Number, failed: Number, scanned: Number}>}
+ */
+const syncAccountEmails = async (params) => {
+  let pageToken = null;
+  let newCount = 0;
+  let failed = 0;
+  let scanned = 0;
+  let pages = 0;
+
+  for (;;) {
+    const page = await syncAccountPage({ ...params, pageToken });
+    pages += 1;
+    newCount += page.newCount;
+    failed += page.failed;
+    scanned += page.scanned;
+
+    const verdict = exports.shouldStopPaging({
+      nextPageToken: page.nextPageToken,
+      pageScanned: page.scanned,
+      pageNew: page.pageNew,
+      scannedTotal: scanned,
+      ceiling: GMAIL_SYNC_MAX_MESSAGES
+    });
+    if (verdict.stop) {
+      if (verdict.reason === 'ceiling') {
+        logger.info(
+          { inbox: params.inboxEmail, scanned, ceiling: GMAIL_SYNC_MAX_MESSAGES },
+          'gmail sync stopped at the per-run ceiling; older mail arrives on the next run'
+        );
+      }
+      break;
+    }
+    pageToken = page.nextPageToken;
+  }
+
+  logger.info({ inbox: params.inboxEmail, pages, scanned, newCount, failed }, 'gmail sync finished');
+  return { inbox: params.inboxEmail, newCount, failed, scanned };
 };
 
 /**
@@ -2940,7 +3062,7 @@ exports.replyToEmail = async (req, res) => {
 // @access  Private (Admin, Head only)
 exports.bulkAssignEmails = async (req, res) => {
   try {
-    const { emailIds, assignedTo, deadline, priority } = req.body;
+    const { emailIds, assignedTo, deadline, priority, clientName: clientNameOverride, note } = req.body;
 
     if (!emailIds || !Array.isArray(emailIds) || emailIds.length === 0) {
       return res.status(400).json({ message: 'emailIds array is required.' });
@@ -2998,10 +3120,19 @@ exports.bulkAssignEmails = async (req, res) => {
     // This used to store the raw From header ("Name <addr@example>") verbatim,
     // which escaped every per-client counter (they group by client name) and
     // rendered a mangled header in the Tasks UI client column.
-    const clientMatcher = await getClientMatcher();
+    //
+    // An explicit client chosen in the assign dialog wins over the sender
+    // match: the person doing the assigning can see the message and knows
+    // which client it belongs to, which the From address often cannot tell you
+    // (shared mailboxes, agents, portals all send on a client's behalf).
+    const explicitClient = (clientNameOverride || '').trim();
+    const clientMatcher = explicitClient ? null : await getClientMatcher();
+    const assignmentNote = (note || '').trim();
     const operations = [];
     for (const email of emails) {
-      const { clientName } = await resolveClientForSender(email.from, clientMatcher);
+      const clientName = explicitClient
+        ? explicitClient
+        : (await resolveClientForSender(email.from, clientMatcher)).clientName;
       operations.push({
         updateOne: {
           filter: { linkedEmail: email._id },
@@ -3013,6 +3144,14 @@ exports.bulkAssignEmails = async (req, res) => {
               // task links to the email; the body is served only through an
               // authorized email read path.
               description: '',
+              // The handover note goes to Task.notes ("Internal notes"), which
+              // the Tasks drawer already renders and the Tasks form already
+              // edits — so it is visible to the assignee without new UI.
+              //
+              // setOnInsert, not set: re-assigning an email whose task already
+              // exists must not silently overwrite notes somebody has since
+              // written on it.
+              notes: assignmentNote,
               linkedEmail: email._id,
               clientName,
               createdBy: req.user._id,

@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import { useSearchParams } from 'react-router-dom'
-import { Building2, Pencil, Plus, Search, Trash2, X } from 'lucide-react'
+import { Building2, Pencil, Plus, Search, Tags, Trash2, Upload, X } from 'lucide-react'
 
 import api, { getErrorMessage, isCanceled } from '../api/axios'
 import { useAuth } from '../components/AuthProvider'
@@ -25,6 +25,8 @@ import {
   toast,
   useConfirm,
 } from '../components/ui'
+import { ImportClientsDialog } from '../components/ImportClientsDialog'
+import { ClientStatusCodesDialog } from '../components/ClientStatusCodesDialog'
 import { formatNumber } from '../lib/utils'
 import { useCachedQuery } from '../lib/useCachedQuery'
 
@@ -44,6 +46,8 @@ const STATUS_OPTIONS = [
 
 const EMPTY_FORM = {
   name: '',
+  code: '',
+  address: '',
   contactPerson: '',
   email: '',
   phone: '',
@@ -142,6 +146,8 @@ export default function ClientList() {
   const [searchParams, setSearchParams] = useSearchParams()
 
   const canEdit = isAdmin || isHead
+  const [importOpen, setImportOpen] = useState(false)
+  const [codesOpen, setCodesOpen] = useState(false)
   const canDelete = isAdmin
 
   /* -- URL state --------------------------------------------------------- */
@@ -341,6 +347,8 @@ export default function ClientList() {
     setEditing(client)
     setForm({
       name: typeof client?.name === 'string' ? client.name : '',
+      code: client?.code || '',
+      address: client?.address || '',
       contactPerson: client?.contactPerson || '',
       email: client?.email || '',
       phone: client?.phone || '',
@@ -386,6 +394,8 @@ export default function ClientList() {
 
     const body = {
       name: form.name.trim(),
+      code: form.code.trim(),
+      address: form.address.trim(),
       contactPerson: form.contactPerson.trim(),
       email: form.email.trim(),
       phone: form.phone.trim(),
@@ -462,6 +472,17 @@ export default function ClientList() {
             </div>
           )
         },
+      },
+      {
+        accessorKey: 'code',
+        header: 'Code',
+        /* The practice identifies clients by code, so it earns a column — and
+         * it is what the importer matches on, which makes a wrong or missing
+         * one worth being able to see. Narrow: codes are a few characters. */
+        meta: { width: '96px' },
+        cell: ({ row }) => (
+          <span className="font-mono text-xs text-fg-2">{row.original?.code || '—'}</span>
+        ),
       },
       {
         accessorKey: 'email',
@@ -579,9 +600,25 @@ export default function ClientList() {
         description="Client records, their email routing addresses and the work booked against them."
         actions={
           canEdit ? (
-            <Button variant="primary" leftIcon={<Plus className="h-4 w-4" />} onClick={openCreate}>
-              New client
-            </Button>
+            <div className="flex flex-wrap items-center gap-2">
+              <Button
+                variant="secondary"
+                leftIcon={<Tags className="h-4 w-4" />}
+                onClick={() => setCodesOpen(true)}
+              >
+                Status codes
+              </Button>
+              <Button
+                variant="secondary"
+                leftIcon={<Upload className="h-4 w-4" />}
+                onClick={() => setImportOpen(true)}
+              >
+                Import
+              </Button>
+              <Button variant="primary" leftIcon={<Plus className="h-4 w-4" />} onClick={openCreate}>
+                New client
+              </Button>
+            </div>
           ) : null
         }
       />
@@ -945,6 +982,35 @@ export default function ClientList() {
               </FormField>
             </div>
 
+            <div className="grid gap-4 sm:grid-cols-2">
+              <FormField
+                label="Client code"
+                optionalText="(optional)"
+                error={formErrors.code}
+                hint="Your own reference. Spreadsheet imports match on this."
+              >
+                {(field) => (
+                  <Input
+                    {...field}
+                    placeholder="e.g. 138B"
+                    value={form.code}
+                    onChange={(e) => setForm((p) => ({ ...p, code: e.target.value }))}
+                  />
+                )}
+              </FormField>
+
+              <FormField label="Address" optionalText="(optional)" error={formErrors.address}>
+                {(field) => (
+                  <Input
+                    {...field}
+                    placeholder="Street, town, postcode"
+                    value={form.address}
+                    onChange={(e) => setForm((p) => ({ ...p, address: e.target.value }))}
+                  />
+                )}
+              </FormField>
+            </div>
+
             <FormField
               label="Additional email addresses"
               error={formErrors.associatedEmails}
@@ -1006,6 +1072,18 @@ export default function ClientList() {
           </form>
         </DialogContent>
       </Dialog>
+
+      <ImportClientsDialog
+        open={importOpen}
+        onOpenChange={setImportOpen}
+        onImported={reload}
+      />
+
+      <ClientStatusCodesDialog
+        open={codesOpen}
+        onOpenChange={setCodesOpen}
+        onChanged={reload}
+      />
     </>
   )
 }

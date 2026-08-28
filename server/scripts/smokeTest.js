@@ -134,9 +134,13 @@ const check = (name, ok, detail = '') => {
   }
 };
 
-const api = async (path, { token, method = 'GET', body, headers = {} } = {}) => {
+const api = async (path, { token, method = 'GET', body, headers = {}, redirect } = {}) => {
   const res = await fetch(`${BASE}${path}`, {
     method,
+    // `redirect: 'manual'` lets a caller assert on a 3xx and its Location
+    // rather than silently following it, which is the only way to test that an
+    // endpoint redirects somewhere specific.
+    ...(redirect ? { redirect } : {}),
     headers: {
       'Content-Type': 'application/json',
       ...(token ? { Authorization: `Bearer ${token}` } : {}),
@@ -170,7 +174,7 @@ const api = async (path, { token, method = 'GET', body, headers = {} } = {}) => 
     process.exit(2);
   }
 
-  return { status: res.status, json };
+  return { status: res.status, json, location: res.headers.get('location') };
 };
 
 /**
@@ -2806,6 +2810,299 @@ const main = async () => {
   check('an Employee is refused on both create URLs', (await api('/api/clients', { token: empToken, method: 'POST', body: { name: 'nope' } })).status === 403);
   check('  ... and on the duplicate URL', (await api('/api/tasks/clients', { token: empToken, method: 'POST', body: { name: 'nope' } })).status === 403);
   await Client.deleteMany({ name: { $in: [m12A, m12B] } });
+
+  console.log('\nGmail sync pages through history instead of stopping at 150');
+
+  /*
+   * messages.list was called once with maxResults and no pageToken, so a sync
+   * only ever saw the newest 150 messages. A mailbox with years of history was
+   * never fully imported and nothing reported a problem — it simply looked
+   * like mail was missing.
+   *
+   * The loop that fixes it is the dangerous kind: get it wrong and it either
+   * abandons mail silently or walks a mailbox forever burning Gmail quota.
+   * Neither is visible from an HTTP test, so the stopping rules are exported
+   * and asserted directly.
+   */
+  {
+    const { shouldStopPaging } = require('../controllers/gmailController');
+    const reason = (o) => shouldStopPaging(o).reason;
+    const base = { pageScanned: 150, pageNew: 150, scannedTotal: 300, ceiling: 1000 };
+
+    check('no further page stops the run', reason({ ...base, nextPageToken: null }) === 'no_more_pages');
+    check('a page with nothing new means we have caught up', reason({ ...base, nextPageToken: 't', pageNew: 0 }) === 'caught_up');
+    check('a page with new mail keeps going', reason({ ...base, nextPageToken: 't', pageNew: 3 }) === 'continue');
+    check('the per-run ceiling stops the run', reason({ ...base, nextPageToken: 't', scannedTotal: 1000 }) === 'ceiling');
+    check('one message below the ceiling still continues', reason({ ...base, nextPageToken: 't', scannedTotal: 999 }) === 'continue');
+    check('an EMPTY page is not mistaken for caught-up', reason({ nextPageToken: 't', pageScanned: 0, pageNew: 0, scannedTotal: 0, ceiling: 1000 }) === 'continue');
+
+    // The property that matters: a first sync of a huge mailbox terminates.
+    let pages = 0, scanned = 0;
+    for (;;) {
+      pages += 1; scanned += 150;
+      if (shouldStopPaging({ nextPageToken: 't', pageScanned: 150, pageNew: 150, scannedTotal: scanned, ceiling: 1000 }).stop) break;
+      if (pages > 100) break;
+    }
+    check('a first sync is BOUNDED, never a runaway', pages <= 8, `stopped after ${pages} pages / ${scanned} messages`);
+
+    // ...and the routine case stays cheap.
+    let steady = 0; scanned = 0;
+    for (;;) {
+      steady += 1; scanned += 150;
+      const pageNew = steady === 1 ? 4 : 0;
+      if (shouldStopPaging({ nextPageToken: 't', pageScanned: 150, pageNew, scannedTotal: scanned, ceiling: 1000 }).stop) break;
+      if (steady > 100) break;
+    }
+    check('a routine sync costs two pages, not a re-scan', steady === 2, `pages=${steady}`);
+  }
+
+  console.log('\nGmail OAuth callback returns the user to the app, never a blank page');
+
+  /*
+   * All nine failure exits used to answer res.send(plain text): the person
+   * ended up on a bare white page of server prose, outside the application,
+   * with no link back — and the UI could not react, because nothing came back
+   * to it. The likeliest failure is a Head whose address an Admin has not
+   * allow-listed, which is a configuration step rather than a fault, and it
+   * read as "connecting Gmail is broken".
+   *
+   * The reason is a stable CODE and the client owns the wording, so nothing
+   * user-controlled is reflected into the page.
+   */
+  const cbNoCode = await api('/api/gmail/oauth/callback', { redirect: 'manual' });
+  check('the callback redirects instead of printing text', cbNoCode.status === 302, `got ${cbNoCode.status}`);
+  check('  ... and names a machine-readable reason', String(cbNoCode.location || '').includes('gmail=error&reason=missing_code'), `location=${cbNoCode.location}`);
+
+  const cbBadState = await api('/api/gmail/oauth/callback?code=x&state=garbage', { redirect: 'manual' });
+  check('an expired or forged state also redirects', cbBadState.status === 302, `got ${cbBadState.status}`);
+  check('  ... with its own reason, not a generic one', String(cbBadState.location || '').includes('reason=bad_state'), `location=${cbBadState.location}`);
+  check('  ... and lands back on the inbox', String(cbBadState.location || '').includes('/inbox?'), `location=${cbBadState.location}`);
+
+  console.log('\nClient import: a spreadsheet becomes clients, idempotently');
+
+  /*
+   * The office keeps ~1,000 clients in their practice software and exported
+   * them as a legacy .xls. Adding those by hand was the single biggest
+   * complaint. The browser parses the workbook and posts rows; this endpoint
+   * is what receives them, so it is validated like any other untrusted body.
+   *
+   * The property that matters most is IDEMPOTENCE: the same sheet imported
+   * twice must not produce two of every client. Names in the real export carry
+   * trailing spaces and inconsistent casing, so matching on name alone would
+   * do exactly that. Matching on the practice's own client CODE is what makes
+   * a re-run safe.
+   */
+  const impCode = `SMK${Date.now()}`;
+  const impRows = [
+    { code: `${impCode}A`, name: `Smoke Import Alpha ${impCode}`, address: '1 High Street', phone: '9825041814', sourceStatus: '01' },
+    { code: `${impCode}B`, name: `Smoke Import Beta ${impCode}`, address: '2 Low Street', phone: '9824045289', sourceStatus: '05' }
+  ];
+
+  const imp1 = await api('/api/clients/import', { token: adminToken, method: 'POST', body: { rows: impRows } });
+  check('POST /api/clients/import is 200', imp1.status === 200, `got ${imp1.status} ${JSON.stringify(imp1.json).slice(0, 160)}`);
+  check('  ... and reports what it created', imp1.json?.data?.created === 2, `created=${imp1.json?.data?.created}`);
+
+  const impA = await Client.findOne({ code: `${impCode}A` }).lean();
+  check('the client exists with its code', Boolean(impA), `code=${impCode}A`);
+  check('  ... keeps the address from the sheet', impA?.address === '1 High Street', `address=${impA?.address}`);
+  check('  ... keeps the phone from the sheet', impA?.phone === '9825041814', `phone=${impA?.phone}`);
+  check('  ... is Active regardless of the sheet status code', impA?.status === 'Active', `status=${impA?.status}`);
+  check('  ... preserves the ORIGINAL status code rather than guessing', impA?.sourceStatus === '01', `sourceStatus=${impA?.sourceStatus}`);
+
+  const impBeta = await Client.findOne({ code: `${impCode}B` }).lean();
+  check('a second status code is preserved too, not collapsed', impBeta?.sourceStatus === '05', `sourceStatus=${impBeta?.sourceStatus}`);
+
+  // Re-importing the SAME sheet must update, never duplicate.
+  const imp2 = await api('/api/clients/import', { token: adminToken, method: 'POST', body: { rows: impRows } });
+  check('re-importing the same rows is 200', imp2.status === 200, `got ${imp2.status}`);
+  check('  ... creates NOTHING the second time', imp2.json?.data?.created === 0, `created=${imp2.json?.data?.created}`);
+  check('  ... and reports them as updated', imp2.json?.data?.updated === 2, `updated=${imp2.json?.data?.updated}`);
+  check('the database still holds exactly one of each', (await Client.countDocuments({ code: { $in: [`${impCode}A`, `${impCode}B`] } })) === 2);
+
+  // A changed cell must reach the existing record.
+  const imp3 = await api('/api/clients/import', {
+    token: adminToken,
+    method: 'POST',
+    body: { rows: [{ ...impRows[0], phone: '9999999999' }] }
+  });
+  check('an edited row updates the existing client', imp3.status === 200 && imp3.json?.data?.updated === 1, `updated=${imp3.json?.data?.updated}`);
+  check('  ... and the new value is stored', (await Client.findOne({ code: `${impCode}A` }).lean())?.phone === '9999999999');
+
+  // A sheet that repeats a code within ONE batch must not fail the batch.
+  const dupBatch = await api('/api/clients/import', {
+    token: adminToken,
+    method: 'POST',
+    body: { rows: [
+      { code: `${impCode}C`, name: `Smoke Import Gamma ${impCode}` },
+      { code: `${impCode}C`, name: `Smoke Import Gamma Again ${impCode}` }
+    ] }
+  });
+  check('a code repeated inside one file does not fail the batch', dupBatch.status === 200, `got ${dupBatch.status}`);
+  check('  ... the repeat is skipped and reported', dupBatch.json?.data?.skipped === 1, `skipped=${dupBatch.json?.data?.skipped}`);
+
+  // Validation and permissions.
+  const impBad = await api('/api/clients/import', { token: adminToken, method: 'POST', body: { rows: [{ name: '' }] } });
+  check('a row with no name is 400', impBad.status === 400, `got ${impBad.status}`);
+  check('  ... with field-level detail', Array.isArray(impBad.json?.errors) && impBad.json.errors.length > 0);
+  const impEmpty = await api('/api/clients/import', { token: adminToken, method: 'POST', body: { rows: [] } });
+  check('an empty import is 400, not a silent success', impEmpty.status === 400, `got ${impEmpty.status}`);
+  const impHead = await api('/api/clients/import', { token: headToken, method: 'POST', body: { rows: [{ code: `${impCode}H`, name: `Smoke Import Head ${impCode}` }] } });
+  check('a Head may import, exactly as they may create one by hand', impHead.status === 200, `got ${impHead.status}`);
+  const impEmp = await api('/api/clients/import', { token: empToken, method: 'POST', body: { rows: [{ name: 'nope' }] } });
+  check('an Employee cannot import', impEmp.status === 403, `got ${impEmp.status}`);
+
+  // An imported client must be editable by hand afterwards. Adding the fields
+  // to the model without adding them to create/update would leave every
+  // imported code and address permanently read-only in the UI.
+  const hand = await api('/api/clients', {
+    token: adminToken, method: 'POST',
+    body: { name: `Smoke Hand ${impCode}`, code: `${impCode}HAND`, address: '9 Hand Lane' }
+  });
+  check('a client created by hand accepts a code and address', hand.status === 201, `got ${hand.status}`);
+  const handDoc = await Client.findOne({ code: `${impCode}HAND` }).lean();
+  check('  ... and both are stored', handDoc?.address === '9 Hand Lane', `address=${handDoc?.address}`);
+  const handPut = await api(`/api/clients/${handDoc?._id}`, {
+    token: adminToken, method: 'PUT', body: { code: `${impCode}EDIT`, address: '10 Edited Way' }
+  });
+  check('an existing client\'s code can be corrected', handPut.status === 200, `got ${handPut.status}`);
+  const handAfter = await Client.findOne({ _id: handDoc?._id }).lean();
+  check('  ... the new code is stored', handAfter?.code === `${impCode}EDIT`, `code=${handAfter?.code}`);
+  check('  ... and the new address too', handAfter?.address === '10 Edited Way', `address=${handAfter?.address}`);
+
+  // Two clients must not be able to share a code.
+  const clash = await api('/api/clients', {
+    token: adminToken, method: 'POST',
+    body: { name: `Smoke Clash ${impCode}`, code: `${impCode}EDIT` }
+  });
+  check('a duplicate client code is refused', clash.status === 400, `got ${clash.status}`);
+  check('  ... blamed on the code field', JSON.stringify(clash.json?.errors || []).includes('code'), JSON.stringify(clash.json?.errors || []).slice(0, 120));
+
+  // ...but many clients WITHOUT a code must still coexist: the index is
+  // partial, and a plain unique index would reject all but the first.
+  const noCodeA = await api('/api/clients', { token: adminToken, method: 'POST', body: { name: `Smoke NoCode A ${impCode}` } });
+  const noCodeB = await api('/api/clients', { token: adminToken, method: 'POST', body: { name: `Smoke NoCode B ${impCode}` } });
+  check('two clients with no code can both exist', noCodeA.status === 201 && noCodeB.status === 201, `${noCodeA.status}/${noCodeB.status}`);
+
+  await Client.deleteMany({ name: { $regex: `Smoke (Hand|Clash|NoCode)` } });
+  // Bulk status by imported code.
+  //
+  // Everything imports as Active because the sheet's codes (01/03/05/08/14) are
+  // the practice's business rules, not ours, and guessing which mean "closed"
+  // would silently hide live clients. This is how that decision gets made
+  // afterwards — once, by someone who knows — instead of opening 165 clients
+  // one at a time. Keyed on the CODE because that is the only durable way to
+  // name the group without selecting every row by hand.
+  const codesRes = await api('/api/clients/status-codes', { token: adminToken });
+  check('GET /api/clients/status-codes: 200', codesRes.status === 200, `got ${codesRes.status}`);
+  const codeRow = (codesRes.json?.data || []).find((r) => r.sourceStatus === '01');
+  check('the imported codes are reported with counts', Boolean(codeRow), JSON.stringify(codesRes.json?.data || []).slice(0, 140));
+  check('  ... and everything imported is Active to begin with', codeRow?.active === codeRow?.total, `active=${codeRow?.active} total=${codeRow?.total}`);
+
+  const bulk = await api('/api/clients/bulk-status', {
+    token: adminToken, method: 'PUT', body: { sourceStatus: '01', status: 'Inactive' }
+  });
+  check('PUT /api/clients/bulk-status: 200', bulk.status === 200, `got ${bulk.status} ${JSON.stringify(bulk.json).slice(0, 140)}`);
+  check('  ... reports how many it changed', bulk.json?.data?.modified >= 1, `modified=${bulk.json?.data?.modified}`);
+  check('  ... and every client on that code moved', (await Client.countDocuments({ sourceStatus: '01', status: 'Active' })) === 0);
+  check('  ... while a DIFFERENT code is untouched', (await Client.countDocuments({ sourceStatus: '05', status: 'Active' })) >= 1);
+
+  // Reversible: the code itself is never rewritten, so running it back works.
+  const back = await api('/api/clients/bulk-status', {
+    token: adminToken, method: 'PUT', body: { sourceStatus: '01', status: 'Active' }
+  });
+  check('running it back restores them', back.status === 200 && (await Client.countDocuments({ sourceStatus: '01', status: 'Inactive' })) === 0);
+
+  // Re-applying the same status is not an error, and says so honestly.
+  const again = await api('/api/clients/bulk-status', {
+    token: adminToken, method: 'PUT', body: { sourceStatus: '01', status: 'Active' }
+  });
+  check('re-applying the same status is 200, not a failure', again.status === 200, `got ${again.status}`);
+  check('  ... matched is reported even when modified is 0', again.json?.data?.matched >= 1 && again.json?.data?.modified === 0, `matched=${again.json?.data?.matched} modified=${again.json?.data?.modified}`);
+
+  const unknownCode = await api('/api/clients/bulk-status', {
+    token: adminToken, method: 'PUT', body: { sourceStatus: 'NOPE', status: 'Inactive' }
+  });
+  check('an unknown code is 400, not a silent no-op', unknownCode.status === 400, `got ${unknownCode.status}`);
+  const badStatus = await api('/api/clients/bulk-status', {
+    token: adminToken, method: 'PUT', body: { sourceStatus: '01', status: 'Archived' }
+  });
+  check('an invalid status is 400', badStatus.status === 400, `got ${badStatus.status}`);
+  const headCodeBulk = await api('/api/clients/bulk-status', {
+    token: headToken, method: 'PUT', body: { sourceStatus: '01', status: 'Active' }
+  });
+  check('a Head may do it, as they may edit one by hand', headCodeBulk.status === 200, `got ${headCodeBulk.status}`);
+  const empCodeBulk = await api('/api/clients/bulk-status', {
+    token: empToken, method: 'PUT', body: { sourceStatus: '01', status: 'Inactive' }
+  });
+  check('an Employee cannot', empCodeBulk.status === 403, `got ${empCodeBulk.status}`);
+
+  // The literal paths must never be swallowed by the '/:id' routes.
+  check('"bulk-status" is not read as a client id', bulk.status !== 400 || !JSON.stringify(bulk.json).includes('Invalid'), 'route ordering');
+
+  // Searching by CODE is the point of importing codes. The client search
+  // matched name/email/contactPerson/associatedEmails only, so a practice that
+  // identifies clients by code could not find a single imported record by the
+  // identifier it actually uses — and the source sheet has no email column, so
+  // most of the other searchable fields are empty for them.
+  const byCode = await api(`/api/clients?q=${encodeURIComponent(`${impCode}A`)}`, { token: adminToken });
+  check('a client is findable by its code', (byCode.json?.data || []).some((c) => c.code === `${impCode}A`), `got ${(byCode.json?.data || []).length} rows`);
+  const byPhone = await api('/api/clients?q=9824045289', { token: adminToken });
+  check('...and by phone, which the sheet also fills', (byPhone.json?.data || []).some((c) => c.phone === '9824045289'), `got ${(byPhone.json?.data || []).length} rows`);
+  const byName = await api(`/api/clients?q=${encodeURIComponent('Smoke Import Alpha')}`, { token: adminToken });
+  check('...and by name, as before', (byName.json?.data || []).length > 0, `got ${(byName.json?.data || []).length} rows`);
+
+  await Client.deleteMany({ code: { $regex: `^${impCode}` } });
+
+  console.log('\nAssign-as-task: an explicit client and a handover note');
+
+  /*
+   * The assign dialog only ever asked for an assignee, a deadline and a
+   * priority. Two things were missing in daily use: the client (the sender
+   * address often belongs to a portal or an agent, not the client the work is
+   * for), and somewhere to say WHY this is being handed over.
+   */
+  const asgClient = `Smoke Assign Client ${Date.now()}`;
+  await api('/api/clients', { token: adminToken, method: 'POST', body: { name: asgClient } });
+  const asgEmployee = await User.findOne({ email: employeeEmail }).select('_id').lean();
+  const asgEmail = await Email.findOne({ deletedAt: null, direction: { $ne: 'outbound' } }).select('_id').lean();
+  if (asgEmail && asgEmployee) {
+    await Task.deleteOne({ linkedEmail: asgEmail._id });
+    const asg = await api('/api/gmail/emails/bulk-assign', {
+      token: adminToken,
+      method: 'POST',
+      body: {
+        emailIds: [String(asgEmail._id)],
+        assignedTo: String(asgEmployee._id),
+        clientName: asgClient,
+        note: 'Client rang about this - needs the revised figures before Friday.'
+      }
+    });
+    check('bulk-assign accepts a client and a note', asg.status === 200, `got ${asg.status} ${JSON.stringify(asg.json).slice(0, 160)}`);
+
+    const asgTask = await Task.findOne({ linkedEmail: asgEmail._id }).lean();
+    check('  ... the chosen client wins over the sender match', asgTask?.clientName === asgClient, `clientName=${asgTask?.clientName}`);
+    check('  ... the note is stored where the Tasks drawer already shows it', asgTask?.notes?.includes('revised figures'), `notes=${String(asgTask?.notes).slice(0, 60)}`);
+
+    // Without an explicit client the sender match must still apply.
+    await Task.deleteOne({ linkedEmail: asgEmail._id });
+    const asgAuto = await api('/api/gmail/emails/bulk-assign', {
+      token: adminToken,
+      method: 'POST',
+      body: { emailIds: [String(asgEmail._id)], assignedTo: String(asgEmployee._id) }
+    });
+    check('omitting the client keeps the sender-matched behaviour', asgAuto.status === 200, `got ${asgAuto.status}`);
+    const autoTask = await Task.findOne({ linkedEmail: asgEmail._id }).lean();
+    check('  ... and clientName is still resolved, not blank', Boolean(autoTask?.clientName), `clientName=${autoTask?.clientName}`);
+    check('  ... with no note when none was given', !autoTask?.notes, `notes=${autoTask?.notes}`);
+
+    const asgLong = await api('/api/gmail/emails/bulk-assign', {
+      token: adminToken,
+      method: 'POST',
+      body: { emailIds: [String(asgEmail._id)], assignedTo: String(asgEmployee._id), note: 'x'.repeat(20001) }
+    });
+    check('an over-long note is 400, not silently truncated', asgLong.status === 400, `got ${asgLong.status}`);
+  }
+  await Client.deleteMany({ name: asgClient });
 
   console.log('\nM-13: every 400 carries field-level detail');
 

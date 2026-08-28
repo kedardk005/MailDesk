@@ -108,11 +108,50 @@ import {
 } from '../components/ui'
 import { describeSyncResult, syncAddedMail } from '../lib/gmailSync'
 import { TAB_VALUES, visibleTabs } from '../lib/inboxTabs'
-import { searchAssignees } from '../lib/pickers'
+import { searchAssignees, searchClients } from '../lib/pickers'
 import { getSocket } from '../lib/socket'
 import { useCachedQuery } from '../lib/useCachedQuery'
 import { cn, formatDurationMinutes, formatNumber, timeAgo } from '../lib/utils'
 import { ExtractActionsPanel } from '../components/ActionExtraction'
+
+/* Ceiling for the auto-sizing email iframe.
+ *
+ * The "only half the email shows" bug was NOT this cap — it was the iframe
+ * sandbox denying the parent access to contentDocument, so the auto-height
+ * measurement silently failed and every message stayed at minHeight (see
+ * EmailBody.jsx). With measurement working, the old caps of 560/900 would
+ * bite for real, giving a long email its own scrollbar inside a drawer that
+ * already scrolls.
+ *
+ * Drawer.jsx gives the panel `overflow-y-auto`, so letting the frame grow to
+ * its natural height simply makes the drawer scroll, which is what a reader
+ * expects. The ceiling remains only as a runaway guard: a hostile or broken
+ * message cannot turn itself into a 100,000px frame. No genuine email is
+ * anywhere near it. */
+const EMAIL_BODY_MAX_HEIGHT = 20000
+
+/* The Gmail OAuth callback returns here with ?gmail=connected, or
+ * ?gmail=error&reason=<code>. Before this existed every failure ended on a
+ * bare white page of server text — outside the app, with no way back — and
+ * the most likely failure by far is a Head whose address an Admin has not
+ * allow-listed yet. The server sends a stable CODE and we own the wording, so
+ * nothing user-controlled is reflected into the page. */
+const GMAIL_CONNECT_ERRORS = {
+  not_allow_listed: (d) =>
+    `${d || 'That mailbox'} is not on your allow-list. Ask an Admin to authorise it for your account.`,
+  account_limit: (d) =>
+    `You have reached your limit of ${d || 'the permitted number of'} connected mailboxes. An Admin can raise it.`,
+  claimed_by_other: (d) =>
+    `That mailbox is already connected by ${d || 'another user'}. An Admin must disconnect it there first.`,
+  role_not_permitted: () => 'Only Admins and Heads can connect a mailbox.',
+  profile_unavailable: () =>
+    'Google did not return the mailbox address. Make sure you granted Gmail access, then try again.',
+  missing_code: () => 'The Google sign-in did not complete. Please try connecting again.',
+  bad_state: () => 'That connection link has expired. Please start again.',
+  user_not_found: () => 'Your account could not be found. Sign out and back in, then retry.',
+  unexpected: () => 'Google sign-in did not complete. Please try again.',
+}
+
 
 /* -------------------------------------------------------------------------- */
 /* Constants                                                                   */
@@ -924,7 +963,7 @@ function EmailDrawer({
               <EmailBody
                 html={email.body}
                 minHeight={240}
-                maxHeight={900}
+                maxHeight={EMAIL_BODY_MAX_HEIGHT}
                 allowRemoteImages={showImages}
                 title={`Email content: ${email.subject || 'no subject'}`}
               />
@@ -1018,7 +1057,7 @@ function ThreadMessage({ message }) {
           html={message.body}
           imageGate
           minHeight={120}
-          maxHeight={560}
+          maxHeight={EMAIL_BODY_MAX_HEIGHT}
           title={`Message from ${author}`}
         />
       ) : (
@@ -1401,6 +1440,11 @@ function AssignDialog({ open, onOpenChange, emailIds, onAssigned }) {
   const [deadline, setDeadline] = useState('')
   const [priority, setPriority] = useState('Medium')
   const [taskStatus, setTaskStatus] = useState('Pending')
+  /* Optional. Left empty, the server keeps matching the client from the sender
+   * address as it always has — this only overrides that when the assigner
+   * knows better, which is common for shared mailboxes and portal senders. */
+  const [clientOption, setClientOption] = useState(null)
+  const [note, setNote] = useState('')
   const [saving, setSaving] = useState(false)
 
   const [prevOpen, setPrevOpen] = useState(open)
@@ -1411,6 +1455,8 @@ function AssignDialog({ open, onOpenChange, emailIds, onAssigned }) {
       setDeadline('')
       setPriority('Medium')
       setTaskStatus('Pending')
+      setClientOption(null)
+      setNote('')
     }
   }
 
@@ -1423,6 +1469,8 @@ function AssignDialog({ open, onOpenChange, emailIds, onAssigned }) {
         assignedTo: assignee,
         deadline: deadline || undefined,
         priority,
+        clientName: clientOption?.value || undefined,
+        note: note.trim() || undefined,
       })
 
       // POST /api/tasks/bulk was implemented server-side and never called.
@@ -1476,6 +1524,25 @@ function AssignDialog({ open, onOpenChange, emailIds, onAssigned }) {
             )}
           </FormField>
 
+          <FormField
+            label="Client"
+            optionalText="Optional"
+            hint="Leave empty to match the client from the sender address."
+          >
+            {(field) => (
+              <Combobox
+                {...field}
+                value={clientOption}
+                onChange={setClientOption}
+                loadOptions={searchClients}
+                placeholder="Match from sender"
+                searchPlaceholder="Search clients…"
+                emptyMessage="No matching clients."
+                errorMessage="Could not search clients."
+              />
+            )}
+          </FormField>
+
           <div className="grid gap-4 sm:grid-cols-2">
             <FormField label="Deadline" hint="Defaults to three days from now">
               {(field) => (
@@ -1506,6 +1573,22 @@ function AssignDialog({ open, onOpenChange, emailIds, onAssigned }) {
                 value={taskStatus}
                 onChange={(e) => setTaskStatus(e.target.value)}
                 options={TASK_STATUS_OPTIONS}
+              />
+            )}
+          </FormField>
+
+          <FormField
+            label="Note for the assignee"
+            optionalText="Optional"
+            hint="Saved as the task's internal notes. Anything they need to know before starting."
+          >
+            {(field) => (
+              <Textarea
+                {...field}
+                rows={3}
+                value={note}
+                onChange={(e) => setNote(e.target.value)}
+                placeholder="e.g. Client rang about this — needs the revised figures before Friday."
               />
             )}
           </FormField>
@@ -2124,6 +2207,29 @@ export default function EmailInbox() {
   const listRef = useRef(null)
   const searchRef = useRef(null)
   const searchTimer = useRef(0)
+
+  /* Report the outcome of a Gmail connect attempt, then scrub the query so a
+   * refresh does not replay the message. */
+  const [gmailParams, setGmailParams] = useSearchParams()
+  useEffect(() => {
+    const outcome = gmailParams.get('gmail')
+    if (!outcome) return
+
+    if (outcome === 'connected') {
+      toast.success('Mailbox connected')
+    } else {
+      const reason = gmailParams.get('reason') || 'unexpected'
+      const detail = gmailParams.get('detail') || ''
+      const build = GMAIL_CONNECT_ERRORS[reason] || GMAIL_CONNECT_ERRORS.unexpected
+      toast.error('Could not connect the mailbox', { description: build(detail) })
+    }
+
+    const next = new URLSearchParams(gmailParams)
+    next.delete('gmail')
+    next.delete('reason')
+    next.delete('detail')
+    setGmailParams(next, { replace: true })
+  }, [gmailParams, setGmailParams])
 
   const [searchInput, setSearchInput] = useState(view.q)
   const [prevQ, setPrevQ] = useState(view.q)

