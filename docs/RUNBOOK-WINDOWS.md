@@ -336,25 +336,68 @@ node count-tmp.js
 Remove-Item count-tmp.js
 ```
 
-### Backup — set this up
+### Backup
 
-Nothing backs up this database yet. It is the only part of the system that
-cannot be rebuilt from GitHub.
+`scripts/backup-windows.ps1` dumps the database to a single gzipped archive,
+**reads it back to prove it is not truncated**, and prunes archives older than
+14 days.
+
+First, the tools — they ship **separately** from the MongoDB server and are
+usually absent:
 
 ```powershell
-# Needs MongoDB Database Tools, which do NOT come with the server package.
-# Check what winget offers first:  winget search "mongodb database tools"
-$stamp = Get-Date -Format 'yyyy-MM-dd'
-mongodump --uri="mongodb://127.0.0.1:27017/maildesk" --out="D:\maildesk-backups\$stamp"
+winget search "mongodb database tools"
+```
+
+Then register the nightly job (elevated, once):
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File C:\apps\maildesk\scripts\backup-windows.ps1 -Install
+```
+
+Runs daily at 02:00 — before the 03:30 deploy, so the day's backup predates any
+code change. It writes to the largest non-C: drive it can find, because a backup
+on the same disk as the database does not survive the failure it exists for; it
+warns in the log if it has to fall back to C:.
+
+```powershell
+# back up right now
+powershell -NoProfile -ExecutionPolicy Bypass -File C:\apps\maildesk\scripts\backup-windows.ps1
 ```
 
 ```powershell
-# Restore a backup into a SCRATCH database first and check it before ever
-# restoring over the live one.
-mongorestore --uri="mongodb://127.0.0.1:27017" --nsFrom="maildesk.*" --nsTo="maildesk_restoretest.*" "D:\maildesk-backups\2026-08-21\maildesk"
+Get-Content C:\apps\maildesk\logs\backup.log -Tail 20
 ```
 
----
+**Every run verifies.** `mongodump` exits 0 on a truncated write, a half-written
+file on a full disk, and a silently empty dump — so the archive is read back
+with `mongorestore --dryRun` and **deleted** if it does not parse. Old backups
+are pruned only after a new verified one exists, so a run of failures can never
+leave you with nothing.
+
+#### Prove a backup actually restores
+
+Verification says the file parses. This says it restores:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File C:\apps\maildesk\scripts\backup-windows.ps1 -TestRestore
+```
+
+It restores the newest archive into `maildesk_restoretest` — **never over the
+live database** — counts the documents, and drops the scratch copy. Run it after
+setting this up, and occasionally thereafter. A backup nobody has restored is a
+guess.
+
+#### Restoring for real
+
+```powershell
+# ALWAYS restore into a scratch database first and look at it.
+mongorestore --uri="mongodb://127.0.0.1:27017" --gzip --archive="D:\maildesk-backups\maildesk-2026-08-29_0200.gz" --nsFrom="maildesk.*" --nsTo="maildesk_check.*"
+```
+
+Only once you have confirmed the scratch copy holds what you expect should you
+consider restoring over `maildesk` — stop `MailDeskAPI` first, and keep the
+archive.
 
 ## 11. Users
 
@@ -409,7 +452,7 @@ The tunnel. See §8.
 
 ## 13. Still outstanding
 
-- [ ] **Database backups** (§10) — nothing is backed up today
+- [x] **Database backups** — `scripts/backup-windows.ps1 -Install` (§10)
 - [ ] **Sleep settings.** This is a desktop Windows; if it sleeps, the app is
       offline and neither scheduled task fires. Needs the owner's agreement:
       `powercfg /change standby-timeout-ac 0`
