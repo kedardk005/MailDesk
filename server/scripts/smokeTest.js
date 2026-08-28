@@ -2811,6 +2811,51 @@ const main = async () => {
   check('  ... and on the duplicate URL', (await api('/api/tasks/clients', { token: empToken, method: 'POST', body: { name: 'nope' } })).status === 403);
   await Client.deleteMany({ name: { $in: [m12A, m12B] } });
 
+  console.log('\nGmail sync pages through history instead of stopping at 150');
+
+  /*
+   * messages.list was called once with maxResults and no pageToken, so a sync
+   * only ever saw the newest 150 messages. A mailbox with years of history was
+   * never fully imported and nothing reported a problem — it simply looked
+   * like mail was missing.
+   *
+   * The loop that fixes it is the dangerous kind: get it wrong and it either
+   * abandons mail silently or walks a mailbox forever burning Gmail quota.
+   * Neither is visible from an HTTP test, so the stopping rules are exported
+   * and asserted directly.
+   */
+  {
+    const { shouldStopPaging } = require('../controllers/gmailController');
+    const reason = (o) => shouldStopPaging(o).reason;
+    const base = { pageScanned: 150, pageNew: 150, scannedTotal: 300, ceiling: 1000 };
+
+    check('no further page stops the run', reason({ ...base, nextPageToken: null }) === 'no_more_pages');
+    check('a page with nothing new means we have caught up', reason({ ...base, nextPageToken: 't', pageNew: 0 }) === 'caught_up');
+    check('a page with new mail keeps going', reason({ ...base, nextPageToken: 't', pageNew: 3 }) === 'continue');
+    check('the per-run ceiling stops the run', reason({ ...base, nextPageToken: 't', scannedTotal: 1000 }) === 'ceiling');
+    check('one message below the ceiling still continues', reason({ ...base, nextPageToken: 't', scannedTotal: 999 }) === 'continue');
+    check('an EMPTY page is not mistaken for caught-up', reason({ nextPageToken: 't', pageScanned: 0, pageNew: 0, scannedTotal: 0, ceiling: 1000 }) === 'continue');
+
+    // The property that matters: a first sync of a huge mailbox terminates.
+    let pages = 0, scanned = 0;
+    for (;;) {
+      pages += 1; scanned += 150;
+      if (shouldStopPaging({ nextPageToken: 't', pageScanned: 150, pageNew: 150, scannedTotal: scanned, ceiling: 1000 }).stop) break;
+      if (pages > 100) break;
+    }
+    check('a first sync is BOUNDED, never a runaway', pages <= 8, `stopped after ${pages} pages / ${scanned} messages`);
+
+    // ...and the routine case stays cheap.
+    let steady = 0; scanned = 0;
+    for (;;) {
+      steady += 1; scanned += 150;
+      const pageNew = steady === 1 ? 4 : 0;
+      if (shouldStopPaging({ nextPageToken: 't', pageScanned: 150, pageNew, scannedTotal: scanned, ceiling: 1000 }).stop) break;
+      if (steady > 100) break;
+    }
+    check('a routine sync costs two pages, not a re-scan', steady === 2, `pages=${steady}`);
+  }
+
   console.log('\nGmail OAuth callback returns the user to the app, never a blank page');
 
   /*
@@ -2939,6 +2984,18 @@ const main = async () => {
   check('two clients with no code can both exist', noCodeA.status === 201 && noCodeB.status === 201, `${noCodeA.status}/${noCodeB.status}`);
 
   await Client.deleteMany({ name: { $regex: `Smoke (Hand|Clash|NoCode)` } });
+  // Searching by CODE is the point of importing codes. The client search
+  // matched name/email/contactPerson/associatedEmails only, so a practice that
+  // identifies clients by code could not find a single imported record by the
+  // identifier it actually uses — and the source sheet has no email column, so
+  // most of the other searchable fields are empty for them.
+  const byCode = await api(`/api/clients?q=${encodeURIComponent(`${impCode}A`)}`, { token: adminToken });
+  check('a client is findable by its code', (byCode.json?.data || []).some((c) => c.code === `${impCode}A`), `got ${(byCode.json?.data || []).length} rows`);
+  const byPhone = await api('/api/clients?q=9824045289', { token: adminToken });
+  check('...and by phone, which the sheet also fills', (byPhone.json?.data || []).some((c) => c.phone === '9824045289'), `got ${(byPhone.json?.data || []).length} rows`);
+  const byName = await api(`/api/clients?q=${encodeURIComponent('Smoke Import Alpha')}`, { token: adminToken });
+  check('...and by name, as before', (byName.json?.data || []).length > 0, `got ${(byName.json?.data || []).length} rows`);
+
   await Client.deleteMany({ code: { $regex: `^${impCode}` } });
 
   console.log('\nAssign-as-task: an explicit client and a handover note');

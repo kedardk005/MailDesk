@@ -25,7 +25,13 @@ const { paginate } = require('./paginate');
 // Sortable fields, per docs/audits/API-LIST-CONTRACT.md.
 const CLIENT_SORT_FIELDS = ['name', 'createdAt', 'status', 'contactPerson'];
 
-const CLIENT_FIELDS = 'name associatedEmails contactPerson email phone notes status createdAt';
+/* `code`, `address` and `sourceStatus` are in the projection because the
+ * spreadsheet import fills them and the Clients table shows the code. Leaving
+ * them out is a quiet failure: the search matches on `code`, so the right row
+ * comes back — with an empty code column, which reads as "the import lost my
+ * codes" rather than "the API did not return the field". */
+const CLIENT_FIELDS =
+  'name code address sourceStatus associatedEmails contactPerson email phone notes status createdAt';
 
 /*
  * L-8 — the "Clients" dashboard tile was `Client.estimatedDocumentCount()`.
@@ -253,7 +259,21 @@ const listClients = async (params, options = {}) => {
   const filter = { ...CLIENT_BASE_FILTER };
   if (params.q) {
     const regex = new RegExp(escapeRegex(params.q), 'i');
-    filter.$or = [{ name: regex }, { email: regex }, { contactPerson: regex }, { associatedEmails: regex }];
+    /* `code` and `phone` are searchable because the spreadsheet import fills
+     * them for every client and leaves email blank — the source sheet has no
+     * email column. Without these two, a practice that identifies its clients
+     * by code could not find any of the ~1,000 imported records by the only
+     * identifiers they actually have. This also feeds the client pickers on
+     * the Tasks page and the assign-as-task dialog, which query the same
+     * endpoint. */
+    filter.$or = [
+      { name: regex },
+      { code: regex },
+      { phone: regex },
+      { email: regex },
+      { contactPerson: regex },
+      { associatedEmails: regex }
+    ];
   }
 
   const { data, pagination } = await paginate(Client, filter, params, { select: CLIENT_FIELDS });

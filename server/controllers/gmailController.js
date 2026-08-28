@@ -127,6 +127,20 @@ const GMAIL_TIMEOUT_MS = Number(process.env.GMAIL_TIMEOUT_MS || 20000);
 const GMAIL_MESSAGE_CONCURRENCY = Number(process.env.GMAIL_SYNC_CONCURRENCY || 10);
 const GMAIL_ATTACHMENT_CONCURRENCY = Number(process.env.GMAIL_ATTACHMENT_CONCURRENCY || 5);
 const GMAIL_MAX_RESULTS = Number(process.env.GMAIL_MAX_RESULTS || 150);
+/* Ceiling on ONE sync run, across all pages.
+ *
+ * messages.list was called once with maxResults and no pageToken, so a sync
+ * only ever saw the newest 150 messages and stopped — a mailbox with years of
+ * history was never fully imported, and nothing said so. The list is paginated
+ * now, bounded two ways: this total, and an early exit as soon as a whole page
+ * turns out to be already stored (Gmail returns newest-first, so a fully known
+ * page means we have caught up with history).
+ *
+ * The result: the FIRST sync of a mailbox walks back through history up to
+ * this many messages, while every routine sync afterwards still costs one or
+ * two pages. Raise it to backfill more, at the cost of a slower first run and
+ * more Gmail quota. */
+const GMAIL_SYNC_MAX_MESSAGES = Number(process.env.GMAIL_SYNC_MAX_MESSAGES || 1000);
 
 /**
  * Every outbound Gmail call goes through here: a hard timeout (gaxios has NONE
@@ -822,20 +836,27 @@ const buildEmailDocument = async ({ gmail, message, inboxEmail, userId, rules, c
  * @param {Object} params
  * @returns {Promise<{inbox: String, newCount: Number, failed: Number, scanned: Number}>}
  */
-const syncAccountEmails = async ({ userId, accessToken, refreshToken, inboxEmail, isPrimary, onProgress }) => {
+const syncAccountPage = async ({ userId, accessToken, refreshToken, inboxEmail, isPrimary, onProgress, pageToken }) => {
   const { gmail } = buildGmailClient({ userId, accessToken, refreshToken, inboxEmail, isPrimary });
 
   const listRes = await gmailCall(
     () =>
       gmail.users.messages.list(
-        { userId: 'me', maxResults: GMAIL_MAX_RESULTS, includeSpamTrash: true },
+        {
+          userId: 'me',
+          maxResults: GMAIL_MAX_RESULTS,
+          includeSpamTrash: true,
+          ...(pageToken ? { pageToken } : {})
+        },
         GMAIL_REQUEST_OPTIONS
       ),
     'messages.list'
   );
 
+  const nextPageToken = listRes.data.nextPageToken || null;
+
   const messages = listRes.data.messages || [];
-  if (messages.length === 0) return { inbox: inboxEmail, newCount: 0, failed: 0, scanned: 0 };
+  if (messages.length === 0) return { inbox: inboxEmail, newCount: 0, failed: 0, scanned: 0, pageNew: 0, nextPageToken };
 
   // One indexed query instead of a per-message existence check.
   const messageIds = messages.map((m) => m.id);
@@ -843,7 +864,7 @@ const syncAccountEmails = async ({ userId, accessToken, refreshToken, inboxEmail
   const pending = messages.filter((m) => !existingIds.has(m.id));
 
   logger.info({ inbox: inboxEmail, listed: messages.length, new: pending.length }, 'gmail sync starting');
-  if (pending.length === 0) return { inbox: inboxEmail, newCount: 0, failed: 0, scanned: messages.length };
+  if (pending.length === 0) return { inbox: inboxEmail, newCount: 0, failed: 0, scanned: messages.length, pageNew: 0, nextPageToken };
 
   const [rules, clientMatcher] = await Promise.all([getActiveKeywordRules(), getClientMatcher()]);
 
@@ -883,7 +904,7 @@ const syncAccountEmails = async ({ userId, accessToken, refreshToken, inboxEmail
   );
 
   const docs = settled.filter(Boolean);
-  if (docs.length === 0) return { inbox: inboxEmail, newCount: 0, failed, scanned: messages.length };
+  if (docs.length === 0) return { inbox: inboxEmail, newCount: 0, failed, scanned: messages.length, pageNew: pending.length, nextPageToken };
 
   // `ordered: false` makes a duplicate messageId (two syncs racing, or two
   // replicas on the same cron tick) SKIP rather than abort the whole batch.
@@ -923,7 +944,89 @@ const syncAccountEmails = async ({ userId, accessToken, refreshToken, inboxEmail
   }
 
   logger.info({ inbox: inboxEmail, inserted, failed }, 'gmail sync finished');
-  return { inbox: inboxEmail, newCount: inserted, failed, scanned: messages.length };
+  return { inbox: inboxEmail, newCount: inserted, failed, scanned: messages.length, pageNew: pending.length, nextPageToken };
+};
+
+/**
+ * Should the sync stop after this page?
+ *
+ * Extracted and exported so the stopping rules are directly testable: a bug in
+ * this loop either abandons mail silently or walks a mailbox forever burning
+ * Gmail quota, and neither is visible from an HTTP-level test.
+ *
+ * @param {Object} p
+ * @param {String|null} p.nextPageToken  what Gmail says comes next
+ * @param {Number} p.pageScanned         messages listed on this page
+ * @param {Number} p.pageNew             of those, how many we had not stored
+ * @param {Number} p.scannedTotal        messages listed this run, all pages
+ * @param {Number} p.ceiling             GMAIL_SYNC_MAX_MESSAGES
+ * @returns {{stop: Boolean, reason: String}}
+ */
+exports.shouldStopPaging = ({ nextPageToken, pageScanned, pageNew, scannedTotal, ceiling }) => {
+  if (!nextPageToken) return { stop: true, reason: 'no_more_pages' };
+  // Gmail lists newest-first, so a page with nothing new means we have reached
+  // history we already hold — and everything older is held too.
+  if (pageScanned > 0 && pageNew === 0) return { stop: true, reason: 'caught_up' };
+  if (scannedTotal >= ceiling) return { stop: true, reason: 'ceiling' };
+  return { stop: false, reason: 'continue' };
+};
+
+/**
+ * Sync one mailbox, walking back through history a page at a time.
+ *
+ * Gmail returns messages newest-first. The loop stops at whichever comes
+ * first:
+ *
+ *   - Gmail reports no further page;
+ *   - a whole page contained nothing new, which means we have reached
+ *     already-stored history and everything older is stored too;
+ *   - GMAIL_SYNC_MAX_MESSAGES have been scanned.
+ *
+ * The middle condition is what keeps this cheap. A first sync walks back to
+ * the ceiling; every routine sync afterwards finds the handful of new messages
+ * on page one, sees page two is entirely known, and stops — so the common case
+ * costs one extra list call, not a full re-scan.
+ *
+ * The signature and return shape are unchanged for callers.
+ *
+ * @param {Object} params
+ * @returns {Promise<{inbox: String, newCount: Number, failed: Number, scanned: Number}>}
+ */
+const syncAccountEmails = async (params) => {
+  let pageToken = null;
+  let newCount = 0;
+  let failed = 0;
+  let scanned = 0;
+  let pages = 0;
+
+  for (;;) {
+    const page = await syncAccountPage({ ...params, pageToken });
+    pages += 1;
+    newCount += page.newCount;
+    failed += page.failed;
+    scanned += page.scanned;
+
+    const verdict = exports.shouldStopPaging({
+      nextPageToken: page.nextPageToken,
+      pageScanned: page.scanned,
+      pageNew: page.pageNew,
+      scannedTotal: scanned,
+      ceiling: GMAIL_SYNC_MAX_MESSAGES
+    });
+    if (verdict.stop) {
+      if (verdict.reason === 'ceiling') {
+        logger.info(
+          { inbox: params.inboxEmail, scanned, ceiling: GMAIL_SYNC_MAX_MESSAGES },
+          'gmail sync stopped at the per-run ceiling; older mail arrives on the next run'
+        );
+      }
+      break;
+    }
+    pageToken = page.nextPageToken;
+  }
+
+  logger.info({ inbox: params.inboxEmail, pages, scanned, newCount, failed }, 'gmail sync finished');
+  return { inbox: params.inboxEmail, newCount, failed, scanned };
 };
 
 /**
