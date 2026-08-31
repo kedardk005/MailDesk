@@ -275,6 +275,49 @@ $deployed    = $false
 # restart for no reason, turning a harmless no-op into an outage window.
 $checkoutChanged = $false
 
+function Test-MongoReachable {
+    <#
+        Is MongoDB accepting connections?
+
+        A bare TCP connect, not a driver call: the question is only "is
+        something listening", and this must work before any of the app's own
+        code runs.
+
+        The host and port come from the app's own server/.env, so this can
+        never probe a different database from the one the deploy is about to
+        migrate. Anything it cannot parse is treated as reachable, because a
+        probe that cannot read the config must not be the thing that blocks a
+        deploy.
+
+        @returns {Boolean}
+    #>
+    $uri = 'mongodb://127.0.0.1:27017'
+    $envFile = Join-Path $InstallDir 'server\.env'
+    if (Test-Path -LiteralPath $envFile) {
+        $line = Select-String -LiteralPath $envFile -Pattern '^\s*MONGO_URI\s*=\s*(.+)$' | Select-Object -First 1
+        if ($line) { $uri = $line.Matches[0].Groups[1].Value.Trim() }
+    }
+
+    # mongodb://[user:pass@]host:port[/db]  -- take the FIRST host of the list.
+    if ($uri -notmatch '^[a-z+]+://(?:[^@/]+@)?([^/,?]+)') { return $true }
+    $hostPort = $Matches[1].Split(',')[0]
+    $mongoHost = $hostPort.Split(':')[0]
+    $mongoPort = 27017
+    if ($hostPort -match ':(\d+)$') { $mongoPort = [int]$Matches[1] }
+
+    # A DNS-hosted cluster (Atlas via mongodb+srv) has no port to probe here;
+    # do not block on it.
+    if ($uri -like 'mongodb+srv://*') { return $true }
+
+    try {
+        $c = [System.Net.Sockets.TcpClient]::new()
+        $ok = $c.ConnectAsync($mongoHost, $mongoPort).Wait(3000)
+        $c.Close()
+        return $ok
+    }
+    catch { return $false }
+}
+
 function Get-HeadSha {
     param([string]$Ref = 'HEAD')
     return (Invoke-Native git @('rev-parse', $Ref) -WorkingDirectory $InstallDir)
@@ -402,6 +445,23 @@ function Install-And-Restart {
 }
 
 try {
+    # -- 0. is the database up? --------------------------------------------
+    #
+    # Checked BEFORE anything is touched. syncIndexes below connects to
+    # MongoDB, so a stopped database fails the deploy halfway — and then the
+    # rollback runs the SAME syncIndexes and fails for the same reason, ending
+    # at "the API is down and needs a human" when the only real problem was a
+    # stopped service that no amount of reverting code could start.
+    #
+    # Refusing here changes nothing at all: the running version keeps serving
+    # the moment the database comes back.
+    if (-not (Test-MongoReachable)) {
+        Write-Log 'MongoDB is not accepting connections - refusing to deploy' 'FAIL'
+        Write-Log 'nothing was changed; the running version is untouched' 'INFO'
+        Write-Log 'start it, then re-run:  Start-Service MongoDB' 'INFO'
+        exit 5
+    }
+
     # -- 1. what is on the remote? -----------------------------------------
     Invoke-Native git @('fetch', $Remote, $Branch, '--prune') -WorkingDirectory $InstallDir | Out-Null
 
@@ -466,6 +526,20 @@ try {
 }
 catch {
     Write-Log "deploy failed: $($_.Exception.Message)" 'FAIL'
+
+    # A database that died mid-deploy is not something a rollback can fix, and
+    # attempting one guarantees a second failure (Install-And-Restart runs
+    # syncIndexes too) plus an alarming "needs a human" for a stopped service.
+    # Same rule the watchdog follows.
+    if (-not (Test-MongoReachable)) {
+        Write-Log 'MongoDB is not reachable - this is a dependency failure, not the code' 'FAIL'
+        Write-Log 'NOT rolling back: reverting code cannot restart a database' 'WARN'
+        if ($checkoutChanged) {
+            Write-Log "the checkout is at $($targetSha.Substring(0,7)); it will serve once MongoDB is back" 'INFO'
+        }
+        Write-Log 'start it, then re-run:  Start-Service MongoDB' 'INFO'
+        exit 5
+    }
 
     if ($checkoutChanged -and $previousSha -and -not $deployed) {
         Write-Log "rolling back to $($previousSha.Substring(0,7))" 'WARN'
