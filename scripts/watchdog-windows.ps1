@@ -59,6 +59,9 @@ param(
     [string]$MongoHost   = '127.0.0.1',
     [int]   $MongoPort   = 27017,
     [int]   $SoakMinutes = 60,
+    # Hours before a missing/old backup is treated as a problem. 36 gives a
+    # nightly job one full miss of slack before it says anything.
+    [int]   $MaxBackupAgeHours = 36,
     [int]   $EveryMinutes = 5,
     [int]   $HealthTimeoutSeconds = 90,
     [switch]$WhatIfRollback,
@@ -258,6 +261,43 @@ function Set-Alert {
 # --------------------------------------------------------------------------
 # Probes
 # --------------------------------------------------------------------------
+function Get-BackupProblem {
+    <#
+        Is the backup actually happening?
+
+        A silently failing backup looks exactly like a working one right up
+        until the day you need it. This deployment ran for a day with
+        "mongodump not found" — including a 02:00 scheduled run — and nobody
+        would have known.
+
+        Reads the marker backup-windows.ps1 writes after a VERIFIED archive, so
+        this reports on restorable backups rather than on the script having
+        run. Returns $null when all is well, or a sentence to show a human.
+
+        @returns {String|$null}
+    #>
+    $stateFile = Join-Path $LogDir 'backup-state.json'
+    if (-not (Test-Path -LiteralPath $stateFile)) {
+        # Absent is only meaningful once backups are supposed to exist.
+        if (Get-ScheduledTask -TaskName 'MailDesk Database Backup' -ErrorAction SilentlyContinue) {
+            return 'The backup task is installed but has never completed one successfully.'
+        }
+        return $null
+    }
+
+    try {
+        $b = Get-Content -LiteralPath $stateFile -Raw | ConvertFrom-Json
+        $ageHours = ([DateTimeOffset]::UtcNow.ToUnixTimeSeconds() - [int64]$b.lastBackupAt) / 3600.0
+        if ($ageHours -gt $MaxBackupAgeHours) {
+            return ("The newest verified backup is {0:N0} hours old ({1}). Nightly backups are not completing." -f $ageHours, $b.archive)
+        }
+        return $null
+    }
+    catch {
+        return 'The backup marker file could not be read, so backup health is unknown.'
+    }
+}
+
 function Get-ApiState {
     <#
         Returns 'healthy', 'degraded' (answers, but its database is gone),
@@ -378,9 +418,23 @@ switch ($apiState) {
             Write-Log "$short promoted to last-known-good after $([math]::Round($healthyFor)) min (was $was)" 'OK'
             if (Test-Path -LiteralPath $AlertFile) { Remove-Item -LiteralPath $AlertFile -Force }
         }
+        elseif ($state.lastKnownGood -eq $currentSha) {
+            # Already promoted. Saying "1460 of 60 min" here reads as though it
+            # is still waiting to trust a commit it trusted a day ago.
+            Write-Log "$short healthy - trusted as the rollback target"
+        }
         else {
             Write-Log "$short healthy ($([math]::Round($healthyFor)) of $SoakMinutes min)"
         }
+
+        # Checked only while the API is HEALTHY, so a stale-backup warning can
+        # never overwrite the alert for an actual outage.
+        $backupProblem = Get-BackupProblem
+        if ($backupProblem) {
+            Write-Log $backupProblem 'WARN'
+            Set-Alert "$backupProblem`n`nThe application is running normally; this is about backups only.`n`nCheck:  Get-Content $LogDir\backup.log -Tail 20`nRun now: Start-ScheduledTask -TaskName 'MailDesk Database Backup'"
+        }
+
         Write-State $state
         exit 0
     }
