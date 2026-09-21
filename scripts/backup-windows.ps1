@@ -320,4 +320,31 @@ foreach ($f in $old) {
 
 $kept = @(Get-ChildItem -LiteralPath $dest -Filter '*.gz')
 Write-Log "backup complete - $($kept.Count) archive(s) held, newest $sizeMb MB" 'OK'
+
+<#
+    Record the outcome where anything else can read it.
+
+    The watchdog needs to know whether backups are actually happening, and the
+    alternative — teaching it this script's destination logic — would be two
+    copies of the same rule drifting apart. A tiny state file keeps the
+    knowledge in one place.
+
+    Written only after a VERIFIED archive exists, so the timestamp means "a
+    restorable backup was taken", not "the script ran".
+#>
+$state = [ordered]@{
+    lastBackupAt = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+    archive      = $archive
+    sizeMb       = $sizeMb
+    kept         = $kept.Count
+}
+try {
+    ($state | ConvertTo-Json -Depth 3) |
+        Set-Content -LiteralPath (Join-Path $LogDir 'backup-state.json') -Encoding utf8
+}
+catch {
+    # Never fail a good backup because the marker could not be written.
+    Write-Log "could not write backup-state.json: $($_.Exception.Message)" 'WARN'
+}
+
 exit 0
