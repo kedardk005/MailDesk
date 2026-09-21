@@ -9,6 +9,16 @@ export default defineConfig({
     strictPort: true,
   },
   build: {
+    /* The deploy script builds into a temporary directory and swaps it in only
+     * once the build has succeeded. Building straight into `dist` empties it
+     * first, so a failure half way through would leave the office looking at a
+     * blank page while the API stayed perfectly healthy — invisible to both
+     * the deploy's health gate and the watchdog.
+     *
+     * Unset (every normal `npm run build`) keeps vite's default of `dist`. */
+    outDir: process.env.VITE_OUT_DIR || 'dist',
+    emptyOutDir: true,
+
     // Every route is React.lazy'd (see App.jsx). These manual groups keep the
     // heavy shared dependencies out of the first paint on /login.
     rollupOptions: {

@@ -3373,6 +3373,73 @@ const main = async () => {
   check('password change is audited with an ip', Boolean(changePwLog?.ip), JSON.stringify(changePwLog));
   check('password change audit records NO before/after credential', !changePwLog?.before && !changePwLog?.after, JSON.stringify({ b: changePwLog?.before, a: changePwLog?.after }));
 
+  console.log('\nLAN: same-origin serving and origin classification');
+  {
+    const { isLanOrigin } = require('../utils/frontendUrl');
+
+    // Private-network addresses: the office reaches the same box by hostname,
+    // by mDNS name and by raw IP, and all three are the same deployment.
+    for (const origin of [
+      'http://kmk-server',
+      'http://kmk-server.local',
+      'http://192.168.1.40',
+      'http://10.0.0.5:80',
+      'http://172.16.3.9',
+      'http://localhost:5188',
+      'http://127.0.0.1:5188'
+    ]) {
+      check(`isLanOrigin allows ${origin}`, isLanOrigin(origin) === true);
+    }
+
+    // Anything routable from the internet must still be listed explicitly in
+    // FRONTEND_URL. `172.32.x` is deliberately here: it is OUTSIDE RFC1918 and
+    // an off-by-one in the 172.16/12 range would quietly admit it.
+    for (const origin of [
+      'http://evil.example.com',
+      'https://evil.example.com',
+      'http://sub.evil.example.com',
+      'http://172.32.0.1',
+      'https://kmkothari-alpha.vercel.app',
+      'https://kmk-server',
+      '',
+      'not-a-url',
+      null
+    ]) {
+      check(`isLanOrigin rejects ${JSON.stringify(origin)}`, isLanOrigin(origin) === false);
+    }
+
+    // The SPA is served from this same process, so a browser route must return
+    // the app shell while an unknown /api path must stay JSON. Getting this
+    // backwards turns every API typo into a 200 page and breaks error handling
+    // everywhere at once.
+    const clientServed = await api('/');
+    if (clientServed.status === 200) {
+      const deep = await fetch(`${BASE}/clients`);
+      check('a client-side route returns the app shell', deep.status === 200, `got ${deep.status}`);
+      check(
+        'the app shell is HTML',
+        (deep.headers.get('content-type') || '').includes('text/html'),
+        deep.headers.get('content-type')
+      );
+      check(
+        'the app shell is not cached',
+        (deep.headers.get('cache-control') || '').includes('no-cache'),
+        deep.headers.get('cache-control')
+      );
+      const unknownApi = await api('/api/definitely-not-a-route');
+      check('an unknown /api route stays JSON 404', unknownApi.status === 404, `got ${unknownApi.status}`);
+      check(
+        'an unknown /api route does NOT fall through to the SPA',
+        typeof unknownApi.json?.message === 'string',
+        JSON.stringify(unknownApi.json)
+      );
+    } else {
+      // Server-only checkout (CI, or `npm run dev` against Vite): nothing is
+      // built to serve, and that is a supported configuration, not a failure.
+      console.log('  (no client build present — SPA serving checks skipped)');
+    }
+  }
+
   // Cleanup of the fixtures created above.
   await SlaPolicy.deleteMany({});
   // Tasks the audit-D2 bulk-assign created (one carries the 'Unassigned'

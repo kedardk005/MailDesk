@@ -11,23 +11,28 @@ command says otherwise.
 
 ## 1. What is deployed, and where
 
+> **The LAN deployment replaces the tunnel.** Frontend and API are now served
+> by the same process on the office network — see
+> [DEPLOY-LAN-WINDOWS.md](DEPLOY-LAN-WINDOWS.md), commands in
+> [DEPLOY-LAN-COMMANDS.md](DEPLOY-LAN-COMMANDS.md). The Vercel + Tailscale setup
+> below is kept as the fallback it became, not as the live path.
+
 | Piece | Where it runs | Address |
 | --- | --- | --- |
-| Frontend (React) | Vercel | `https://maildesk.kmkothari.com` |
-| API (Node) | Windows PC, service `MailDeskAPI` | `http://127.0.0.1:5015` |
-| Public API URL | Tailscale Funnel | `https://kmk-server.tail0dbcb3.ts.net` |
+| Frontend **and** API | Windows PC, service `MailDeskAPI` | `http://kmk-server/` |
 | Database | Windows PC, service `MongoDB` | `mongodb://127.0.0.1:27017/maildesk` |
+| Frontend (fallback) | Vercel | `https://maildesk.kmkothari.com` |
 
 ```
-  Browser ──► maildesk.kmkothari.com        (Vercel, static files)
-                     │
-                     │  XHR + WebSocket
-                     ▼
-        kmk-server.tail0dbcb3.ts.net        (Tailscale Funnel, HTTPS)
-                     │
-                     ▼
-        127.0.0.1:5015  MailDeskAPI  ──►  127.0.0.1:27017  MongoDB
+  Browser (any office PC) ──► http://kmk-server/
+                                   │
+                                   │  same origin: page, XHR and WebSocket
+                                   ▼
+                    MailDeskAPI (node)  ──►  127.0.0.1:27017  MongoDB
+                    serves client\dist + /api
 ```
+
+Nothing is exposed to the internet. No tunnel, no CORS, no mixed content.
 
 Key paths:
 
@@ -47,7 +52,9 @@ Versions that matter: **Node 24.19.0**, **MongoDB 7.0.28**, **PowerShell 5.1**.
 ```powershell
 # The three services that must be running, plus the API's own opinion of itself.
 Get-Service MongoDB,MailDeskAPI,Tailscale | Select-Object Name,Status,StartType
-Invoke-RestMethod http://127.0.0.1:5015/api/health | ConvertTo-Json -Compress
+# Reads the port from server\.env, so this keeps working whichever port is set.
+$port = (Select-String -LiteralPath C:\apps\maildesk\server\.env -Pattern '^\s*PORT\s*=\s*(\d+)').Matches[0].Groups[1].Value
+Invoke-RestMethod "http://127.0.0.1:$port/api/health" | ConvertTo-Json -Compress
 ```
 
 Healthy looks like `Running` / `Automatic` for all three, and
@@ -149,7 +156,7 @@ The values that matter most:
 | --- | --- | --- |
 | `MONGO_URI` | `mongodb://127.0.0.1:27017/maildesk` | **Local.** Never point this at a cloud cluster by accident |
 | `FRONTEND_URL` | `https://maildesk.kmkothari.com,https://kmkothari-alpha.vercel.app` | Comma-separated allowlist. Exact match — scheme required, no trailing slash |
-| `PORT` | `5015` | The tunnel forwards here |
+| `PORT` | `80` | What the office browses to. deploy and watchdog read this, so change it here and nowhere else. |
 | `TOKEN_ENCRYPTION_KEY` | 64 hex characters | Exactly 64, or AES-256 refuses |
 | `ALLOW_LEGACY_PLAINTEXT_TOKENS` | `false` | Keep false in production |
 

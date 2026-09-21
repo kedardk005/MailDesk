@@ -36,4 +36,59 @@ const allowedOrigins = () =>
  */
 const primaryAppUrl = () => allowedOrigins()[0] || DEFAULT_APP_URL;
 
-module.exports = { allowedOrigins, primaryAppUrl, DEFAULT_APP_URL };
+/**
+ * True for an origin that can only exist inside a private network.
+ *
+ * The LAN deployment serves the client and the API from one Express process,
+ * and people reach it by whatever name their machine resolves —
+ * `http://kmk-server`, `http://kmk-server.local`, or the raw
+ * `http://192.168.1.40`. FRONTEND_URL can only name ONE of those.
+ *
+ * Scope, measured rather than assumed: this affects Socket.io's POLLING
+ * fallback and cross-origin REST, not the WebSocket transport, which engine.io
+ * accepts from any origin because CORS does not apply to WebSocket. So the
+ * failure it prevents is narrow — a browser that falls back to polling loses
+ * live updates when it reached the app by an address FRONTEND_URL does not
+ * list — but it is silent when it happens, and on a LAN the alternate address
+ * is the normal case, not the exception.
+ *
+ * Deliberately narrow — loopback, RFC1918, CGNAT, link-local, `.local`, and
+ * dotless single-label hostnames, which cannot be public DNS names. A public
+ * hostname still has to be in FRONTEND_URL.
+ */
+const LAN_HOST = new RegExp(
+  '^(' +
+    'localhost' +
+    '|127\\.\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}' +
+    '|10\\.\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}' +
+    '|192\\.168\\.\\d{1,3}\\.\\d{1,3}' +
+    '|172\\.(?:1[6-9]|2\\d|3[01])\\.\\d{1,3}\\.\\d{1,3}' +
+    '|100\\.(?:6[4-9]|[7-9]\\d|1[01]\\d|12[0-7])\\.\\d{1,3}\\.\\d{1,3}' +
+    '|169\\.254\\.\\d{1,3}\\.\\d{1,3}' +
+    '|[^.]+\\.local' +
+    '|[^.:]+' +
+  ')$',
+  'i'
+);
+
+/**
+ * @param {String} origin a browser Origin header, e.g. `http://kmk-server`
+ * @returns {Boolean} true when it is plain http to a private-network host
+ */
+const isLanOrigin = (origin) => {
+  if (!origin) return false;
+  let url;
+  try {
+    url = new URL(origin);
+  } catch {
+    return false;
+  }
+  // http only: an https LAN origin means a proxy is in front, and then the
+  // operator can and should name it explicitly.
+  if (url.protocol !== 'http:') return false;
+  const host = url.hostname.replace(/^\[|\]$/g, '');
+  if (host === '::1') return true;
+  return LAN_HOST.test(host);
+};
+
+module.exports = { allowedOrigins, primaryAppUrl, isLanOrigin, DEFAULT_APP_URL };

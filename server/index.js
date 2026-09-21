@@ -3,6 +3,8 @@ require('dotenv').config();
 
 const express = require('express');
 const http = require('http');
+const path = require('path');
+const fs = require('fs');
 const { Server } = require('socket.io');
 const cors = require('cors');
 const helmet = require('helmet');
@@ -155,8 +157,17 @@ app.use(helmet());
  * carries a path, and `https://app.example.com/` quietly matching nothing was
  * an easy thing to stare at for an hour.
  */
-const { allowedOrigins: parseAllowedOrigins } = require('./utils/frontendUrl');
+const { allowedOrigins: parseAllowedOrigins, isLanOrigin } = require('./utils/frontendUrl');
 const allowedOrigins = parseAllowedOrigins();
+
+// Declared here, next to the origin checks that consult it; the static-file
+// block that uses it to actually serve the bundle is further down.
+const CLIENT_DIST = process.env.CLIENT_DIST
+  ? path.resolve(process.env.CLIENT_DIST)
+  : path.resolve(__dirname, '..', 'client', 'dist');
+
+const clientBuilt = fs.existsSync(path.join(CLIENT_DIST, 'index.html'));
+
 
 // `callback(null, false)` rather than an Error: an unknown origin should just
 // not receive the header and let the browser refuse it. Passing an Error makes
@@ -167,7 +178,14 @@ const corsOriginCheck = (origin, callback) => {
   // server-to-server. Those are not cross-origin requests and must not be
   // blocked, or the funnel's own health check starts failing.
   if (!origin) return callback(null, true);
-  return callback(null, allowedOrigins.includes(origin));
+  if (allowedOrigins.includes(origin)) return callback(null, true);
+  // Same-origin LAN deployment: this process serves the bundle too, so the
+  // browser's origin is whatever name resolved to this machine. FRONTEND_URL
+  // can only name one of `http://kmk-server`, `http://kmk-server.local` and
+  // `http://192.168.1.40`, and the other two are the same deployment.
+  // Restricted to private-network hosts (see isLanOrigin) and only when we
+  // are the one serving the client.
+  return callback(null, clientBuilt && isLanOrigin(origin));
 };
 
 app.use(cors({ origin: corsOriginCheck }));
@@ -315,8 +333,75 @@ app.get('/api/auth/me', protect, (req, res) => {
   res.json(req.user);
 });
 
-// JSON 404 for unmatched routes — Express's default is an HTML page, which
+/* ---------------------------------------------------------------------------
+ * The built React client, served by this same process.
+ *
+ * The office reaches MailDesk over its own LAN, not the internet. Serving the
+ * client here rather than from a separate host makes the two SAME-ORIGIN,
+ * which removes three whole problems at once:
+ *
+ *   - CORS. There is no cross-origin request left to allow.
+ *   - Mixed content. An https page may not call an http API; with one origin
+ *     over http on a LAN, the question never arises.
+ *   - A public tunnel. Nothing has to be exposed to the internet at all.
+ *
+ * One process also means one thing to install, watch and restart on a machine
+ * that is somebody's shared office desktop.
+ *
+ * Absent build => skipped entirely, so a server-only checkout (CI, a
+ * developer running `npm run dev` against Vite) behaves exactly as before.
+ * ------------------------------------------------------------------------ */
+if (clientBuilt) {
+  logger.info({ dir: CLIENT_DIST }, 'serving the built client');
+
+  /* Hashed assets are immutable: the filename changes whenever the contents
+   * do, so a year of caching is safe and means a reload costs nothing. */
+  app.use(
+    '/assets',
+    express.static(path.join(CLIENT_DIST, 'assets'), {
+      immutable: true,
+      maxAge: '1y'
+    })
+  );
+
+  /* Everything else (favicon, fonts, manifest). `index: false` so the SPA
+   * fallback below owns "/" — one place decides how the app is delivered. */
+  app.use(express.static(CLIENT_DIST, { index: false, maxAge: '1h' }));
+} else {
+  logger.warn(
+    { dir: CLIENT_DIST },
+    'no client build found; serving the API only. Run `npm run build` in client/ to serve the app from here.'
+  );
+}
+
+// JSON 404 for unmatched API routes — Express's default is an HTML page, which
 // breaks the JSON contract the client expects.
+//
+// Scoped to /api so it cannot swallow a deep link like /inbox, which must
+// reach the SPA fallback below and be answered with index.html.
+app.use('/api', (req, res) => {
+  res.status(404).json({ message: `Not found: ${req.method} ${req.originalUrl}` });
+});
+
+if (clientBuilt) {
+  /* SPA fallback. React Router owns the path, so /inbox and /clients/123 must
+   * return index.html rather than 404 — otherwise a refresh or a pasted link
+   * breaks, while in-app navigation works, which is a maddening bug to be
+   * handed.
+   *
+   * GET/HEAD only: a POST to a path that does not exist is a genuine 404, and
+   * answering it with a page of HTML would hide a client bug.
+   *
+   * index.html itself is never cached. It names the hashed bundles, so a
+   * cached copy pins a browser to the previous deploy indefinitely. */
+  app.get(/.*/, (req, res, next) => {
+    if (req.method !== 'GET' && req.method !== 'HEAD') return next();
+    res.set('Cache-Control', 'no-cache, must-revalidate');
+    return res.sendFile(path.join(CLIENT_DIST, 'index.html'));
+  });
+}
+
+// Anything left is genuinely not found.
 app.use((req, res) => {
   res.status(404).json({ message: `Not found: ${req.method} ${req.originalUrl}` });
 });
@@ -354,10 +439,24 @@ const server = http.createServer(app);
 // Initialize Socket.io on the HTTP server
 const io = new Server(server, {
   cors: {
-    // Socket.io accepts an array directly. Kept in step with the REST list
-    // above: a login that works while live updates silently do not is a
-    // miserable thing to debug.
-    origin: allowedOrigins,
+    /*
+     * The SAME function the REST layer uses, not a copy of the array, so the
+     * LAN rule below applies here too.
+     *
+     * What this actually governs, measured rather than assumed: engine.io
+     * applies the origin check to the POLLING transport only. A WebSocket
+     * upgrade is accepted from any origin (verified: an upgrade sent with
+     * `Origin: http://evil.example.com` still gets a 101) because CORS does
+     * not apply to WebSocket at all. So this is not an authentication
+     * boundary and never was — the handshake's JWT is (see io.use below),
+     * and no other origin can read it out of our localStorage.
+     *
+     * It still matters for the LAN deployment: the client lists polling as
+     * its fallback transport, and with a bare array a browser that cannot
+     * hold a WebSocket open would lose live updates whenever someone reached
+     * the app by an address other than the single one in FRONTEND_URL.
+     */
+    origin: corsOriginCheck,
     methods: ["GET", "POST"]
   }
 });

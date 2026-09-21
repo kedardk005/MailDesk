@@ -55,7 +55,8 @@
 param(
     [string]$InstallDir  = 'C:\apps\maildesk',
     [string]$ServiceName = 'MailDeskAPI',
-    [string]$HealthUrl   = 'http://127.0.0.1:5015/api/health',
+    # Empty = read PORT from server\.env (see Resolve-HealthUrl below).
+    [string]$HealthUrl   = '',
     [string]$MongoHost   = '127.0.0.1',
     [int]   $MongoPort   = 27017,
     [int]   $SoakMinutes = 60,
@@ -67,6 +68,31 @@ param(
 
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
+
+<#
+    Resolve the health URL from the app's own server\.env when the caller did
+    not pass one. Mirrors deploy-windows.ps1 exactly, so the two never disagree
+    about which port the API is on.
+
+    A stale default here is not cosmetic: the watchdog would read a healthy
+    server on a different port as an outage and restart-loop until it paged a
+    human. Falls back to 5015, what install-windows.ps1 writes.
+#>
+function Resolve-HealthUrl {
+    param([string]$Dir)
+
+    $port = '5015'
+    $envFile = Join-Path $Dir 'server\.env'
+    if (Test-Path -LiteralPath $envFile) {
+        $line = Select-String -LiteralPath $envFile -Pattern '^\s*PORT\s*=\s*(\d+)\s*$' | Select-Object -First 1
+        if ($line) { $port = $line.Matches[0].Groups[1].Value.Trim() }
+    }
+
+    if ($port -eq '80') { return 'http://127.0.0.1/api/health' }
+    return "http://127.0.0.1:${port}/api/health"
+}
+
+if (-not $HealthUrl) { $HealthUrl = Resolve-HealthUrl -Dir $InstallDir }
 
 # PowerShell 5.1 is what ships on Windows 10/Server, and on older .NET it
 # negotiates TLS 1.0 by default — github.com refuses that, so Get-CiState would
