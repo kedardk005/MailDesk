@@ -13,7 +13,8 @@ command says otherwise.
 
 > **The LAN deployment replaces the tunnel.** Frontend and API are now served
 > by the same process on the office network — see
-> [DEPLOY-LAN-WINDOWS.md](DEPLOY-LAN-WINDOWS.md). The Vercel + Tailscale setup
+> [DEPLOY-LAN-WINDOWS.md](DEPLOY-LAN-WINDOWS.md), commands in
+> [DEPLOY-LAN-COMMANDS.md](DEPLOY-LAN-COMMANDS.md). The Vercel + Tailscale setup
 > below is kept as the fallback it became, not as the live path.
 
 | Piece | Where it runs | Address |

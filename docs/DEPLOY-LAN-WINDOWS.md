@@ -45,6 +45,10 @@ day the machine's IP changes.
 
 ## Deploying it
 
+> **Just want the commands?**
+> [DEPLOY-LAN-COMMANDS.md](DEPLOY-LAN-COMMANDS.md) is the copy-paste sheet for
+> the whole switch, in order, with the check after every step.
+
 ### 1. Check port 80 is actually free
 
 **Do this first.** IIS, Skype, or a vendor tool may already own it.
