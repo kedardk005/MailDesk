@@ -64,8 +64,8 @@ param(
     # Node's own port, not Caddy's. Health-checking through the proxy would
     # pass while the API is dead if the proxy ever serves a cached or static
     # response, and would fail for proxy-only problems that are not this
-    # deploy's fault. install-windows.ps1 writes PORT=5015.
-    [string]$HealthUrl   = 'http://127.0.0.1:5015/api/health',
+    # deploy's fault. Empty = read PORT from server\.env (see below).
+    [string]$HealthUrl   = '',
     [int]   $HealthTimeoutSeconds = 90,
     [switch]$SkipCiCheck,
     [switch]$Install,
@@ -75,6 +75,39 @@ param(
 
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
+
+<#
+    Resolve the health URL from the app's own server\.env when the caller did
+    not pass one.
+
+    This used to be hard-coded to :5015. The LAN deployment serves the app and
+    the API together on :80, and a stale default here is not a cosmetic bug:
+    the post-deploy check would fail against a perfectly healthy server and
+    roll every deploy back, and the watchdog would read the same silence as an
+    outage and restart-loop until it paged a human. Both failures look like
+    the app is broken when only this number is wrong.
+
+    Falls back to 5015 - what install-windows.ps1 writes - if .env is absent
+    or unparseable. Reading it wrong must not be the thing that blocks a
+    deploy, so every failure path lands on the old default.
+#>
+function Resolve-HealthUrl {
+    param([string]$Dir)
+
+    $port = '5015'
+    $envFile = Join-Path $Dir 'server\.env'
+    if (Test-Path -LiteralPath $envFile) {
+        $line = Select-String -LiteralPath $envFile -Pattern '^\s*PORT\s*=\s*(\d+)\s*$' | Select-Object -First 1
+        if ($line) { $port = $line.Matches[0].Groups[1].Value.Trim() }
+    }
+
+    # Port 80 is the default for http, and some tooling normalises the URL
+    # differently with it present; keep it out so logs and comparisons match.
+    if ($port -eq '80') { return 'http://127.0.0.1/api/health' }
+    return "http://127.0.0.1:${port}/api/health"
+}
+
+if (-not $HealthUrl) { $HealthUrl = Resolve-HealthUrl -Dir $InstallDir }
 
 # PowerShell 5.1 is what ships on Windows 10/Server, and on older .NET it
 # negotiates TLS 1.0 by default — github.com refuses that, so Get-CiState would
@@ -409,8 +442,90 @@ function Install-And-Restart {
     #>
     param([string]$Label)
 
-    Write-Log "[$Label] npm ci --omit=dev"
+    Write-Log "[$Label] server: npm ci --omit=dev"
     Invoke-Native (Get-NpmExe) @('ci', '--omit=dev') -WorkingDirectory $serverDir | Out-Null
+
+    <#
+        Build the client too, because this machine SERVES it.
+
+        The office reaches MailDesk over the LAN from this one process, so a
+        deploy that updated only the API would leave the browser running the
+        previous release against a new backend — the kind of mismatch that
+        produces bug reports nobody can reproduce.
+
+        `npm ci` here is deliberately NOT --omit=dev: vite, the plugins and the
+        whole toolchain are devDependencies, so a production-only install
+        cannot build anything.
+
+        Built into a TEMPORARY directory and swapped in only on success. A
+        build writing straight into client/dist empties it first, so a failure
+        half way through leaves the office staring at a blank page — with the
+        API perfectly healthy, so neither the health gate nor the watchdog
+        would notice.
+    #>
+    $clientDir = Join-Path $InstallDir 'client'
+    if (Test-Path -LiteralPath (Join-Path $clientDir 'package.json')) {
+        Write-Log "[$Label] client: npm ci (with dev deps - vite is one)"
+        Invoke-Native (Get-NpmExe) @('ci') -WorkingDirectory $clientDir | Out-Null
+
+        $dist    = Join-Path $clientDir 'dist'
+        $staging = Join-Path $clientDir 'dist.building'
+        $previous = Join-Path $clientDir 'dist.previous'
+        if (Test-Path -LiteralPath $staging)  { Remove-Item -LiteralPath $staging -Recurse -Force }
+        if (Test-Path -LiteralPath $previous) { Remove-Item -LiteralPath $previous -Recurse -Force }
+
+        <#
+            The API URL is baked into the bundle at BUILD time, and the client
+            fails loudly at load if it is missing - a production build refuses
+            to fall back to localhost. Unset, this deploy would publish a
+            bundle that white-screens every browser in the office while
+            /api/health stayed green, so neither the post-deploy check nor the
+            watchdog would roll it back.
+
+            Same-origin by default, and RELATIVE on purpose: '/api' follows
+            whatever host the page was opened from, so one build serves
+            http://kmk-server/, the raw LAN IP and http://localhost/ on the
+            machine itself. An absolute URL would pin the bundle to a single
+            spelling of the address.
+
+            Overridable for the split deployment (client on Vercel) by setting
+            these before invoking the script.
+        #>
+        $viteApiUrl    = if ($env:VITE_API_URL)    { $env:VITE_API_URL }    else { '/api' }
+        $viteSocketUrl = if ($env:VITE_SOCKET_URL) { $env:VITE_SOCKET_URL } else { '/' }
+        Write-Log "[$Label] client: building (VITE_API_URL=$viteApiUrl VITE_SOCKET_URL=$viteSocketUrl)"
+
+        $prevOutDir    = $env:VITE_OUT_DIR
+        $prevApiUrl    = $env:VITE_API_URL
+        $prevSocketUrl = $env:VITE_SOCKET_URL
+        $env:VITE_OUT_DIR    = $staging
+        $env:VITE_API_URL    = $viteApiUrl
+        $env:VITE_SOCKET_URL = $viteSocketUrl
+        try {
+            Invoke-Native (Get-NpmExe) @('run', 'build') -WorkingDirectory $clientDir | Out-Null
+        }
+        finally {
+            if ($null -eq $prevOutDir)    { Remove-Item Env:\VITE_OUT_DIR -ErrorAction SilentlyContinue }    else { $env:VITE_OUT_DIR = $prevOutDir }
+            if ($null -eq $prevApiUrl)    { Remove-Item Env:\VITE_API_URL -ErrorAction SilentlyContinue }    else { $env:VITE_API_URL = $prevApiUrl }
+            if ($null -eq $prevSocketUrl) { Remove-Item Env:\VITE_SOCKET_URL -ErrorAction SilentlyContinue } else { $env:VITE_SOCKET_URL = $prevSocketUrl }
+        }
+
+        if (-not (Test-Path -LiteralPath (Join-Path $staging 'index.html'))) {
+            throw "client build produced no index.html in $staging"
+        }
+
+        # Swap. The old build is kept until the new one is in place, so the
+        # window in which no build exists is as short as a rename.
+        if (Test-Path -LiteralPath $dist) { Move-Item -LiteralPath $dist -Destination $previous }
+        Move-Item -LiteralPath $staging -Destination $dist
+        if (Test-Path -LiteralPath $previous) { Remove-Item -LiteralPath $previous -Recurse -Force }
+
+        $files = @(Get-ChildItem -LiteralPath $dist -Recurse -File).Count
+        Write-Log "[$Label] client: built ($files files)" 'OK'
+    }
+    else {
+        Write-Log "[$Label] no client/ directory - serving the API only"
+    }
 
     # Idempotent, and index definitions change between releases. The backfill
     # scripts in server/scripts are deliberately NOT run here: they are one-time

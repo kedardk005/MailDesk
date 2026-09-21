@@ -19,6 +19,13 @@ export default defineConfig([
     },
   },
   {
+    // Build-time config runs in Node, not the browser: it reads
+    // `process.env.VITE_OUT_DIR` so the deploy script can build into a staging
+    // directory and swap it in only after the build succeeds.
+    files: ['vite.config.js', 'vitest.config.js'],
+    languageOptions: { globals: globals.node },
+  },
+  {
     /*
      * The design-system layer legitimately exports non-components alongside
      * components: cva variant factories (`buttonVariants`), re-exported Radix
