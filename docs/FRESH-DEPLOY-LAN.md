@@ -223,19 +223,29 @@ Select-String -Path C:\apps\maildesk\server\.env -Pattern '^\s*([A-Z_]+)\s*=' |
 
 Install and build:
 
+**`npm.cmd`, never bare `npm`.** On PATH, `npm` resolves to `npm.ps1` first,
+and this machine's execution policy refuses to run it:
+
+> npm.ps1 cannot be loaded because running scripts is disabled on this system
+
+`npm.cmd` is a batch shim, not a script, so the policy does not apply. This is
+why `deploy-windows.ps1` has `Get-NpmExe` — the same trap, already handled
+there. Use `.cmd` for every npm call below rather than weakening the execution
+policy, which is not ours to change on somebody else's machine.
+
 ```powershell
 cd C:\apps\maildesk\server
-npm ci --omit=dev
+npm.cmd ci --omit=dev
 ```
 
 ```powershell
 cd C:\apps\maildesk\client
-npm ci
+npm.cmd ci
 ```
 
 ```powershell
 cd C:\apps\maildesk\client
-$env:VITE_API_URL='/api'; $env:VITE_SOCKET_URL='/'; npm run build
+$env:VITE_API_URL='/api'; $env:VITE_SOCKET_URL='/'; npm.cmd run build
 Remove-Item Env:\VITE_API_URL, Env:\VITE_SOCKET_URL
 ```
 
@@ -252,7 +262,7 @@ Test-Path C:\apps\maildesk\client\dist\index.html
 ```powershell
 New-Item -ItemType Directory -Force -Path C:\apps\maildesk\logs | Out-Null
 cd C:\apps\maildesk\server
-npm run sync-indexes
+npm.cmd run sync-indexes
 ```
 
 ---

@@ -420,7 +420,7 @@ To roll the *code* back to the previous release:
 cd C:\apps\maildesk
 git log --oneline -5
 git reset --hard <sha-from-before>
-cd server; npm ci --omit=dev
+cd server; npm.cmd ci --omit=dev
 Restart-Service MailDeskAPI
 ```
 
