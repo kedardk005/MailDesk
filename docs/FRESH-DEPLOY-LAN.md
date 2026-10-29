@@ -97,7 +97,8 @@ if (Test-Path $cfg) { Select-String -Path $cfg -Pattern 'dbPath|path:' }
 The path must **not** start with `C:\apps\maildesk`. If it does, stop and tell
 me — the plan changes.
 
-Take a fresh backup right now, on top of last night's:
+Take a fresh backup now, unless last night's automatic one is good enough
+(the nightly task already wrote one to `K:` before you started):
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File C:\apps\maildesk\scripts\backup-windows.ps1
@@ -105,18 +106,28 @@ Get-ChildItem K:\maildesk-backups | Sort-Object LastWriteTime -Desc | Select-Obj
 ```
 
 Record where nssm actually is — we will call it by full path so PATH can never
-break the deploy again:
+break the deploy again.
+
+Do **not** hunt through folders for it. nssm works by registering *itself* as
+the service binary, so the running `MailDeskAPI` service points straight at it.
+That is authoritative even when the folder is somewhere unexpected and even
+when PATH is broken — which is exactly the situation here:
 
 ```powershell
-"=== nssm ==="
-$nssm = @("C:\Program Files\nssm","C:\Program Files (x86)\nssm","C:\ProgramData\chocolatey\bin","C:\tools","C:\nssm","$env:LOCALAPPDATA\Microsoft\WinGet\Links") |
-  ForEach-Object { Get-ChildItem -Path $_ -Filter nssm.exe -Recurse -ErrorAction SilentlyContinue } |
-  Select-Object -First 1 -ExpandProperty FullName
-if ($nssm) { "FOUND: $nssm" } else { "NOT FOUND - stop, we need to reinstall nssm first" }
+$raw = (Get-CimInstance Win32_Service -Filter "Name='MailDeskAPI'").PathName
+if ($raw -match '^"([^"]+)"') { $nssm = $Matches[1] } else { $nssm = ($raw -split ' ')[0] }
 
-"=== node ==="
+"service registration : $raw"
+"resolved nssm        : $nssm"
+if (Test-Path -LiteralPath $nssm) { "exists               : YES" } else { "exists               : NO - stop" }
+if ((Split-Path $nssm -Leaf) -eq 'nssm.exe') { "is nssm              : YES" } else { "is nssm              : NO - stop, read the path above" }
+
+"`n=== node ==="
 (Get-Command node).Source
 ```
+
+Keep this PowerShell window open. `$nssm` is used by every later phase, and it
+is lost if you close the window.
 
 **Do not continue until:** sizes match, `TOKEN_ENCRYPTION_KEY` is present, the
 mongo data path is outside `C:\apps\maildesk`, a fresh backup exists, and nssm
@@ -129,9 +140,9 @@ was found.
 The office cannot use the app from here until phase 4. Do it outside working
 hours if you can.
 
-```powershell
-$nssm = '<the path phase 0 printed>'
+`$nssm` is already set from phase 0 — same window, no retyping:
 
+```powershell
 & $nssm stop   MailDeskAPI confirm
 & $nssm remove MailDeskAPI confirm
 ```
@@ -254,7 +265,7 @@ This is the actual fix for the five weeks of silent failure. The 03:30 task
 runs as SYSTEM, which cannot see a per-user PATH.
 
 ```powershell
-$nssmDir = Split-Path '<the nssm path from phase 0>'
+$nssmDir = Split-Path $nssm
 $machinePath = [Environment]::GetEnvironmentVariable('Path','Machine')
 if ($machinePath -notlike "*$nssmDir*") {
   [Environment]::SetEnvironmentVariable('Path', "$machinePath;$nssmDir", 'Machine')
@@ -271,7 +282,6 @@ Prove SYSTEM will see it — this reads the machine PATH, not yours:
 ### 3b. Register the API service
 
 ```powershell
-$nssm = '<the nssm path from phase 0>'
 $node = (Get-Command node).Source
 
 & $nssm install MailDeskAPI $node C:\apps\maildesk\server\index.js
