@@ -324,7 +324,7 @@ checking the wrong port — stop, and revert with the rollback below.
 No alert file should exist:
 
 ```powershell
-Test-Path C:\apps\maildesk\logs\ALERT.txt
+Test-Path C:\apps\maildesk\logs\WATCHDOG-NEEDS-ATTENTION.txt
 ```
 
 Expect `False`.
@@ -344,7 +344,7 @@ Get-ScheduledTask | Where-Object { $_.TaskName -like '*MailDesk*' } |
 # One-line "is it all fine?"
 Get-Service MailDeskAPI, MongoDB | Select-Object Name, Status
 Invoke-RestMethod http://127.0.0.1/api/health | ConvertTo-Json -Compress
-Test-Path C:\apps\maildesk\logs\ALERT.txt      # False = nothing needs a human
+Test-Path C:\apps\maildesk\logs\WATCHDOG-NEEDS-ATTENTION.txt   # False = nothing needs a human
 ```
 
 ```powershell
