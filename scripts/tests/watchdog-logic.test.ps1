@@ -39,7 +39,12 @@ function New-State {
 }
 
 function Invoke-Tick {
-    param($ApiState, [bool]$MongoUp, $CurrentSha, $State, [bool]$RestoreWorks = $true)
+    param($ApiState, [bool]$MongoUp, $CurrentSha, $State, [bool]$RestoreWorks = $true,
+          # $null = backups are fine; a string = that problem is reported.
+          $BackupProblem = $null,
+          # Seeds an existing alert file of this kind ('backup' or 'other')
+          # so retraction can be tested.
+          $SeedAlertKind = $null)
 
     $root = Join-Path ([System.IO.Path]::GetTempPath()) "wd-$([guid]::NewGuid())"
     New-Item -ItemType Directory -Path (Join-Path $root '.git')  -Force | Out-Null
@@ -47,6 +52,15 @@ function Invoke-Tick {
     $stateFile = Join-Path $root 'logs/watchdog-state.json'
     $traceFile = Join-Path $root 'logs/trace.txt'
     Set-Content -LiteralPath $stateFile -Value ($State | ConvertTo-Json -Depth 4) -Encoding utf8
+
+    if ($SeedAlertKind) {
+        Set-Content -LiteralPath (Join-Path $root 'logs/WATCHDOG-NEEDS-ATTENTION.txt') `
+            -Value "MailDesk watchdog needs attention [$SeedAlertKind]`nseeded by the test" -Encoding utf8
+    }
+
+    # Get-ScheduledTask and the backup marker are Windows/host state; the probe
+    # is stubbed so the DECISION is what gets tested, not the environment.
+    $bpBody = if ($null -eq $BackupProblem) { '$null' } else { "'" + ($BackupProblem -replace "'", "''") + "'" }
 
     $fakes = @"
 # ---- test overrides (defined last, so these win) ----
@@ -59,6 +73,7 @@ function Restore-Commit {
     return `$$($RestoreWorks.ToString().ToLower())
 }
 function nssm { Add-Content -LiteralPath '$traceFile' -Value 'nssm-restart' }
+function Get-BackupProblem { $bpBody }
 
 $marker
 "@
@@ -156,6 +171,35 @@ $r = Invoke-Tick -ApiState 'restarting' -MongoUp $true -CurrentSha $BAD -State (
 Check 'exit 0'                 ($r.exit -eq 0)              "got $($r.exit)"
 Check 'no rollback'            ($r.trace -notmatch 'restore') "trace=$($r.trace)"
 Check 'no restart'             ($r.trace -notmatch 'nssm')  "trace=$($r.trace)"
+
+'== 13. backups broken while healthy: alert raised, no rollback =='
+$NOW = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+$r = Invoke-Tick -ApiState 'healthy' -MongoUp $true -CurrentSha $GOOD `
+        -State (New-State $GOOD $GOOD 0 ($NOW - 4500)) `
+        -BackupProblem 'The backup task is installed but has never completed one successfully.'
+Check 'exit 0 (app is fine)'   ($r.exit -eq 0)              "got $($r.exit)"
+Check 'alert raised'           $r.alert                     'no alert file'
+Check 'no rollback for a backup problem' ($r.trace -notmatch 'restore') "trace=$($r.trace)"
+
+'== 14. backups fixed on an ALREADY-PROMOTED commit: alert retracted =='
+# The regression this covers: the alert file was only ever removed in the
+# commit-promotion branch, which never runs again once a commit is promoted.
+# A backup alert raised here was therefore permanent - observed in production,
+# where a verified 20 MB archive left "needs attention" true forever.
+$r = Invoke-Tick -ApiState 'healthy' -MongoUp $true -CurrentSha $GOOD `
+        -State (New-State $GOOD $GOOD 0 ($NOW - 4500)) `
+        -BackupProblem $null -SeedAlertKind 'backup'
+Check 'exit 0'                 ($r.exit -eq 0)              "got $($r.exit)"
+Check 'backup alert retracted' (-not $r.alert)              'alert file still present'
+
+'== 15. an OUTAGE alert is never retracted by a good backup =='
+# Fail towards keeping an alert: a rollback alert says the app is up but on
+# older code, which still needs a human even though everything looks healthy.
+$r = Invoke-Tick -ApiState 'healthy' -MongoUp $true -CurrentSha $GOOD `
+        -State (New-State $GOOD $GOOD 0 ($NOW - 4500)) `
+        -BackupProblem $null -SeedAlertKind 'other'
+Check 'exit 0'                 ($r.exit -eq 0)              "got $($r.exit)"
+Check 'non-backup alert kept'  $r.alert                     'alert file was wrongly deleted'
 
 ''
 "RESULT: $script:pass passed, $script:fail failed"

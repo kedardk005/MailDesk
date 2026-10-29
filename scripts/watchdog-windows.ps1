@@ -270,9 +270,19 @@ function Write-State {
 }
 
 function Set-Alert {
-    param([string]$Text)
+    param(
+        [string]$Text,
+
+        # Machine-readable, so an alert can be RETRACTED once its cause is
+        # resolved. Anything not explicitly marked is never auto-removed: a
+        # stuck alert is annoying, but silently deleting a real one - an
+        # outage, or a rollback that left the app on older code - is
+        # dangerous. Fail towards keeping it.
+        [ValidateSet('backup', 'other')]
+        [string]$Kind = 'other'
+    )
     @(
-        "MailDesk watchdog needs attention"
+        "MailDesk watchdog needs attention [$Kind]"
         (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')
         ''
         $Text
@@ -458,7 +468,30 @@ switch ($apiState) {
         $backupProblem = Get-BackupProblem
         if ($backupProblem) {
             Write-Log $backupProblem 'WARN'
-            Set-Alert "$backupProblem`n`nThe application is running normally; this is about backups only.`n`nCheck:  Get-Content $LogDir\backup.log -Tail 20`nRun now: Start-ScheduledTask -TaskName 'MailDesk Database Backup'"
+            Set-Alert "$backupProblem`n`nThe application is running normally; this is about backups only.`n`nCheck:  Get-Content $LogDir\backup.log -Tail 20`nRun now: Start-ScheduledTask -TaskName 'MailDesk Database Backup'" -Kind 'backup'
+        }
+        elseif (Test-Path -LiteralPath $AlertFile) {
+            <#
+                Retract the backup alert once backups are verified again.
+
+                The alert file used to be removed in exactly ONE place: the
+                commit-promotion branch, which only runs when a NEW commit
+                finishes its soak. On an already-promoted commit that line
+                never runs again, so a backup alert raised here was permanent
+                even after the backup succeeded - measured on the office
+                machine, where a verified 20 MB archive left the alert in
+                place. The runbook tells a human to check this file daily, so
+                a stuck alert turns the one "needs attention" signal into
+                noise, which is how alerting dies.
+
+                Only retracts alerts THIS probe raised. An outage or rollback
+                alert carries [other] and is left for a human.
+            #>
+            $firstLine = Get-Content -LiteralPath $AlertFile -First 1 -ErrorAction SilentlyContinue
+            if ($firstLine -and $firstLine.Contains('[backup]')) {
+                Remove-Item -LiteralPath $AlertFile -Force
+                Write-Log 'backups verified again - backup alert retracted' 'OK'
+            }
         }
 
         Write-State $state
